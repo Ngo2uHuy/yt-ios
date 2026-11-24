@@ -11,7 +11,9 @@ final class HLSServer: @unchecked Sendable {
 
     private var listener: NWListener?
     private(set) var port: UInt16 = 0
+    typealias DynamicRouteHandler = @Sendable () -> (contentType: String, data: Data)?
     private var routes: [String: (contentType: String, data: Data)] = [:]
+    private var dynamicRoutes: [String: DynamicRouteHandler] = [:]
     private var routeKeys: [String] = [] // LRU tracking
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "vidra.hls.server", qos: .userInitiated)
@@ -64,6 +66,18 @@ final class HLSServer: @unchecked Sendable {
         return p
     }
 
+    /// Registers a dynamic route whose content is computed on each request (e.g. live sliding-window HLS).
+    func registerDynamic(path: String, handler: @escaping DynamicRouteHandler) async -> URL? {
+        let p = await ensurePort()
+        guard p > 0 else { return nil }
+        lock.lock()
+        dynamicRoutes[path] = handler
+        let decoded = path.removingPercentEncoding ?? path
+        if decoded != path { dynamicRoutes[decoded] = handler }
+        lock.unlock()
+        return URL(string: "http://127.0.0.1:\(p)\(path)")
+    }
+
     /// Registers an in-memory route (e.g. `/hls/abc/master.m3u8`) and returns its local loopback URL.
     func register(path: String, contentType: String, data: Data) async -> URL? {
         let p = await ensurePort()
@@ -106,9 +120,16 @@ final class HLSServer: @unchecked Sendable {
 
             self.lock.lock()
             let matched = self.routes[rawPath] ?? self.routes[decodedPath]
+            let dynamicHandler = self.dynamicRoutes[rawPath] ?? self.dynamicRoutes[decodedPath]
             self.lock.unlock()
 
-            guard let (contentType, body) = matched else {
+            let responsePair: (contentType: String, body: Data)? = {
+                if let matched { return (matched.contentType, matched.data) }
+                if let dynamicHandler { return dynamicHandler() }
+                return nil
+            }()
+
+            guard let (contentType, body) = responsePair else {
                 self.send(status: 404, text: "Not Found", connection: connection)
                 return
             }
@@ -313,6 +334,115 @@ enum HLSBuilder {
 
         guard let mData = master.data(using: .utf8) else { return nil }
         return await HLSServer.shared.register(path: mPath, contentType: "application/vnd.apple.mpegurl", data: mData)
+    }
+
+    private static func fetchLiveSequence(url: URL) async -> Int {
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.setValue(YTClient.ios.userAgent, forHTTPHeaderField: "User-Agent")
+        if let resp = try? await session.data(for: req).1 as? HTTPURLResponse,
+           let seqStr = resp.value(forHTTPHeaderField: "X-Sequence-Num") ?? resp.value(forHTTPHeaderField: "X-Head-Seqnum"),
+           let seq = Int(seqStr), seq > 0 {
+            return seq
+        }
+        return max(10, Int(Date().timeIntervalSince1970) % 50000)
+    }
+
+    /// Builds a compliant Apple Live HLS Master Playlist for YouTube live broadcasts.
+    static func buildLiveMaster(id: String, video: DirectFormat, audio: DirectFormat) async -> URL? {
+        let baseSeq = await fetchLiveSequence(url: video.url)
+        let startTime = Date()
+
+        let tag = "live_\(id)_\(Int(Date().timeIntervalSince1970 * 1000))"
+        let vPath = "/hls/\(tag)/video.m3u8"
+        let aPath = "/hls/\(tag)/audio.m3u8"
+        let mPath = "/hls/\(tag)/master.m3u8"
+
+        let vUrlStr = video.url.absoluteString
+        let aUrlStr = audio.url.absoluteString
+
+        _ = await HLSServer.shared.registerDynamic(path: vPath) {
+            let elapsed = Int(Date().timeIntervalSince(startTime))
+            let currentSeq = baseSeq + elapsed
+            let windowStart = max(0, currentSeq - 5)
+            var lines: [String] = []
+            lines.append("#EXTM3U")
+            lines.append("#EXT-X-VERSION:7")
+            lines.append("#EXT-X-TARGETDURATION:2")
+            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
+            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+            lines.append("#EXT-X-MAP:URI=\"\(vUrlStr)&sq=0\"")
+            for s in windowStart...currentSeq {
+                lines.append("#EXTINF:1.000,")
+                lines.append("\(vUrlStr)&sq=\(s)")
+            }
+            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
+            return ("application/vnd.apple.mpegurl", data)
+        }
+
+        _ = await HLSServer.shared.registerDynamic(path: aPath) {
+            let elapsed = Int(Date().timeIntervalSince(startTime))
+            let currentSeq = baseSeq + elapsed
+            let windowStart = max(0, currentSeq - 5)
+            var lines: [String] = []
+            lines.append("#EXTM3U")
+            lines.append("#EXT-X-VERSION:7")
+            lines.append("#EXT-X-TARGETDURATION:2")
+            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
+            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)&sq=0\"")
+            for s in windowStart...currentSeq {
+                lines.append("#EXTINF:1.000,")
+                lines.append("\(aUrlStr)&sq=\(s)")
+            }
+            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
+            return ("application/vnd.apple.mpegurl", data)
+        }
+
+        let vCodec = extractCodec(from: video.mime) ?? "avc1.4d401f"
+        let aCodec = extractCodec(from: audio.mime) ?? "mp4a.40.2"
+        let width = video.width ?? (video.height.map { $0 * 16 / 9 } ?? 1280)
+        let height = video.height ?? 720
+        let bandwidth = max(video.bitrate + audio.bitrate, 800_000)
+
+        var master = "#EXTM3U\n"
+        master += "#EXT-X-VERSION:7\n"
+        master += "#EXT-X-INDEPENDENT-SEGMENTS\n\n"
+        master += "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n"
+        master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),CODECS=\"\(vCodec),\(aCodec)\",AUDIO=\"audio\"\n"
+        master += "video.m3u8\n"
+
+        guard let mData = master.data(using: .utf8) else { return nil }
+        return await HLSServer.shared.register(path: mPath, contentType: "application/vnd.apple.mpegurl", data: mData)
+    }
+
+    /// Builds a compliant Apple Live HLS Audio Playlist for YouTube live broadcasts.
+    static func buildLiveAudio(id: String, audio: DirectFormat) async -> URL? {
+        let baseSeq = await fetchLiveSequence(url: audio.url)
+        let startTime = Date()
+
+        let tag = "live_\(id)_\(Int(Date().timeIntervalSince1970 * 1000))"
+        let aPath = "/hls/\(tag)/audio.m3u8"
+        let aUrlStr = audio.url.absoluteString
+
+        return await HLSServer.shared.registerDynamic(path: aPath) {
+            let elapsed = Int(Date().timeIntervalSince(startTime))
+            let currentSeq = baseSeq + elapsed
+            let windowStart = max(0, currentSeq - 5)
+            var lines: [String] = []
+            lines.append("#EXTM3U")
+            lines.append("#EXT-X-VERSION:7")
+            lines.append("#EXT-X-TARGETDURATION:2")
+            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
+            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)&sq=0\"")
+            for s in windowStart...currentSeq {
+                lines.append("#EXTINF:1.000,")
+                lines.append("\(aUrlStr)&sq=\(s)")
+            }
+            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
+            return ("application/vnd.apple.mpegurl", data)
+        }
     }
 
     private static func fetchRange(_ url: URL, start: Int, end: Int) async -> Data? {

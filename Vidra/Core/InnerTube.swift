@@ -321,14 +321,26 @@ actor InnerTube {
                 muxed: fCandidates.compactMap(\.muxed).first
             )
         }()
-        let isLive = (vrOK ?? iosOK)?["videoDetails"]["isLive"].bool ?? (vrOK ?? iosOK)?["videoDetails"]["isLiveContent"].bool ?? false
+        let isLive = (vrOK ?? iosOK)?["videoDetails"]["isLive"].bool ?? false
         let hls = [vrOK, iosOK].compactMap { $0?["streamingData"]["hlsManifestUrl"].string }.compactMap { URL(string: $0) }
 
         // Ordered by preference; the player falls through on failure.
         var sources: [PlaybackSource] = []
         if isLive {
-            // Live streams must be played via Apple HLS manifest (which streams sliding window chunks)
+            // 1. YouTube provided official HLS manifest (.m3u8)
             sources = hls.map { PlaybackSource.hls($0) }
+
+            // 2. Dynamic Sliding-Window Live HLS reconstructed from adaptive live tracks
+            if !audioOnly, let v = direct.video, let a = direct.audio {
+                if let liveMaster = await HLSBuilder.buildLiveMaster(id: id, video: v, audio: a) {
+                    sources.append(.hls(liveMaster))
+                }
+            }
+            if let a = direct.audio {
+                if let liveAudio = await HLSBuilder.buildLiveAudio(id: id, audio: a) {
+                    sources.append(.hls(liveAudio))
+                }
+            }
         } else if audioOnly {
             if let a = direct.audio {
                 if let audioHLS = await HLSBuilder.buildAudio(id: id, audio: a, startTimeSecs: startTimeSecs) {
@@ -624,7 +636,7 @@ enum YTParse {
 
     static func details(_ j: J, id: String) -> (Video, VideoInfo) {
         let d = j["videoDetails"]
-        let live = d["isLive"].bool ?? d["isLiveContent"].bool ?? false
+        let live = d["isLive"].bool ?? false
         let views = d["viewCount"].int
         let video = Video(
             id: id,
