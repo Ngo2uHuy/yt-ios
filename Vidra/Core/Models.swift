@@ -143,6 +143,19 @@ struct DirectSet {
     var video: DirectFormat?
     var audio: DirectFormat?
     var muxed: DirectFormat?
+    var videoVariants: [DirectFormat] = []
+
+    init(
+        video: DirectFormat? = nil,
+        audio: DirectFormat? = nil,
+        muxed: DirectFormat? = nil,
+        videoVariants: [DirectFormat] = []
+    ) {
+        self.video = video
+        self.audio = audio
+        self.muxed = muxed
+        self.videoVariants = videoVariants
+    }
 }
 
 enum PlaybackSource {

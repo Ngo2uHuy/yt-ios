@@ -70,6 +70,12 @@ final class PlayerManager: NSObject, ObservableObject {
     private var toastTask: Task<Void, Never>?
     private var itemObservation: NSKeyValueObservation?
     private var statusObservation: NSKeyValueObservation?
+    private var bufferEmptyObserver: NSKeyValueObservation?
+    private var bufferKeepUpObserver: NSKeyValueObservation?
+    private var stallCount: Int = 0
+    private var lastStallTime: Date = Date.distantPast
+    @Published private(set) var isNetworkConstrained: Bool = false
+    @Published private(set) var currentIndicatedBitrate: Double = 0
 
     private override init() {
         rate = Float(Pref.defaultRate)
@@ -327,6 +333,13 @@ final class PlayerManager: NSObject, ObservableObject {
         seekTask = nil
         itemObservation?.invalidate()
         itemObservation = nil
+        bufferEmptyObserver?.invalidate()
+        bufferEmptyObserver = nil
+        bufferKeepUpObserver?.invalidate()
+        bufferKeepUpObserver = nil
+        stallCount = 0
+        isNetworkConstrained = false
+        lastStallTime = .distantPast
         preloadedNext = nil
         captionTracks = []
         selectedCaption = nil
@@ -384,6 +397,13 @@ final class PlayerManager: NSObject, ObservableObject {
         captionTask = nil
         itemObservation?.invalidate()
         itemObservation = nil
+        bufferEmptyObserver?.invalidate()
+        bufferEmptyObserver = nil
+        bufferKeepUpObserver?.invalidate()
+        bufferKeepUpObserver = nil
+        stallCount = 0
+        isNetworkConstrained = false
+        lastStallTime = .distantPast
 
         let resume = Library.shared.position(video.id)
         let seekTarget = resume > 5 ? resume : nil
@@ -642,6 +662,20 @@ final class PlayerManager: NSObject, ObservableObject {
             let status = item.status
             Task { @MainActor in self?.itemStatusChanged(item, status) }
         }
+
+        // ABR buffer state observations
+        bufferEmptyObserver?.invalidate()
+        bufferEmptyObserver = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
+            let empty = item.isPlaybackBufferEmpty
+            Task { @MainActor in self?.handleBufferEmpty(empty) }
+        }
+
+        bufferKeepUpObserver?.invalidate()
+        bufferKeepUpObserver = item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] item, _ in
+            let keepUp = item.isPlaybackLikelyToKeepUp
+            Task { @MainActor in self?.handleBufferKeepUp(keepUp) }
+        }
+
         player.replaceCurrentItem(with: item)
         player.play()
         if item.status != .unknown {
@@ -703,7 +737,8 @@ final class PlayerManager: NSObject, ObservableObject {
             item.configuredTimeOffsetFromLive = CMTime(seconds: 2.0, preferredTimescale: 600)
             item.preferredForwardBufferDuration = 4.0
         } else {
-            item.preferredForwardBufferDuration = 20.0
+            // Generous 30.0s forward buffer duration to absorb temporary network fluctuations
+            item.preferredForwardBufferDuration = 30.0
         }
     }
 
@@ -731,7 +766,14 @@ final class PlayerManager: NSObject, ObservableObject {
             let item = note.object as AnyObject?
             Task { @MainActor in
                 guard let self, item === self.player.currentItem else { return }
-                self.player.play()
+                self.handlePlaybackStall()
+            }
+        }
+        nc.addObserver(forName: .AVPlayerItemNewAccessLogEntry, object: nil, queue: .main) { [weak self] note in
+            let item = note.object as AnyObject?
+            Task { @MainActor in
+                guard let self, item === self.player.currentItem else { return }
+                self.evaluateNetworkRecovery()
             }
         }
         nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
@@ -846,6 +888,80 @@ final class PlayerManager: NSObject, ObservableObject {
             loadArtwork(for: updated)
         }
         updateNowPlaying()
+    }
+
+    // MARK: - Adaptive Bitrate & Buffer Health
+
+    private func handleBufferEmpty(_ empty: Bool) {
+        if empty && isPlaying {
+            isLoading = true
+        }
+    }
+
+    private func handleBufferKeepUp(_ keepUp: Bool) {
+        if keepUp {
+            isLoading = false
+            if player.timeControlStatus == .paused && isPlaying {
+                player.play()
+            }
+        }
+    }
+
+    private func handlePlaybackStall() {
+        let now = Date()
+        if now.timeIntervalSince(lastStallTime) < 40 {
+            stallCount += 1
+        } else {
+            stallCount = 1
+        }
+        lastStallTime = now
+
+        guard let item = player.currentItem else {
+            player.play()
+            return
+        }
+
+        isNetworkConstrained = true
+
+        // Proactively step down peak bitrate to switch to a lower variant in the master playlist without interruption
+        switch stallCount {
+        case 1:
+            // Cap to 720p (~2.5 Mbps)
+            item.preferredPeakBitRate = 2_500_000
+            item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+            showToast("Mạng chậm, tự động tối ưu 720p để tiếp tục phát mượt mà")
+        case 2:
+            // Cap to 480p (~1.0 Mbps)
+            item.preferredPeakBitRate = 1_000_000
+            item.preferredMaximumResolution = CGSize(width: 854, height: 480)
+            showToast("Mạng yếu, tự động điều chỉnh 480p để tránh đứng hình")
+        default:
+            // Cap to 360p (~500 kbps)
+            item.preferredPeakBitRate = 500_000
+            item.preferredMaximumResolution = CGSize(width: 640, height: 360)
+            showToast("Tối ưu hóa độ phân giải ở mức tiết kiệm dữ liệu")
+        }
+
+        player.play()
+    }
+
+    private func evaluateNetworkRecovery() {
+        guard isNetworkConstrained,
+              let event = player.currentItem?.accessLog()?.events.last,
+              event.observedBitrate > 0 else { return }
+
+        currentIndicatedBitrate = event.indicatedBitrate
+
+        // If observed bandwidth has recovered to > 5.5 Mbps and no stalls for 45s, restore full resolution
+        if event.observedBitrate > 5_500_000 && Date().timeIntervalSince(lastStallTime) > 45 {
+            isNetworkConstrained = false
+            stallCount = 0
+            if let item = player.currentItem {
+                let maxH = Double(Pref.maxHeight)
+                item.preferredPeakBitRate = 0 // Uncapped / Auto
+                item.preferredMaximumResolution = maxH > 0 ? CGSize(width: maxH * 16 / 9, height: maxH) : .zero
+            }
+        }
     }
 
     private func showToast(_ text: String) {

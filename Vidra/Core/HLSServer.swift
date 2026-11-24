@@ -297,41 +297,80 @@ enum HLSBuilder {
         return await HLSServer.shared.register(path: aPath, contentType: "application/vnd.apple.mpegurl", data: aData)
     }
 
-    /// Builds a compliant Apple HLS Master Playlist for separate YouTube DASH video and audio tracks.
-    static func buildMaster(id: String, video: DirectFormat, audio: DirectFormat, startTimeSecs: Int? = nil) async -> URL? {
-        guard let vInit = video.initRange, let vIdx = video.indexRange,
-              let aInit = audio.initRange, let aIdx = audio.indexRange else {
+    /// Builds a compliant Apple HLS Master Playlist for separate YouTube DASH video and audio tracks,
+    /// supporting seamless Adaptive Bitrate (ABR) switching between multiple resolutions (e.g. 1080p, 720p, 480p).
+    static func buildMaster(id: String, video: DirectFormat, audio: DirectFormat, variants: [DirectFormat] = [], startTimeSecs: Int? = nil) async -> URL? {
+        guard let aInit = audio.initRange, let aIdx = audio.indexRange else {
             return nil
         }
 
-        let vKey = "v_\(video.height ?? 0)"
-        async let vSegsRes = getOrFetchSegments(id: id, trackType: vKey, url: video.url, idx: vIdx)
-        async let aSegsRes = getOrFetchSegments(id: id, trackType: "a", url: audio.url, idx: aIdx)
-
-        guard let vSegs = await vSegsRes, let aSegs = await aSegsRes else {
-            return nil
+        // Prepare and deduplicate video variants (e.g. 1080p, 720p, 480p, 360p)
+        var allVariants = variants
+        if !allVariants.contains(where: { $0.url == video.url }) {
+            allVariants.append(video)
         }
-
-        let startD = startTimeSecs.map(Double.init)
-        let vPlaylist = makeMediaPlaylist(url: video.url, initRange: vInit, segments: vSegs, startSec: startD)
-        let aPlaylist = makeMediaPlaylist(url: audio.url, initRange: aInit, segments: aSegs, startSec: startD)
+        var validVariants: [DirectFormat] = []
+        var seenHeights = Set<Int>()
+        // Sort descending by resolution & bitrate so higher qualities are indexed first
+        allVariants.sort { ($0.height ?? 0, $0.bitrate) > ($1.height ?? 0, $1.bitrate) }
+        for v in allVariants {
+            guard let h = v.height, h > 0, v.initRange != nil, v.indexRange != nil else { continue }
+            if seenHeights.insert(h).inserted {
+                validVariants.append(v)
+            }
+        }
+        if validVariants.isEmpty {
+            guard video.initRange != nil, video.indexRange != nil else { return nil }
+            validVariants = [video]
+        }
 
         let tag = "\(id)_\(Int(Date().timeIntervalSince1970 * 1000))".replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
-        let vPath = "/hls/\(tag)/video.m3u8"
+        let startD = startTimeSecs.map(Double.init)
+
+        // Fetch audio and all video variant segments concurrently in parallel
+        async let aSegsRes = getOrFetchSegments(id: id, trackType: "a", url: audio.url, idx: aIdx)
+
+        var variantPlaylists: [(format: DirectFormat, fileName: String, path: String, playlist: String)] = []
+        await withTaskGroup(of: (DirectFormat, String, String, [SIDXSegment]?)?.self) { group in
+            for v in validVariants {
+                guard let vIdx = v.indexRange else { continue }
+                let h = v.height ?? 720
+                let fileName = "video_\(h).m3u8"
+                let vPath = "/hls/\(tag)/\(fileName)"
+                let vKey = "v_\(h)"
+                group.addTask {
+                    let segs = await getOrFetchSegments(id: id, trackType: vKey, url: v.url, idx: vIdx)
+                    return (v, fileName, vPath, segs)
+                }
+            }
+            for await result in group {
+                guard let (v, fileName, vPath, segs) = result, let segs, let vInit = v.initRange else { continue }
+                let vPlaylist = makeMediaPlaylist(url: v.url, initRange: vInit, segments: segs, startSec: startD)
+                variantPlaylists.append((v, fileName, vPath, vPlaylist))
+            }
+        }
+
+        guard let aSegs = await aSegsRes, !variantPlaylists.isEmpty else {
+            return nil
+        }
+
+        let aPlaylist = makeMediaPlaylist(url: audio.url, initRange: aInit, segments: aSegs, startSec: startD)
         let aPath = "/hls/\(tag)/audio.m3u8"
         let mPath = "/hls/\(tag)/master.m3u8"
 
-        guard let vData = vPlaylist.data(using: .utf8),
-              let aData = aPlaylist.data(using: .utf8) else { return nil }
-
-        _ = await HLSServer.shared.register(path: vPath, contentType: "application/vnd.apple.mpegurl", data: vData)
+        guard let aData = aPlaylist.data(using: .utf8) else { return nil }
         _ = await HLSServer.shared.register(path: aPath, contentType: "application/vnd.apple.mpegurl", data: aData)
 
-        let vCodec = extractCodec(from: video.mime) ?? "avc1.4d401f"
+        // Register each video variant playlist
+        for item in variantPlaylists {
+            if let vData = item.playlist.data(using: .utf8) {
+                _ = await HLSServer.shared.register(path: item.path, contentType: "application/vnd.apple.mpegurl", data: vData)
+            }
+        }
+
+        // Sort variants descending by height & bitrate for Apple HLS compliance
+        let sortedVariants = variantPlaylists.sorted { ($0.format.height ?? 0, $0.format.bitrate) > ($1.format.height ?? 0, $1.format.bitrate) }
         let aCodec = extractCodec(from: audio.mime) ?? "mp4a.40.2"
-        let width = video.width ?? (video.height.map { $0 * 16 / 9 } ?? 1280)
-        let height = video.height ?? 720
-        let bandwidth = max(video.bitrate + audio.bitrate, 800_000)
 
         var master = "#EXTM3U\n"
         master += "#EXT-X-VERSION:7\n"
@@ -340,9 +379,18 @@ enum HLSBuilder {
             master += String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", Double(s))
         }
         master += "\n"
-        master += "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n"
-        master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),CODECS=\"\(vCodec),\(aCodec)\",AUDIO=\"audio\"\n"
-        master += "video.m3u8\n"
+        master += "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n\n"
+
+        for item in sortedVariants {
+            let v = item.format
+            let vCodec = extractCodec(from: v.mime) ?? "avc1.4d401f"
+            let width = v.width ?? (v.height.map { $0 * 16 / 9 } ?? 1280)
+            let height = v.height ?? 720
+            let bandwidth = max(v.bitrate + audio.bitrate, 400_000)
+
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),CODECS=\"\(vCodec),\(aCodec)\",AUDIO=\"audio\"\n"
+            master += "\(item.fileName)\n\n"
+        }
 
         guard let mData = master.data(using: .utf8) else { return nil }
         return await HLSServer.shared.register(path: mPath, contentType: "application/vnd.apple.mpegurl", data: mData)

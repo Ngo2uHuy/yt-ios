@@ -314,7 +314,8 @@ actor InnerTube {
         let direct = DirectSet(
             video: directCandidates.compactMap(\.video).first,
             audio: directCandidates.compactMap(\.audio).first,
-            muxed: directCandidates.compactMap(\.muxed).first
+            muxed: directCandidates.compactMap(\.muxed).first,
+            videoVariants: directCandidates.first?.videoVariants ?? []
         )
 
         // If high resolution (>1080p) is selected, also prepare a 1080p H.264 fallback
@@ -324,7 +325,8 @@ actor InnerTube {
             return DirectSet(
                 video: fCandidates.compactMap(\.video).first,
                 audio: fCandidates.compactMap(\.audio).first,
-                muxed: fCandidates.compactMap(\.muxed).first
+                muxed: fCandidates.compactMap(\.muxed).first,
+                videoVariants: fCandidates.first?.videoVariants ?? []
             )
         }()
         let isLive = (vrOK ?? iosOK)?["videoDetails"]["isLive"].bool ?? false
@@ -356,9 +358,9 @@ actor InnerTube {
             }
             sources += hls.map { PlaybackSource.hls($0) }
         } else {
-            // 1. Primary high-resolution source (4K / 2K / 1080p)
+            // 1. Primary high-resolution source (4K / 2K / 1080p) with Multi-Bitrate ABR variants
             if let v = direct.video, let a = direct.audio {
-                if let dynamicHLS = await HLSBuilder.buildMaster(id: id, video: v, audio: a, startTimeSecs: startTimeSecs) {
+                if let dynamicHLS = await HLSBuilder.buildMaster(id: id, video: v, audio: a, variants: direct.videoVariants, startTimeSecs: startTimeSecs) {
                     sources.append(.hls(dynamicHLS))
                 }
                 sources.append(.composite(video: v.url, audio: a.url))
@@ -366,7 +368,7 @@ actor InnerTube {
 
             // 2. Fallback to 1080p H.264 if high-res stream is unplayable on this hardware
             if let fb = fallbackDirect, let fv = fb.video, let fa = fb.audio ?? direct.audio, (fv.height ?? 0) < (direct.video?.height ?? 0) {
-                if let dynamicHLS1080 = await HLSBuilder.buildMaster(id: id, video: fv, audio: fa, startTimeSecs: startTimeSecs) {
+                if let dynamicHLS1080 = await HLSBuilder.buildMaster(id: id, video: fv, audio: fa, variants: fb.videoVariants, startTimeSecs: startTimeSecs) {
                     sources.append(.hls(dynamicHLS1080))
                 }
                 sources.append(.composite(video: fv.url, audio: fa.url))
@@ -707,6 +709,17 @@ enum YTParse {
             .filter { $0.mime.hasPrefix("audio/mp4") && $0.isDefaultAudio }
             .max { $0.bitrate < $1.bitrate }
         let muxed = sd["formats"].array.compactMap(format).max { ($0.height ?? 0) < ($1.height ?? 0) }
-        return DirectSet(video: video, audio: audio, muxed: muxed)
+
+        // Extract distinct resolution tiers for Adaptive Bitrate (ABR) ladder
+        let heightTiers: [Int] = [2160, 1440, 1080, 720, 480, 360, 240]
+        var variants: [DirectFormat] = []
+        for tier in heightTiers where tier <= cap {
+            let matching = mp4Videos.filter { ($0.height ?? 0) == tier }
+            if let bestInTier = matching.max(by: { ($0.fps ?? 30, $0.bitrate) < ($1.fps ?? 30, $1.bitrate) }) {
+                variants.append(bestInTier)
+            }
+        }
+
+        return DirectSet(video: video, audio: audio, muxed: muxed, videoVariants: variants)
     }
 }
