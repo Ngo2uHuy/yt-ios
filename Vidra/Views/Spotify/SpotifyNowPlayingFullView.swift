@@ -57,6 +57,7 @@ struct SpotifyNowPlayingFullView: View {
     @State private var lyrics: LyricsResult? = nil
     @State private var lyricsLoading = false
     @State private var isLyricsExpanded = false
+    @State private var userScrolledAway = false
 
     // Sheets & modals
     @State private var showQueueSheet = false
@@ -102,6 +103,7 @@ struct SpotifyNowPlayingFullView: View {
         .task(id: pm.current?.id) {
             scrubFraction = nil
             artDragOffset = 0
+            userScrolledAway = false
             await loadAlbumArtworkColor()
             await loadTrackLyrics()
         }
@@ -726,11 +728,31 @@ struct SpotifyNowPlayingFullView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(slice, id: \.self) { line in
                         let isCurrent = (lyrics.synced.firstIndex(of: line) == activeIdx)
-                        Text(line.text.isEmpty ? "♪" : line.text)
-                            .font(.system(size: isCurrent ? 22 : 18, weight: .bold))
-                            .foregroundStyle(isCurrent ? Color.white : Color.white.opacity(0.4))
-                            .lineLimit(2)
-                            .animation(.easeInOut(duration: 0.2), value: activeIdx)
+                        Button {
+                            pm.seek(to: line.time)
+                            triggerHaptic(style: .medium)
+                        } label: {
+                            Text(line.text.isEmpty ? "♪" : line.text)
+                                .font(.system(
+                                    size: isCurrent ? 22 : 18,
+                                    weight: isCurrent ? .heavy : .bold,
+                                    design: .rounded
+                                ))
+                                .foregroundStyle(isCurrent ? Color.white : Color.white.opacity(0.45))
+                                .shadow(
+                                    color: isCurrent ? Color.white.opacity(0.85) : Color.clear,
+                                    radius: isCurrent ? 8 : 0
+                                )
+                                .shadow(
+                                    color: isCurrent ? tintColor.opacity(0.9) : Color.clear,
+                                    radius: isCurrent ? 16 : 0
+                                )
+                                .scaleEffect(isCurrent ? 1.02 : 1.0, anchor: .leading)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                        }
+                        .buttonStyle(LyricLineButtonStyle())
+                        .animation(.easeInOut(duration: 0.2), value: activeIdx)
                     }
                 }
                 .padding(.vertical, 4)
@@ -780,87 +802,93 @@ struct SpotifyNowPlayingFullView: View {
     // MARK: - Full Screen Synced Karaoke Lyrics View
 
     private func fullLyricsView(_ v: Video) -> some View {
-        VStack(spacing: 0) {
-            // Full-screen Top Bar
-            HStack {
-                Button {
-                    withAnimation(.spring(response: 0.42, dampingFraction: 0.8)) {
-                        isLyricsExpanded = false
+        ZStack {
+            // Spotify Canvas Ambient Glow Living Background
+            SpotifyCanvasBackground(tintColor: tintColor, isPlaying: pm.isPlaying)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Full-screen Top Bar
+                HStack {
+                    Button {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.8)) {
+                            isLyricsExpanded = false
+                        }
+                        triggerHaptic(style: .light)
+                    } label: {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(Color.white)
+                            .padding(10)
+                            .background(Color.black.opacity(0.35), in: Circle())
                     }
-                    triggerHaptic(style: .light)
-                } label: {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(Color.white)
-                        .padding(10)
-                        .background(Color.black.opacity(0.35), in: Circle())
-                }
 
-                Spacer()
+                    Spacer()
 
-                VStack(spacing: 2) {
-                    Text(v.title)
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(Color.white)
-                        .lineLimit(1)
-                    Text(v.channelTitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(SpotifyColors.subtextGray)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: 240)
+                    VStack(spacing: 2) {
+                        Text(v.title)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(Color.white)
+                            .lineLimit(1)
+                        Text(v.channelTitle)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(SpotifyColors.subtextGray)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: 240)
 
-                Spacer()
+                    Spacer()
 
-                ShareLink(item: v.shareURL) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(Color.white)
-                        .padding(10)
-                        .background(Color.black.opacity(0.35), in: Circle())
+                    ShareLink(item: v.shareURL) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(Color.white)
+                            .padding(10)
+                            .background(Color.black.opacity(0.35), in: Circle())
+                    }
                 }
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            // Lyrics Scroll Body
-            if lyricsLoading {
-                VStack(spacing: 12) {
-                    ProgressView().tint(Color.white).scaleEffect(1.2)
-                    Text("Đang tải lời bài hát...")
-                        .font(.headline)
-                        .foregroundStyle(Color.white.opacity(0.7))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let lyrics, !lyrics.synced.isEmpty {
-                syncedLyricsKaraokeList(lyrics.synced)
-            } else if let plain = lyrics?.plain, !plain.isEmpty {
-                ScrollView {
-                    Text(plain)
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.85))
-                        .multilineTextAlignment(.leading)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 36)
-                }
-            } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "music.note.list")
-                        .font(.system(size: 48))
-                        .foregroundStyle(Color.white.opacity(0.4))
-                    Text("Không tìm thấy lời bài hát")
-                        .font(.headline)
-                        .foregroundStyle(Color.white.opacity(0.6))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-
-            // Compact Bottom Player Controls in Lyrics Mode
-            miniControlsInLyrics(v)
                 .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                .background(Color.black.opacity(0.4))
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+
+                // Lyrics Scroll Body
+                if lyricsLoading {
+                    VStack(spacing: 12) {
+                        ProgressView().tint(Color.white).scaleEffect(1.2)
+                        Text("Đang tải lời bài hát...")
+                            .font(.headline)
+                            .foregroundStyle(Color.white.opacity(0.7))
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let lyrics, !lyrics.synced.isEmpty {
+                    syncedLyricsKaraokeList(lyrics.synced)
+                } else if let plain = lyrics?.plain, !plain.isEmpty {
+                    ScrollView {
+                        Text(plain)
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundStyle(Color.white.opacity(0.85))
+                            .multilineTextAlignment(.leading)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 36)
+                    }
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "music.note.list")
+                            .font(.system(size: 48))
+                            .foregroundStyle(Color.white.opacity(0.4))
+                        Text("Không tìm thấy lời bài hát")
+                            .font(.headline)
+                            .foregroundStyle(Color.white.opacity(0.6))
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                // Compact Bottom Player Controls in Lyrics Mode
+                miniControlsInLyrics(v)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .background(Color.black.opacity(0.45))
+            }
         }
     }
 
@@ -868,46 +896,127 @@ struct SpotifyNowPlayingFullView: View {
         let activeIdx = currentLyricIndex(lines)
 
         return ScrollViewReader { proxy in
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 24) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                        let isCurrent = (index == activeIdx)
+            ZStack(alignment: .bottom) {
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 26) {
+                        ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                            let isCurrent = (index == activeIdx)
+                            let isPast = (index < activeIdx)
+                            let text = line.text.isEmpty ? "♪" : line.text
 
-                        Text(line.text.isEmpty ? "♪" : line.text)
-                            .font(.system(size: isCurrent ? 28 : 22, weight: .bold))
-                            .foregroundStyle(isCurrent ? Color.white : Color.white.opacity(0.38))
-                            .blur(radius: isCurrent ? 0 : 0.3)
-                            .scaleEffect(isCurrent ? 1.02 : 1.0, anchor: .leading)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
+                            Button {
                                 pm.seek(to: line.time)
-                                triggerHaptic(style: .light)
+                                userScrolledAway = false
+                                triggerHaptic(style: .medium)
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                    proxy.scrollTo(index, anchor: .center)
+                                }
+                            } label: {
+                                Text(text)
+                                    .font(.system(
+                                        size: isCurrent ? 28 : 22,
+                                        weight: isCurrent ? .heavy : .bold,
+                                        design: .rounded
+                                    ))
+                                    .foregroundStyle(
+                                        isCurrent ? Color.white :
+                                        (isPast ? Color.white.opacity(0.65) : Color.white.opacity(0.30))
+                                    )
+                                    .shadow(
+                                        color: isCurrent ? Color.white.opacity(0.85) : Color.clear,
+                                        radius: isCurrent ? 8 : 0,
+                                        x: 0,
+                                        y: 0
+                                    )
+                                    .shadow(
+                                        color: isCurrent ? tintColor.opacity(0.95) : Color.clear,
+                                        radius: isCurrent ? 22 : 0,
+                                        x: 0,
+                                        y: 0
+                                    )
+                                    .shadow(
+                                        color: isCurrent ? Color.black.opacity(0.5) : Color.clear,
+                                        radius: isCurrent ? 4 : 0,
+                                        x: 0,
+                                        y: 2
+                                    )
+                                    .blur(radius: isCurrent ? 0 : (isPast ? 0 : 0.35))
+                                    .scaleEffect(isCurrent ? 1.04 : 1.0, anchor: .leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .multilineTextAlignment(.leading)
+                                    .padding(.vertical, isCurrent ? 4 : 0)
                             }
+                            .buttonStyle(LyricLineButtonStyle())
                             .id(index)
+                        }
                     }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 60)
+                    .padding(.bottom, 110)
+                    .animation(.spring(response: 0.38, dampingFraction: 0.8), value: activeIdx)
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 90)
-                .animation(.spring(response: 0.38, dampingFraction: 0.8), value: activeIdx)
-            }
-            // Spotify fade mask at top and bottom
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .clear, location: 0),
-                        .init(color: .black, location: 0.08),
-                        .init(color: .black, location: 0.90),
-                        .init(color: .clear, location: 1)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 10)
+                        .onChanged { _ in
+                            if !userScrolledAway {
+                                userScrolledAway = true
+                            }
+                        }
                 )
-            )
+                // Spotify fade mask at top and bottom
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black, location: 0.10),
+                            .init(color: .black, location: 0.88),
+                            .init(color: .clear, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+                // Floating Re-sync button when user scrolled away
+                if userScrolledAway && activeIdx >= 0 {
+                    Button {
+                        userScrolledAway = false
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                            proxy.scrollTo(activeIdx, anchor: .center)
+                        }
+                        triggerHaptic(style: .light)
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 13, weight: .bold))
+                            Text("Đồng bộ lời bài hát")
+                                .font(.system(size: 13, weight: .bold))
+                        }
+                        .foregroundStyle(Color.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.white, in: Capsule())
+                        .shadow(color: Color.black.opacity(0.45), radius: 10, y: 4)
+                    }
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
             .onChange(of: activeIdx) { newIndex in
                 guard newIndex >= 0 else { return }
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                    proxy.scrollTo(newIndex, anchor: .center)
+                if !userScrolledAway {
+                    withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                        proxy.scrollTo(newIndex, anchor: .center)
+                    }
+                }
+            }
+            .onAppear {
+                if activeIdx >= 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                            proxy.scrollTo(activeIdx, anchor: .center)
+                        }
+                    }
                 }
             }
         }
@@ -915,27 +1024,56 @@ struct SpotifyNowPlayingFullView: View {
 
     private func miniControlsInLyrics(_ v: Video) -> some View {
         VStack(spacing: 8) {
-            // Slim progress bar
+            // Interactive slim progress bar
             let total = max(pm.duration, 0)
             let fraction = scrubFraction ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
+            let shownTime = scrubFraction.map { $0 * total } ?? pm.currentTime
 
-            HStack {
-                Text(Fmt.time(pm.currentTime))
+            HStack(spacing: 8) {
+                Text(Fmt.time(shownTime))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(SpotifyColors.subtextGray)
+                    .frame(width: 44, alignment: .leading)
 
                 GeometryReader { geo in
+                    let width = geo.size.width
+                    let progressWidth = max(0, min(width, width * fraction))
+
                     ZStack(alignment: .leading) {
                         Capsule().fill(SpotifyColors.trackUnfilled).frame(height: 3)
-                        Capsule().fill(Color.white).frame(width: geo.size.width * fraction, height: 3)
+                        Capsule().fill(Color.white).frame(width: progressWidth, height: 3)
+
+                        if isScrubbing {
+                            Circle()
+                                .fill(Color.white)
+                                .frame(width: 10, height: 10)
+                                .offset(x: max(0, min(width - 10, progressWidth - 5)))
+                        }
                     }
                     .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { g in
+                                isScrubbing = true
+                                scrubFraction = min(max(g.location.x / max(width, 1), 0), 1)
+                            }
+                            .onEnded { g in
+                                let f = min(max(g.location.x / max(width, 1), 0), 1)
+                                isScrubbing = false
+                                scrubFraction = nil
+                                if total > 0 {
+                                    pm.seek(to: f * total)
+                                }
+                            }
+                    )
                 }
-                .frame(height: 12)
+                .frame(height: 14)
 
-                Text("-" + Fmt.time(max(total - pm.currentTime, 0)))
+                Text("-" + Fmt.time(max(total - shownTime, 0)))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(SpotifyColors.subtextGray)
+                    .frame(width: 44, alignment: .trailing)
             }
 
             // Controls
@@ -1030,6 +1168,81 @@ struct SpotifyNowPlayingFullView: View {
         let generator = UIImpactFeedbackGenerator(style: style)
         generator.prepare()
         generator.impactOccurred()
+    }
+}
+
+// MARK: - Spotify Canvas Ambient Glow Background
+
+private struct SpotifyCanvasBackground: View {
+    let tintColor: Color
+    let isPlaying: Bool
+
+    @State private var animatePulse = false
+
+    var body: some View {
+        ZStack {
+            // Base background
+            SpotifyColors.backgroundBlack
+
+            // Deep dynamic tint gradient
+            LinearGradient(
+                stops: [
+                    .init(color: tintColor.opacity(0.85), location: 0.0),
+                    .init(color: tintColor.opacity(0.35), location: 0.45),
+                    .init(color: SpotifyColors.backgroundBlack.opacity(0.95), location: 0.75),
+                    .init(color: SpotifyColors.backgroundBlack, location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            // Canvas Orb 1: Upper glowing radiant aura
+            Circle()
+                .fill(tintColor.opacity(0.55))
+                .frame(width: 360, height: 360)
+                .blur(radius: 75)
+                .offset(
+                    x: animatePulse ? -50 : 50,
+                    y: animatePulse ? -100 : -30
+                )
+
+            // Canvas Orb 2: Ambient center light pulse (breathes with playback)
+            Circle()
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 280, height: 280)
+                .blur(radius: 65)
+                .scaleEffect(animatePulse ? (isPlaying ? 1.25 : 1.05) : 0.95)
+                .offset(x: 25, y: animatePulse ? 60 : -20)
+
+            // Canvas Orb 3: Lower warm atmosphere
+            Circle()
+                .fill(tintColor.opacity(0.40))
+                .frame(width: 320, height: 320)
+                .blur(radius: 85)
+                .offset(
+                    x: animatePulse ? 70 : -30,
+                    y: animatePulse ? 160 : 220
+                )
+
+            // Contrast scrim overlay for crisp text readability
+            Color.black.opacity(0.25)
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 5.5).repeatForever(autoreverses: true)) {
+                animatePulse = true
+            }
+        }
+    }
+}
+
+// MARK: - Lyric Line Button Style
+
+private struct LyricLineButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.70 : 1.0)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
+            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
