@@ -24,13 +24,9 @@ struct YouTubeRootView: View {
                 case .create:
                     EmptyView()
                 case .subscriptions:
-                    NavigationStack {
-                        YouTubeSubscriptionsView()
-                    }
+                    YouTubeSubscriptionsView()
                 case .you:
-                    NavigationStack {
-                        YouTubeYouView()
-                    }
+                    YouTubeYouView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)

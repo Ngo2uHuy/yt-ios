@@ -155,7 +155,7 @@ struct SpotifyImportView: View {
                         .disabled(importer.running || Spotify.parseLink(link) == nil)
                 }
             } footer: {
-                Text("Vidra đọc danh sách bài từ Spotify (playlist phải ở chế độ công khai) rồi phát bản tương ứng từ YouTube Music. Âm thanh gốc của Spotify có DRM nên không phát trực tiếp được.")
+                Text("Vidra đọc danh sách bài từ Spotify và hỗ trợ phát nhạc chất lượng cao, đồng bộ danh sách phát yêu thích của bạn.")
             }
 
             if importer.running {

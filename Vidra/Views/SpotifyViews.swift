@@ -60,7 +60,7 @@ struct SpotifySetupView: View {
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Kết nối Spotify").font(.title2.bold())
-                    Text("Đồng bộ thư viện, playlist và phát nhạc trực tiếp chất lượng cao qua Spotify App Remote (hoặc nguồn YouTube Music thay thế).")
+                    Text("Đồng bộ thư viện, playlist và phát nhạc trực tiếp chất lượng cao qua Spotify App Remote (hoặc nguồn âm thanh thay thế).")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
 

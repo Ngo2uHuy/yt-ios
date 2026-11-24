@@ -829,14 +829,14 @@ struct YouTubeWatchDetails: View {
 
     // MARK: - Video Metadata Loading
 
-    private func fetchVotes(for video: Video) async -> Votes? {
+    private nonisolated static func fetchVotes(for video: Video) async -> Votes? {
         if video.source == nil || video.source == .ytMusic {
             return await Extras.votes(video.id)
         }
         return nil
     }
 
-    private func fetchTopComment(token: String?) async -> (Comment?, String?) {
+    private nonisolated static func fetchTopComment(token: String?) async -> (Comment?, String?) {
         guard let token else { return (nil, nil) }
         if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
             return (first, res.items.count > 0 ? "\(res.items.count)+" : nil)
@@ -844,7 +844,7 @@ struct YouTubeWatchDetails: View {
         return (nil, nil)
     }
 
-    private func fetchChannel(id: String?, known: Channel?) async -> Channel? {
+    private nonisolated static func fetchChannel(id: String?, known: Channel?) async -> Channel? {
         if let known { return known }
         guard let id, !id.isEmpty else { return nil }
         let page = try? await InnerTube.shared.channelVideos(id, continuation: nil)
@@ -857,9 +857,9 @@ struct YouTubeWatchDetails: View {
         let knownSub = chId.flatMap { id in lib.subscriptions.first(where: { $0.id == id }) }
 
         Task {
-            async let votesRes = fetchVotes(for: v)
-            async let commentRes = fetchTopComment(token: token)
-            async let channelRes = fetchChannel(id: chId, known: knownSub)
+            async let votesRes = Self.fetchVotes(for: v)
+            async let commentRes = Self.fetchTopComment(token: token)
+            async let channelRes = Self.fetchChannel(id: chId, known: knownSub)
 
             let (vRes, cRes, chRes) = await (votesRes, commentRes, channelRes)
             guard pm.current?.id == v.id else { return }

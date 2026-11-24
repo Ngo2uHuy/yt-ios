@@ -455,10 +455,57 @@ actor SpotifyAPI {
 
     // MARK: - Playback Control (Spotify Connect Web API)
 
+    struct SpotifyDevice: Identifiable, Hashable {
+        let id: String
+        let name: String
+        let type: String
+        let isActive: Bool
+        let isPrivateSession: Bool
+        let isRestricted: Bool
+        let volumePercent: Int?
+    }
+
+    /// Fetches a list of available Spotify Connect devices.
+    func getDevices() async throws -> [SpotifyDevice] {
+        let j = try await get("me/player/devices")
+        return j["devices"].array.compactMap { d in
+            guard let id = d["id"].string, !id.isEmpty else { return nil }
+            return SpotifyDevice(
+                id: id,
+                name: d["name"].string ?? "Thiết bị Spotify",
+                type: d["type"].string ?? "Smartphone",
+                isActive: d["is_active"].bool ?? false,
+                isPrivateSession: d["is_private_session"].bool ?? false,
+                isRestricted: d["is_restricted"].bool ?? false,
+                volumePercent: d["volume_percent"].int
+            )
+        }
+    }
+
+    /// Transfers playback to a target Spotify device.
+    func transferPlayback(to deviceId: String, play: Bool = true) async throws {
+        let body: [String: Any] = [
+            "device_ids": [deviceId],
+            "play": play
+        ]
+        _ = try await put("me/player", body: body)
+    }
+
     /// Starts playback of a track URI directly on the user's active Spotify device or app.
     func playTrack(uri: String) async throws {
         let body: [String: Any] = ["uris": [uri]]
-        _ = try await put("me/player/play", body: body)
+        do {
+            _ = try await put("me/player/play", body: body)
+        } catch let SpotifyError.http(code, _) where code == 404 {
+            // No active device found: attempt to find any available device and transfer playback
+            if let devices = try? await getDevices(), let first = devices.first {
+                try await transferPlayback(to: first.id, play: true)
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                _ = try await put("me/player/play", body: body)
+            } else {
+                throw SpotifyError.message("Không tìm thấy thiết bị Spotify đang mở.")
+            }
+        }
     }
 
     /// Pauses playback on active Spotify device.

@@ -153,7 +153,7 @@ struct VideoMenu: ViewModifier {
         content.contextMenu {
             if video.source == .spotify {
                 Button { showRemap = true } label: {
-                    Label("Đổi bản YouTube Music", systemImage: "arrow.triangle.2.circlepath")
+                    Label("Đổi nguồn âm thanh", systemImage: "arrow.triangle.2.circlepath")
                 }
             }
             Button { PlayerManager.shared.playNext(video) } label: {
@@ -327,9 +327,9 @@ struct SpotifyRemapSheet: View {
                     .padding(.vertical, 4)
                 }
 
-                Section("Tìm kiếm bản phát YouTube Music") {
+                Section("Tìm kiếm nguồn âm thanh thay thế") {
                     HStack {
-                        TextField("Tìm trên YouTube Music", text: $query)
+                        TextField("Tìm kiếm bài hát", text: $query)
                             .onSubmit { search() }
                         Button("Tìm") { search() }
                             .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty || loading)
@@ -375,7 +375,7 @@ struct SpotifyRemapSheet: View {
                     }
                 }
             }
-            .navigationTitle("Đổi bản YouTube Music")
+            .navigationTitle("Đổi nguồn âm thanh")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {

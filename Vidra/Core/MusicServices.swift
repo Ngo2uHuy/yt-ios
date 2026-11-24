@@ -23,7 +23,7 @@ actor TrackMatcher {
         let artist = v.channelTitle.components(separatedBy: ",").first ?? v.channelTitle
         let results = try await InnerTube.shared.musicSearch("\(v.title) \(artist)", continuation: nil).videos.prefix(5)
         guard let first = results.first else {
-            throw YTError.unplayable("Không tìm thấy bài này trên YouTube Music")
+            throw YTError.unplayable("Không tìm thấy nguồn phát cho bài hát này")
         }
         // Same song often has several uploads; the closest duration is usually the original.
         var best = first

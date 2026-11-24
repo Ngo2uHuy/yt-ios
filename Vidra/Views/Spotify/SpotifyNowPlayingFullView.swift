@@ -244,6 +244,19 @@ struct SpotifyNowPlayingFullView: View {
 
                 if v.source == .spotify {
                     Button {
+                        if let url = v.link {
+                            UIApplication.shared.open(url)
+                        } else {
+                            let rawId = v.id.hasPrefix("sp:") ? String(v.id.dropFirst(3)) : v.id
+                            if let spUrl = URL(string: "spotify:track:\(rawId)") {
+                                UIApplication.shared.open(spUrl)
+                            }
+                        }
+                    } label: {
+                        Label("Mở trong ứng dụng Spotify", systemImage: "arrow.up.forward.app")
+                    }
+
+                    Button {
                         remapTarget = v
                     } label: {
                         Label("Đổi nguồn âm thanh", systemImage: "arrow.triangle.2.circlepath")

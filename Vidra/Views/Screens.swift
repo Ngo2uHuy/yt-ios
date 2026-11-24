@@ -739,7 +739,7 @@ struct SettingsView: View {
                     ))
 
                     if !SpotifyRemote.shared.isSpotifyInstalled {
-                        Text("Chưa phát hiện app Spotify trên máy. Vidra sẽ tự động phát qua nguồn YouTube Music thay thế.")
+                        Text("Chưa phát hiện app Spotify trên máy. Vidra sẽ tự động phát trực tiếp qua nguồn âm thanh thay thế.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

@@ -139,14 +139,24 @@ final class PlayerManager: NSObject, ObservableObject {
         }
 
         // If player has an active item, seek directly in AVPlayer for zero-latency response
-        if player.currentItem != nil {
-            let tol = target <= 0.1 ? CMTime.zero : CMTime(seconds: 2.0, preferredTimescale: 600)
-            player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
-                        toleranceBefore: tol,
-                        toleranceAfter: tol) { [weak self] _ in
-                Task { @MainActor in
-                    self?.player.play()
-                    self?.updateNowPlaying()
+        if let item = player.currentItem {
+            guard item.status == .readyToPlay else {
+                pendingSeek = target
+                return
+            }
+            if target <= 0.1 {
+                player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.player.play()
+                        self?.updateNowPlaying()
+                    }
+                }
+            } else {
+                player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.player.play()
+                        self?.updateNowPlaying()
+                    }
                 }
             }
             return
@@ -645,13 +655,19 @@ final class PlayerManager: NSObject, ObservableObject {
         case .readyToPlay:
             if let s = pendingSeek {
                 pendingSeek = nil
-                let tol = s <= 0.1 ? CMTime.zero : CMTime(seconds: 2.0, preferredTimescale: 600)
-                player.seek(to: CMTime(seconds: s, preferredTimescale: 600),
-                            toleranceBefore: tol,
-                            toleranceAfter: tol) { [weak self] _ in
-                    Task { @MainActor in
-                        self?.player.play()
-                        self?.updateNowPlaying()
+                if s <= 0.1 {
+                    player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                        Task { @MainActor in
+                            self?.player.play()
+                            self?.updateNowPlaying()
+                        }
+                    }
+                } else {
+                    player.seek(to: CMTime(seconds: s, preferredTimescale: 600)) { [weak self] _ in
+                        Task { @MainActor in
+                            self?.player.play()
+                            self?.updateNowPlaying()
+                        }
                     }
                 }
             }
