@@ -844,7 +844,7 @@ struct YouTubeWatchDetails: View {
             }()
 
             let (vRes, cRes, chRes) = await (votesRes, commentRes, channelRes)
-            guard currentVideo?.id == v.id || pm.current?.id == v.id else { return }
+            guard pm.current?.id == v.id else { return }
             self.votes = vRes
             self.topComment = cRes.0
             self.topCommentCount = cRes.1
