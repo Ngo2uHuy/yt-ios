@@ -25,10 +25,17 @@ struct SponsorSegment: Decodable {
 }
 
 enum Extras {
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 8
+        cfg.timeoutIntervalForResource = 12
+        return URLSession(configuration: cfg)
+    }()
+
     /// Return YouTube Dislike community API.
     static func votes(_ id: String) async -> Votes? {
         guard let url = URL(string: "https://returnyoutubedislikeapi.com/votes?videoId=\(id)"),
-              let res = try? await URLSession.shared.data(from: url) else { return nil }
+              let res = try? await session.data(from: url) else { return nil }
         return try? JSONDecoder().decode(Votes.self, from: res.0)
     }
 
@@ -38,14 +45,14 @@ enum Extras {
             .init(name: "videoID", value: id),
             .init(name: "categories", value: #"["sponsor","selfpromo","interaction","music_offtopic"]"#),
         ]
-        guard let url = c.url, let res = try? await URLSession.shared.data(from: url) else { return [] }
+        guard let url = c.url, let res = try? await session.data(from: url) else { return [] }
         return (try? JSONDecoder().decode([SponsorSegment].self, from: res.0)) ?? []
     }
 
     /// Per-channel RSS is cheap and needs no login, unlike the real subscription feed.
     static func channelFeed(_ id: String) async -> [FeedEntry] {
         guard let url = URL(string: "https://www.youtube.com/feeds/videos.xml?channel_id=\(id)"),
-              let res = try? await URLSession.shared.data(from: url) else { return [] }
+              let res = try? await session.data(from: url) else { return [] }
         return RSSParser.parse(res.0)
     }
 
@@ -72,6 +79,9 @@ enum Extras {
 }
 
 final class RSSParser: NSObject, XMLParserDelegate {
+    private static let isoFormatter = ISO8601DateFormatter()
+    private static let isoLock = NSLock()
+
     private var entries: [FeedEntry] = []
     private var fields: [String: String] = [:]
     private var buffer = ""
@@ -119,7 +129,12 @@ final class RSSParser: NSObject, XMLParserDelegate {
 
     private func makeEntry() -> FeedEntry? {
         guard let id = fields["yt:videoId"], let title = fields["title"] else { return nil }
-        let date = fields["published"].flatMap { ISO8601DateFormatter().date(from: $0) } ?? .distantPast
+        let date: Date = {
+            guard let p = fields["published"] else { return .distantPast }
+            Self.isoLock.lock()
+            defer { Self.isoLock.unlock() }
+            return Self.isoFormatter.date(from: p) ?? .distantPast
+        }()
         let views = fields["views"].flatMap { Int($0) }
         let video = Video(
             id: id,
@@ -135,9 +150,7 @@ final class RSSParser: NSObject, XMLParserDelegate {
 
 enum Media {
     static func asset(_ url: URL) -> AVURLAsset {
-        guard url.host?.contains("googlevideo") == true else { return AVURLAsset(url: url) }
-        // Stream URLs are bound to the client that requested them.
-        return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": YTClient.androidVR.userAgent]])
+        AVURLAsset(url: url)
     }
 
     /// Joins separate video-only and audio-only streams (how YouTube serves >360p) into one item.
@@ -159,12 +172,23 @@ enum Media {
 
     static func merge(video: URL, audio: URL, to output: URL) async throws {
         let comp = try await composition(video: AVURLAsset(url: video), audio: AVURLAsset(url: audio))
-        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else {
-            throw YTError.noStreams
+        var export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough)
+        if export == nil {
+            export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality)
         }
-        export.outputURL = output
-        export.outputFileType = .mp4
-        await export.export()
-        if export.status != .completed { throw export.error ?? YTError.noStreams }
+        guard let session = export else { throw YTError.noStreams }
+        session.outputURL = output
+        session.outputFileType = .mp4
+        await session.export()
+        if session.status != .completed {
+            if let retry = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality) {
+                try? FileManager.default.removeItem(at: output)
+                retry.outputURL = output
+                retry.outputFileType = .mp4
+                await retry.export()
+                if retry.status == .completed { return }
+            }
+            throw session.error ?? YTError.noStreams
+        }
     }
 }

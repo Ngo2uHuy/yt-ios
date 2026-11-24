@@ -56,5 +56,21 @@ struct J {
         return out
     }
 
-    func first(_ key: String) -> J? { collect([key]).first?.value }
+    func first(_ key: String) -> J? {
+        func find(_ node: Any) -> J? {
+            if let d = node as? [String: Any] {
+                if let v = d[key] { return J(v) }
+                for (_, v) in d {
+                    if let found = find(v) { return found }
+                }
+            } else if let a = node as? [Any] {
+                for v in a {
+                    if let found = find(v) { return found }
+                }
+            }
+            return nil
+        }
+        guard let raw else { return nil }
+        return find(raw)
+    }
 }

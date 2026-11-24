@@ -20,9 +20,23 @@ struct HomeView: View {
                 Divider()
                 content
             }
-            .navigationTitle("Vidra")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    HStack(spacing: 6) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.red)
+                                .frame(width: 28, height: 20)
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 9, weight: .black))
+                                .foregroundStyle(.white)
+                        }
+                        Text("Vidra")
+                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                            .tracking(-0.3)
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
                 }
@@ -226,6 +240,23 @@ struct SearchView: View {
         case nil:
             break
         }
+        if let parsed = Spotify.parseLink(q) {
+            Task {
+                if let (_, tracks) = try? await Spotify.fetch(q), let first = tracks.first {
+                    if parsed.kind == "track" {
+                        let v = Video(id: "sp:\(parsed.id)", title: first.title, channelTitle: first.artist, source: .spotify)
+                        PlayerManager.shared.play(v)
+                    } else {
+                        let matched = await Spotify.matchAll(tracks) { _ in }
+                        let playable = matched.compactMap { $0 }
+                        if let firstPlay = playable.first {
+                            PlayerManager.shared.play(firstPlay, queue: Array(playable.dropFirst()))
+                        }
+                    }
+                }
+            }
+            return
+        }
         query = q
         var r = recents.filter { $0 != q }
         r.insert(q, at: 0)
@@ -235,32 +266,54 @@ struct SearchView: View {
 
 // MARK: - Channel & remote playlist
 
+enum ChannelTab: String, CaseIterable, Identifiable {
+    case videos = "Video"
+    case playlists = "Danh sách phát"
+    var id: String { rawValue }
+}
+
 struct ChannelView: View {
     @State var channel: Channel
     @ObservedObject private var lib = Library.shared
+    @State private var tab = ChannelTab.videos
 
     var body: some View {
-        PagedList(
-            loader: { [id = channel.id, title = channel.title] token in
-                var p = try await InnerTube.shared.channelVideos(id, continuation: token)
-                let name = p.channel?.title ?? title
-                p.videos = p.videos.map { v in
-                    var v = v
-                    if v.channelTitle.isEmpty { v.channelTitle = name }
-                    v.channelId = id
-                    return v
-                }
-                return p
-            },
-            header: AnyView(header),
-            compact: false,
-            onFirstPage: { p in
-                guard let c = p.channel else { return }
-                channel = Channel(id: c.id, title: c.title.isEmpty ? channel.title : c.title,
-                                  avatar: c.avatar ?? channel.avatar, subscribers: c.subscribers)
-                lib.refreshChannel(channel)
+        Group {
+            switch tab {
+            case .videos:
+                PagedList(
+                    loader: { [id = channel.id, title = channel.title] token in
+                        var p = try await InnerTube.shared.channelVideos(id, continuation: token)
+                        let name = p.channel?.title ?? title
+                        p.videos = p.videos.map { v in
+                            var v = v
+                            if v.channelTitle.isEmpty { v.channelTitle = name }
+                            v.channelId = id
+                            return v
+                        }
+                        return p
+                    },
+                    header: AnyView(header),
+                    compact: false,
+                    onFirstPage: { p in
+                        guard let c = p.channel else { return }
+                        channel = Channel(id: c.id, title: c.title.isEmpty ? channel.title : c.title,
+                                          avatar: c.avatar ?? channel.avatar, subscribers: c.subscribers)
+                        lib.refreshChannel(channel)
+                    }
+                )
+                .id("videos-\(channel.id)")
+            case .playlists:
+                PagedList(
+                    loader: { [id = channel.id] token in
+                        try await InnerTube.shared.channelPlaylists(id, continuation: token)
+                    },
+                    header: AnyView(header),
+                    compact: false
+                )
+                .id("playlists-\(channel.id)")
             }
-        )
+        }
         .navigationTitle(channel.title)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -271,6 +324,12 @@ struct ChannelView: View {
             Text(channel.title).font(.title3.bold())
             if let s = channel.subscribers { Text(s).font(.caption).foregroundStyle(.secondary) }
             SubscribeButton(channel: channel)
+            Picker("Tab", selection: $tab) {
+                ForEach(ChannelTab.allCases) { t in Text(t.rawValue).tag(t) }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
@@ -374,9 +433,7 @@ struct ArtistDestination: View {
     let channel: Channel
 
     var body: some View {
-        if channel.id.hasPrefix("scu:") {
-            SoundCloudUserView(userId: channel.id, name: channel.title)
-        } else if channel.id.hasPrefix("spa:") {
+        if channel.id.hasPrefix("spa:") {
             SpotifyArtistView(artistId: String(channel.id.dropFirst(4)), name: channel.title)
         } else {
             ChannelView(channel: channel)
@@ -644,13 +701,71 @@ struct SettingsView: View {
     @AppStorage(Pref.hideShortsKey) private var hideShorts = true
     @AppStorage(Pref.musicAudioOnlyKey) private var musicAudioOnly = true
     @State private var confirmClear = false
+    @State private var importingLibrary = false
+    @State private var importMessage: String?
+    @ObservedObject private var spotifyAuth = SpotifyAuth.shared
 
     var body: some View {
         Form {
+            Section("Chế độ ứng dụng") {
+                Picker("Chế độ giao diện", selection: Binding(
+                    get: { AppModeManager.shared.currentMode },
+                    set: { AppModeManager.shared.switchTo($0) }
+                )) {
+                    ForEach(AppMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.iconName).tag(mode)
+                    }
+                }
+            }
+
+            Section("Tài khoản Spotify") {
+                if spotifyAuth.isLoggedIn {
+                    HStack(spacing: 12) {
+                        Avatar(url: spotifyAuth.profile?.image, name: spotifyAuth.profile?.name ?? "S", size: 40)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(spotifyAuth.profile?.name ?? "Người dùng Spotify")
+                                .font(.headline)
+                            HStack(spacing: 4) {
+                                Circle().fill(Color.green).frame(width: 8, height: 8)
+                                Text("Đã kết nối").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+
+                    Button("Đăng xuất Spotify", role: .destructive) {
+                        spotifyAuth.logout()
+                    }
+                } else {
+                    NavigationLink {
+                        SpotifySetupView()
+                            .navigationTitle("Kết nối Spotify")
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Kết nối tài khoản Spotify")
+                                    .foregroundStyle(.primary)
+                                Text("Đồng bộ thư viện, playlist và bài hát đã thích")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "music.note")
+                                .foregroundStyle(.green)
+                        }
+                    }
+                }
+            }
+
             Section("Phát lại") {
                 Picker("Chất lượng tối đa", selection: $maxHeight) {
-                    Text("Tự động").tag(0)
-                    ForEach([1080, 720, 480, 360], id: \.self) { Text("\($0)p").tag($0) }
+                    Text("Tự động (Cao nhất)").tag(0)
+                    Text("4K (2160p)").tag(2160)
+                    Text("2K (1440p)").tag(1440)
+                    Text("1080p (FHD)").tag(1080)
+                    Text("720p (HD)").tag(720)
+                    Text("480p (SD)").tag(480)
+                    Text("360p").tag(360)
                 }
                 Picker("Tốc độ mặc định", selection: $defaultRate) {
                     ForEach([0.75, 1.0, 1.25, 1.5, 1.75, 2.0], id: \.self) { Text(Fmt.rate($0)).tag($0) }
@@ -670,6 +785,11 @@ struct SettingsView: View {
             Section("Quyền riêng tư & dữ liệu") {
                 Toggle("Lưu lịch sử xem", isOn: $saveHistory)
                 ShareLink(item: Library.fileURL) { Label("Xuất dữ liệu (JSON)", systemImage: "square.and.arrow.up") }
+                Button {
+                    importingLibrary = true
+                } label: {
+                    Label("Nhập dữ liệu sao lưu (JSON)", systemImage: "square.and.arrow.down")
+                }
                 Button("Xoá bộ nhớ đệm ảnh") { URLCache.shared.removeAllCachedResponses() }
                 Button("Xoá lịch sử xem", role: .destructive) { confirmClear = true }
             }
@@ -680,9 +800,28 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Cài đặt")
+        .task {
+            if spotifyAuth.isLoggedIn && spotifyAuth.profile == nil {
+                await spotifyAuth.loadProfile()
+            }
+        }
         .onAppear { Library.shared.flush() }
         .confirmationDialog("Xoá toàn bộ lịch sử xem?", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("Xoá", role: .destructive) { Library.shared.clearHistory() }
+        }
+        .fileImporter(isPresented: $importingLibrary, allowedContentTypes: [.json, .plainText, .data]) { result in
+            guard case .success(let url) = result else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url),
+                  Library.shared.restoreBackup(from: data) else {
+                importMessage = "Không đọc được file sao lưu hoặc file không hợp lệ"
+                return
+            }
+            importMessage = "Đã khôi phục dữ liệu thư viện thành công!"
+        }
+        .alert(importMessage ?? "", isPresented: Binding(get: { importMessage != nil }, set: { if !$0 { importMessage = nil } })) {
+            Button("OK") {}
         }
     }
 }

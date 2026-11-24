@@ -25,6 +25,9 @@ final class PlayerManager: NSObject, ObservableObject {
     @Published private(set) var toast: String?
     @Published private(set) var chapters: [Chapter] = []
     @Published private(set) var boosting = false
+    @Published private(set) var captionTracks: [CaptionTrack] = []
+    @Published private(set) var selectedCaption: CaptionTrack?
+    @Published private(set) var activeCueText: String?
     private(set) var storyboard: Storyboard?
     @Published var stopAfterCurrent = false
     @Published var loop = false
@@ -34,8 +37,8 @@ final class PlayerManager: NSObject, ObservableObject {
 
     /// Audio-only playback shows cover art instead of a (black) video layer.
     var showsArtwork: Bool {
-        guard let source = current?.source else { return audioOnly }
-        return audioOnly || source == .soundCloud || Pref.musicAudioOnly
+        guard current?.source != nil else { return audioOnly }
+        return audioOnly || Pref.musicAudioOnly
     }
 
     private var sources: [PlaybackSource] = []
@@ -45,6 +48,18 @@ final class PlayerManager: NSObject, ObservableObject {
     private var pendingSeek: Double?
     private var lastSaved: Double = 0
     private var artwork: MPMediaItemArtwork?
+    private var captionCues: [CaptionCue] = []
+    private var captionTask: Task<Void, Never>?
+
+    private struct PreloadData {
+        let video: Video
+        let item: AVPlayerItem
+        let info: VideoInfo
+        let sources: [PlaybackSource]
+    }
+    private var preloadedNext: PreloadData?
+    private var preloadTask: Task<Void, Never>?
+
     private var loadTask: Task<Void, Never>?
     private var sleepTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
@@ -65,9 +80,11 @@ final class PlayerManager: NSObject, ObservableObject {
 
     // MARK: - Public controls
 
-    func play(_ video: Video, queue newQueue: [Video]? = nil) {
+    func play(_ video: Video, queue newQueue: [Video]? = nil, showWatchSheet: Bool = true) {
         if let newQueue { queue = newQueue }
-        showWatch = true
+        if showWatchSheet {
+            showWatch = true
+        }
         if current?.id == video.id, player.currentItem != nil {
             player.play()
             return
@@ -93,11 +110,100 @@ final class PlayerManager: NSObject, ObservableObject {
         }
     }
 
+    private var seekTask: Task<Void, Never>?
+
     func seek(to seconds: Double) {
         let target = max(0, duration > 0 ? min(seconds, duration - 0.5) : seconds)
+        let oldTime = currentTime
         currentTime = target
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
-            Task { @MainActor in self?.updateNowPlaying() }
+
+        // If live stream, seek directly in AVPlayer
+        if info?.isLive == true {
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+                Task { @MainActor in self?.updateNowPlaying() }
+            }
+            return
+        }
+
+        // If local downloaded file, seek directly in AVPlayer
+        if case .file? = (sources.indices.contains(sourceIndex) ? sources[sourceIndex] : nil) {
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+                Task { @MainActor in self?.updateNowPlaying() }
+            }
+            return
+        }
+
+        // Check if target is already inside the loaded time ranges of AVPlayer
+        if let ranges = player.currentItem?.loadedTimeRanges {
+            let targetCM = CMTime(seconds: target, preferredTimescale: 600)
+            for value in ranges {
+                let range = value.timeRangeValue
+                if CMTimeRangeContainsTime(range, time: targetCM) {
+                    player.seek(to: targetCM,
+                                toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+                                toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)) { [weak self] _ in
+                        Task { @MainActor in self?.updateNowPlaying() }
+                    }
+                    return
+                }
+            }
+        }
+
+        // For nearby seeks (-60s backward to +45s forward), seek directly in AVPlayer for zero-latency response
+        let delta = target - oldTime
+        if (delta >= -60 && delta <= 45) && target >= 0 {
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
+                        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+                        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)) { [weak self] finished in
+                Task { @MainActor in
+                    if finished {
+                        self?.player.play()
+                        self?.updateNowPlaying()
+                    }
+                }
+            }
+            return
+        }
+
+        // For major seeks (to the middle/end) in YouTube HLS streams:
+        seekWithReload(target: target)
+    }
+
+    private func seekWithReload(target: Double) {
+        guard let v = current else { return }
+        seekTask?.cancel()
+        isLoading = true
+        pendingSeek = target
+
+        let wantsAudioOnly = self.audioOnly || (v.source != nil && Pref.musicAudioOnly)
+        let sec = Int(target)
+
+        seekTask = Task { @MainActor in
+            do {
+                var r: ResolvedVideo
+                if v.source == .spotify {
+                    let ytId = try await TrackMatcher.shared.youTubeId(for: v)
+                    r = try await InnerTube.shared.resolve(ytId, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: sec)
+                    r.video = v
+                } else {
+                    r = try await InnerTube.shared.resolve(v.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: sec)
+                }
+                guard !Task.isCancelled else { return }
+
+                self.sources = r.sources
+                self.sourceIndex = 0
+                guard let first = r.sources.first, let item = try? await self.makeItem(first) else {
+                    self.isLoading = false
+                    return
+                }
+                guard !Task.isCancelled else { return }
+
+                self.attach(item)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.isLoading = false
+                self.errorText = error.localizedDescription
+            }
         }
     }
 
@@ -157,8 +263,6 @@ final class PlayerManager: NSObject, ObservableObject {
     func qualityChanged() {
         guard current != nil, sourceIndex < sources.count else { return }
         switch sources[sourceIndex] {
-        case .hls:
-            if let item = player.currentItem { applyQuality(to: item) }
         case .file:
             break
         default:
@@ -186,23 +290,58 @@ final class PlayerManager: NSObject, ObservableObject {
         }
     }
 
+    func selectCaption(_ track: CaptionTrack?) {
+        captionTask?.cancel()
+        selectedCaption = track
+        activeCueText = nil
+        captionCues = []
+        if let track {
+            UserDefaults.standard.set(track.languageCode, forKey: "captionLanguage")
+            captionTask = Task {
+                let cues = await InnerTube.shared.fetchCaptions(from: track.url)
+                guard !Task.isCancelled, selectedCaption?.id == track.id else { return }
+                self.captionCues = cues
+            }
+        } else {
+            UserDefaults.standard.removeObject(forKey: "captionLanguage")
+        }
+    }
+
     func close() {
-        savePosition()
+        savePosition(persist: true)
         loadTask?.cancel()
+        captionTask?.cancel()
+        preloadTask?.cancel()
+        preloadedNext = nil
+        captionTracks = []
+        selectedCaption = nil
+        activeCueText = nil
+        captionCues = []
         player.pause()
         player.replaceCurrentItem(with: nil)
         current = nil
         showWatch = false
         queue = []
+        sources = []
+        sourceIndex = 0
+        currentTime = 0
+        duration = 0
+        errorText = nil
+        isLoading = false
+        artwork = nil
         setSleep(nil)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
-    func savePosition() {
-        guard let v = current, currentTime > 0 else { return }
+    func clearQueue() {
+        queue = []
+    }
+
+    func savePosition(persist: Bool = false) {
+        guard let v = current, currentTime > 0, info?.isLive != true else { return }
         lastSaved = currentTime
         let nearEnd = duration > 0 && currentTime > duration - 15
-        Library.shared.setPosition(v.id, nearEnd ? nil : currentTime)
+        Library.shared.setPosition(v.id, nearEnd ? nil : currentTime, persist: persist)
     }
 
     // MARK: - Loading
@@ -220,6 +359,52 @@ final class PlayerManager: NSObject, ObservableObject {
 
     private func start(_ video: Video) {
         loadTask?.cancel()
+        captionTask?.cancel()
+
+        let resume = Library.shared.position(video.id)
+        let seekTarget = resume > 5 ? resume : nil
+
+        if let p = preloadedNext, p.video.id == video.id {
+            preloadedNext = nil
+            preloadTask?.cancel()
+            preloadTask = nil
+            current = p.video
+            info = p.info
+            chapters = Chapter.parse(p.info.description)
+            storyboard = p.info.storyboard.flatMap { Storyboard(spec: $0) }
+            captionTracks = p.info.captions
+            selectedCaption = nil
+            activeCueText = nil
+            captionCues = []
+            boosting = false
+            related = []
+            commentsToken = nil
+            segments = []
+            errorText = nil
+            isLoading = true
+            currentTime = 0
+            duration = 0
+            lastSaved = 0
+            artwork = nil
+            pendingSeek = seekTarget
+            if let saved = UserDefaults.standard.string(forKey: "captionLanguage"),
+               let match = captionTracks.first(where: { $0.languageCode == saved }) {
+                selectCaption(match)
+            }
+            sources = p.sources
+            sourceIndex = 0
+            try? AVAudioSession.sharedInstance().setActive(true)
+            Library.shared.addHistory(p.video)
+            updateNowPlaying()
+            attach(p.item)
+            loadArtwork(for: p.video)
+            loadRelated(for: p.video)
+            return
+        }
+        preloadedNext = nil
+        preloadTask?.cancel()
+        preloadTask = nil
+
         current = video
         info = nil
         chapters = []
@@ -228,6 +413,10 @@ final class PlayerManager: NSObject, ObservableObject {
         related = []
         commentsToken = nil
         segments = []
+        captionTracks = []
+        selectedCaption = nil
+        activeCueText = nil
+        captionCues = []
         errorText = nil
         isLoading = true
         currentTime = 0
@@ -241,8 +430,7 @@ final class PlayerManager: NSObject, ObservableObject {
         updateNowPlaying()
         loadArtwork(for: video)
 
-        let resume = Library.shared.position(video.id)
-        pendingSeek = resume > 5 ? resume : nil
+        pendingSeek = seekTarget
         let wantsAudioOnly = self.audioOnly || (video.source != nil && Pref.musicAudioOnly)
 
         loadTask = Task {
@@ -251,16 +439,15 @@ final class PlayerManager: NSObject, ObservableObject {
                 Library.shared.addHistory(video)
             } else {
                 do {
+                    let startSec = Int(seekTarget ?? 0)
                     var r: ResolvedVideo
                     switch video.source {
-                    case .soundCloud?:
-                        r = try await SoundCloud.shared.resolve(video.id)
                     case .spotify?:
                         let ytId = try await TrackMatcher.shared.youTubeId(for: video)
-                        r = try await InnerTube.shared.resolve(ytId, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                        r = try await InnerTube.shared.resolve(ytId, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: startSec > 0 ? startSec : nil)
                         r.video = video // keep Spotify id and metadata
                     default:
-                        r = try await InnerTube.shared.resolve(video.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                        r = try await InnerTube.shared.resolve(video.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: startSec > 0 ? startSec : nil)
                     }
                     guard !Task.isCancelled else { return }
                     var v = r.video
@@ -271,8 +458,16 @@ final class PlayerManager: NSObject, ObservableObject {
                     v.link = video.link ?? v.link
                     current = v
                     info = r.info
+                    if r.info.isLive {
+                        pendingSeek = nil
+                    }
                     chapters = Chapter.parse(r.info.description)
                     storyboard = r.info.storyboard.flatMap { Storyboard(spec: $0) }
+                    captionTracks = r.info.captions
+                    if let saved = UserDefaults.standard.string(forKey: "captionLanguage"),
+                       let match = captionTracks.first(where: { $0.languageCode == saved }) {
+                        selectCaption(match)
+                    }
                     sources = r.sources
                     Library.shared.addHistory(v)
                     updateNowPlaying()
@@ -286,12 +481,14 @@ final class PlayerManager: NSObject, ObservableObject {
             await loadCurrentSource()
         }
 
+        loadRelated(for: video)
+    }
+
+    private func loadRelated(for video: Video) {
         Task {
             var upNext: [Video] = []
             var token: String?
             switch video.source {
-            case .soundCloud?:
-                upNext = await SoundCloud.shared.related(video.id)
             case .ytMusic?:
                 upNext = (try? await InnerTube.shared.musicRadio(video.id)) ?? []
             case .spotify?:
@@ -315,6 +512,43 @@ final class PlayerManager: NSObject, ObservableObject {
         }
     }
 
+    private func preloadNextIfNeeded() {
+        guard preloadTask == nil else { return }
+        let nextCandidate: Video? = {
+            if !queue.isEmpty { return queue.first }
+            if Pref.autoplay {
+                let seen = Set(backStack.map(\.id) + [current?.id].compactMap { $0 })
+                return related.first { !seen.contains($0.id) }
+            }
+            return nil
+        }()
+        guard let v = nextCandidate, v.id != preloadedNext?.video.id else { return }
+        let wantsAudioOnly = self.audioOnly || (v.source != nil && Pref.musicAudioOnly)
+        preloadTask = Task {
+            var r: ResolvedVideo?
+            if let file = DownloadManager.shared.localFile(for: v.id) {
+                r = ResolvedVideo(video: v, info: VideoInfo(description: "", isLive: false), sources: [.file(file)])
+            } else {
+                switch v.source {
+                case .spotify?:
+                    if let yt = try? await TrackMatcher.shared.youTubeId(for: v) {
+                        r = try? await InnerTube.shared.resolve(yt, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                        r?.video = v
+                    }
+                default:
+                    r = try? await InnerTube.shared.resolve(v.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                }
+            }
+            guard !Task.isCancelled, let resolved = r, let firstSource = resolved.sources.first,
+                  let item = try? await self.makeItem(firstSource) else {
+                self.preloadTask = nil
+                return
+            }
+            self.preloadedNext = PreloadData(video: resolved.video, item: item, info: resolved.info, sources: resolved.sources)
+            self.preloadTask = nil
+        }
+    }
+
     private func loadCurrentSource() async {
         let id = current?.id
         while sourceIndex < sources.count {
@@ -332,17 +566,18 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     private func makeItem(_ source: PlaybackSource) async throws -> AVPlayerItem {
+        let item: AVPlayerItem
         switch source {
         case .hls(let url):
             // HLS comes from the iOS client, whose own player is AVPlayer — keep the default user agent.
-            let item = AVPlayerItem(url: url)
-            applyQuality(to: item)
-            return item
+            item = AVPlayerItem(url: url)
         case .progressive(let url), .file(let url):
-            return AVPlayerItem(asset: Media.asset(url))
+            item = AVPlayerItem(asset: Media.asset(url))
         case .composite(let v, let a):
-            return AVPlayerItem(asset: try await Media.composition(video: Media.asset(v), audio: Media.asset(a)))
+            item = AVPlayerItem(asset: try await Media.composition(video: Media.asset(v), audio: Media.asset(a)))
         }
+        applyQuality(to: item)
+        return item
     }
 
     private func attach(_ item: AVPlayerItem) {
@@ -352,6 +587,9 @@ final class PlayerManager: NSObject, ObservableObject {
         }
         player.replaceCurrentItem(with: item)
         player.play()
+        if item.status != .unknown {
+            itemStatusChanged(item, item.status)
+        }
     }
 
     private func itemStatusChanged(_ item: AVPlayerItem, _ status: AVPlayerItem.Status) {
@@ -360,11 +598,26 @@ final class PlayerManager: NSObject, ObservableObject {
         case .readyToPlay:
             if let s = pendingSeek {
                 pendingSeek = nil
-                seek(to: s)
+                player.seek(to: CMTime(seconds: s, preferredTimescale: 600),
+                            toleranceBefore: CMTime(seconds: 2, preferredTimescale: 600),
+                            toleranceAfter: CMTime(seconds: 2, preferredTimescale: 600)) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.player.play()
+                        self?.updateNowPlaying()
+                    }
+                }
             }
         case .failed:
-            // Try the next stream variant from where we were.
-            if currentTime > 0 { pendingSeek = currentTime }
+            if let err = item.error {
+                print("Vidra player item failed with error: \(err.localizedDescription)")
+            }
+            if (Pref.maxHeight > 1080 || Pref.maxHeight == 0) && sourceIndex == 0 {
+                showToast("Không giải mã được 4K/2K, tự động chuyển về 1080p")
+            }
+            if currentTime > 5 {
+                seekWithReload(target: currentTime)
+                return
+            }
             sourceIndex += 1
             loadTask?.cancel()
             loadTask = Task { await loadCurrentSource() }
@@ -376,6 +629,8 @@ final class PlayerManager: NSObject, ObservableObject {
     private func applyQuality(to item: AVPlayerItem) {
         let h = Double(Pref.maxHeight)
         item.preferredMaximumResolution = h > 0 ? CGSize(width: h * 16 / 9, height: h) : .zero
+        item.preferredForwardBufferDuration = 25.0
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
     }
 
     // MARK: - Observers
@@ -385,7 +640,9 @@ final class PlayerManager: NSObject, ObservableObject {
             Task { @MainActor in self?.syncPlayState() }
         }
         player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
-            Task { @MainActor in self?.tick(time.seconds) }
+            MainActor.assumeIsolated {
+                self?.tick(time.seconds)
+            }
         }
 
         let nc = NotificationCenter.default
@@ -394,6 +651,13 @@ final class PlayerManager: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self, item === self.player.currentItem else { return }
                 self.itemEnded()
+            }
+        }
+        nc.addObserver(forName: .AVPlayerItemPlaybackStalled, object: nil, queue: .main) { [weak self] note in
+            let item = note.object as AnyObject?
+            Task { @MainActor in
+                guard let self, item === self.player.currentItem else { return }
+                self.player.play()
             }
         }
         nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
@@ -414,8 +678,29 @@ final class PlayerManager: NSObject, ObservableObject {
         let playing = player.timeControlStatus != .paused
         if playing != isPlaying {
             isPlaying = playing
+            if !playing {
+                savePosition(persist: true)
+            }
             updateNowPlaying()
         }
+    }
+
+    private func findCue(for t: Double) -> CaptionCue? {
+        guard !captionCues.isEmpty else { return nil }
+        var low = 0
+        var high = captionCues.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            let cue = captionCues[mid]
+            if t < cue.start {
+                high = mid - 1
+            } else if t > cue.end {
+                low = mid + 1
+            } else {
+                return cue
+            }
+        }
+        return nil
     }
 
     private func tick(_ t: Double) {
@@ -425,11 +710,20 @@ final class PlayerManager: NSObject, ObservableObject {
             updateNowPlaying()
         }
         currentTime = t
+        if selectedCaption != nil && !captionCues.isEmpty {
+            let cue = findCue(for: t)
+            if activeCueText != cue?.text { activeCueText = cue?.text }
+        } else if activeCueText != nil {
+            activeCueText = nil
+        }
         if Pref.sponsorBlock, let seg = segments.first(where: { t >= $0.start && t < $0.end - 1 }) {
             seek(to: seg.end)
             showToast("Đã bỏ qua: \(seg.label)")
         }
-        if abs(t - lastSaved) >= 5 { savePosition() }
+        if abs(t - lastSaved) >= 30 { savePosition(persist: false) }
+        if duration > 0 && currentTime >= duration - 15 {
+            preloadNextIfNeeded()
+        }
     }
 
     private func itemEnded() {
@@ -477,6 +771,25 @@ final class PlayerManager: NSObject, ObservableObject {
         }
         c.previousTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor in self?.previous() }
+            return .success
+        }
+        c.skipForwardCommand.preferredIntervals = [10]
+        c.skipForwardCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.seek(by: 10) }
+            return .success
+        }
+        c.skipBackwardCommand.preferredIntervals = [10]
+        c.skipBackwardCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.seek(by: -10) }
+            return .success
+        }
+        c.likeCommand.isActive = true
+        c.likeCommand.addTarget { [weak self] _ in
+            guard let v = self?.current else { return .noActionableNowPlayingItem }
+            Task { @MainActor in
+                Library.shared.toggleLike(v)
+                self?.updateNowPlaying()
+            }
             return .success
         }
         c.changePlaybackPositionCommand.addTarget { [weak self] event in

@@ -7,26 +7,68 @@ import UIKit
 @MainActor
 final class ArtworkColorCache {
     static let shared = ArtworkColorCache()
+    private static let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
 
     private var cache: [URL: Color] = [:]
-    private let context = CIContext(options: [.workingColorSpace: NSNull()])
+    private var keys: [URL] = []
+    private var inFlight: [URL: Task<Color?, Never>] = [:]
 
     func color(for url: URL) async -> Color? {
         if let hit = cache[url] { return hit }
-        guard let result = try? await URLSession.shared.data(from: url),
-              let image = CIImage(data: result.0),
-              let filter = CIFilter(name: "CIAreaAverage", parameters: [
-                  kCIInputImageKey: image,
-                  kCIInputExtentKey: CIVector(cgRect: image.extent)
-              ]),
-              let output = filter.outputImage else { return nil }
-        var px = [UInt8](repeating: 0, count: 4)
-        context.render(output, toBitmap: &px, rowBytes: 4,
-                       bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                       format: .RGBA8, colorSpace: nil)
-        let color = Color(red: Double(px[0]) / 255, green: Double(px[1]) / 255, blue: Double(px[2]) / 255)
-        if cache.count > 60 { cache.removeAll() }
-        cache[url] = color
+        if let existingTask = inFlight[url] {
+            return await existingTask.value
+        }
+
+        // Fast path: if ImageCache already loaded this image in memory, skip network fetch completely
+        let preloadedImage = ImageCache.shared.image(for: url)
+
+        let task = Task<Color?, Never> {
+            let uiImage: UIImage?
+            if let preloadedImage {
+                uiImage = preloadedImage
+            } else if let result = try? await URLSession.shared.data(from: url) {
+                uiImage = UIImage(data: result.0)
+            } else {
+                uiImage = nil
+            }
+            guard let uiImage else { return nil }
+
+            let rgb = await Task.detached(priority: .utility) { () -> (Double, Double, Double)? in
+                let size = CGSize(width: 24, height: 24)
+                let renderer = UIGraphicsImageRenderer(size: size)
+                let small = renderer.image { _ in
+                    uiImage.draw(in: CGRect(origin: .zero, size: size))
+                }
+                guard let ci = CIImage(image: small) else { return nil }
+                guard let filter = CIFilter(name: "CIAreaAverage", parameters: [
+                    kCIInputImageKey: ci,
+                    kCIInputExtentKey: CIVector(cgRect: ci.extent)
+                ]), let output = filter.outputImage else { return nil }
+                var px = [UInt8](repeating: 0, count: 4)
+                Self.ciContext.render(output, toBitmap: &px, rowBytes: 4,
+                                      bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                                      format: .RGBA8, colorSpace: nil)
+                return (Double(px[0]) / 255.0, Double(px[1]) / 255.0, Double(px[2]) / 255.0)
+            }.value
+            guard let rgb else { return nil }
+            return Color(red: rgb.0, green: rgb.1, blue: rgb.2)
+        }
+
+        inFlight[url] = task
+        let color = await task.value
+        inFlight.removeValue(forKey: url)
+
+        if let color {
+            if let idx = keys.firstIndex(of: url) {
+                keys.remove(at: idx)
+            }
+            keys.append(url)
+            while keys.count > 100 {
+                let old = keys.removeFirst()
+                cache.removeValue(forKey: old)
+            }
+            cache[url] = color
+        }
         return color
     }
 }
@@ -44,8 +86,7 @@ struct NowPlayingView: View {
     @State private var showQueue = false
     @State private var artDrag: CGFloat = 0
     @State private var addTarget: Video?
-    @State private var waveform: [Float] = []
-    @State private var comments: [TimedComment] = []
+    @State private var remapTarget: Video?
     @State private var lyrics: LyricsResult?
     @State private var lyricsLoading = false
     @State private var scrub: Double?
@@ -68,8 +109,15 @@ struct NowPlayingView: View {
         .sheet(item: $addTarget) { v in
             AddToPlaylistView(video: v).presentationDetents([.medium, .large])
         }
-        .task(id: pm.current?.id) { await loadTrackData() }
-        .task(id: pm.current?.id) { await loadLyrics() }
+        .sheet(item: $remapTarget) { v in
+            SpotifyRemapSheet(video: v).presentationDetents([.medium, .large])
+        }
+        .task(id: pm.current?.id) {
+            showLyrics = false
+            scrub = nil
+            await loadTrackData()
+            await loadLyrics()
+        }
     }
 
     // MARK: Layout
@@ -87,7 +135,6 @@ struct NowPlayingView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            commentTicker
             titleRow(v)
             scrubber(v)
             controls
@@ -125,6 +172,11 @@ struct NowPlayingView: View {
                     Label("Tốc độ phát", systemImage: "speedometer")
                 }
                 SleepMenu()
+                if v.source == .spotify {
+                    Button { remapTarget = v } label: {
+                        Label("Đổi bản YouTube Music", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
                 Button { addTarget = v } label: {
                     Label("Thêm vào danh sách phát", systemImage: "text.badge.plus")
                 }
@@ -144,7 +196,6 @@ struct NowPlayingView: View {
 
     private func sourceLabel(_ v: Video) -> String {
         switch v.source {
-        case .soundCloud?: return "SoundCloud"
         case .spotify?: return "Spotify – phát qua YouTube Music"
         case .ytMusic?: return "YouTube Music"
         case nil: return "YouTube"
@@ -166,7 +217,8 @@ struct NowPlayingView: View {
             }
             .aspectRatio(1, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .shadow(color: Color.black.opacity(0.5), radius: 24, y: 12)
+            .shadow(color: tint.opacity(0.45), radius: 28, y: 14)
+            .shadow(color: Color.black.opacity(0.4), radius: 12, y: 6)
             .overlay { stateOverlay }
         }
         .scaleEffect(pm.isPlaying ? 1 : 0.86)
@@ -209,29 +261,6 @@ struct NowPlayingView: View {
         }
     }
 
-    @ViewBuilder private var commentTicker: some View {
-        if let c = latestComment {
-            HStack(spacing: 8) {
-                Avatar(url: c.avatar, name: c.author, size: 22)
-                Text(c.body).font(.caption).lineLimit(1)
-            }
-            .padding(.vertical, 5)
-            .padding(.leading, 6)
-            .padding(.trailing, 12)
-            .background(Color.white.opacity(0.15), in: Capsule())
-            .padding(.bottom, 8)
-            .id(c.id)
-            .transition(.opacity)
-        }
-    }
-
-    private var latestComment: TimedComment? {
-        let t = pm.currentTime
-        return comments
-            .filter { $0.seconds <= t && t - $0.seconds <= 8 }
-            .max { $0.seconds < $1.seconds }
-    }
-
     private func titleRow(_ v: Video) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
@@ -239,10 +268,16 @@ struct NowPlayingView: View {
                 artistLink(v)
             }
             Spacer(minLength: 8)
+            let likeColor: Color = {
+                switch v.source {
+                case .spotify?: return Color(red: 0.11, green: 0.73, blue: 0.33)
+                default: return Color.pink
+                }
+            }()
             Button { library.toggleLike(v) } label: {
                 Image(systemName: library.isLiked(v.id) ? "heart.fill" : "heart")
                     .font(.title2)
-                    .foregroundStyle(library.isLiked(v.id) ? Color.pink : Color.white)
+                    .foregroundStyle(library.isLiked(v.id) ? likeColor : Color.white)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -250,9 +285,7 @@ struct NowPlayingView: View {
 
     @ViewBuilder private func artistLink(_ v: Video) -> some View {
         let label = Text(v.channelTitle).font(.body).foregroundStyle(Color.white.opacity(0.7)).lineLimit(1)
-        if let cid = v.channelId, cid.hasPrefix("scu:") {
-            NavigationLink { SoundCloudUserView(userId: cid, name: v.channelTitle) } label: { label }
-        } else if let cid = v.channelId, cid.hasPrefix("spa:") {
+        if let cid = v.channelId, cid.hasPrefix("spa:") {
             NavigationLink { SpotifyArtistView(artistId: String(cid.dropFirst(4)), name: v.channelTitle) } label: { label }
         } else {
             label
@@ -265,16 +298,9 @@ struct NowPlayingView: View {
         let total = max(pm.duration, 0)
         let fraction = scrub ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
         let shownTime = scrub.map { $0 * total } ?? pm.currentTime
-        let isSC = v.source == .soundCloud && !waveform.isEmpty
         return VStack(spacing: 4) {
             GeometryReader { geo in
-                Group {
-                    if isSC {
-                        WaveformBars(samples: waveform, progress: fraction)
-                    } else {
-                        SlimTrack(progress: fraction)
-                    }
-                }
+                SlimTrack(progress: fraction)
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 0)
@@ -288,7 +314,7 @@ struct NowPlayingView: View {
                         }
                 )
             }
-            .frame(height: isSC ? 48 : 24)
+            .frame(height: 24)
             HStack {
                 Text(Fmt.time(shownTime))
                 Spacer()
@@ -314,8 +340,16 @@ struct NowPlayingView: View {
             Button { pm.previous() } label: { Image(systemName: "backward.fill").font(.title) }
             Spacer()
             Button { pm.togglePlay() } label: {
-                Image(systemName: pm.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                    .font(.system(size: 72))
+                ZStack {
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 64, height: 64)
+                        .shadow(color: Color.black.opacity(0.3), radius: 6, y: 3)
+                    Image(systemName: pm.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.title2.bold())
+                        .foregroundStyle(Color.black)
+                        .offset(x: pm.isPlaying ? 0 : 2)
+                }
             }
             Spacer()
             Button { pm.next() } label: { Image(systemName: "forward.fill").font(.title) }
@@ -352,21 +386,10 @@ struct NowPlayingView: View {
     // MARK: Data
 
     private func loadTrackData() async {
-        waveform = []
-        comments = []
         guard let v = pm.current else { return }
         if let url = v.thumbnail, let c = await ArtworkColorCache.shared.color(for: url) {
             withAnimation(.easeInOut(duration: 0.6)) { tint = c }
         }
-        guard v.source == .soundCloud, v.id.hasPrefix("sc:") else { return }
-        let trackId = v.id // SoundCloud APIs take the full "sc:<n>" id
-        async let bars = SoundCloud.shared.waveform(trackId)
-        async let notes = SoundCloud.shared.timedComments(trackId)
-        let b = await bars
-        let n = await notes
-        guard !Task.isCancelled else { return }
-        waveform = b
-        comments = n
     }
 
     private func loadLyrics() async {
@@ -381,30 +404,6 @@ struct NowPlayingView: View {
 }
 
 // MARK: - Scrubber pieces
-
-private struct WaveformBars: View {
-    let samples: [Float]
-    let progress: Double
-
-    var body: some View {
-        Canvas { ctx, size in
-            let count = max(Int(size.width / 4), 1)
-            let step = Double(samples.count) / Double(count)
-            for i in 0..<count {
-                let lo = Int(Double(i) * step)
-                let hi = max(min(Int(Double(i + 1) * step), samples.count), lo + 1)
-                let slice = samples[min(lo, samples.count - 1)..<min(hi, samples.count)]
-                let peak = CGFloat(slice.max() ?? 0)
-                let h = max(size.height * peak, 3)
-                let x = CGFloat(i) * 4
-                let rect = CGRect(x: x, y: (size.height - h) / 2, width: 2.5, height: h)
-                let played = Double(i) / Double(count) <= progress
-                ctx.fill(Path(roundedRect: rect, cornerRadius: 1.2),
-                         with: .color(played ? Color.white : Color.white.opacity(0.3)))
-            }
-        }
-    }
-}
 
 private struct SlimTrack: View {
     let progress: Double
@@ -459,23 +458,38 @@ struct LyricsView: View {
         let idx = currentIndex(lines)
         return ScrollViewReader { proxy in
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
                         Text(line.text.isEmpty ? "♪" : line.text)
-                            .font(.system(size: i == idx ? 26 : 22, weight: .bold))
-                            .foregroundStyle(i == idx ? Color.white : Color.white.opacity(0.35))
+                            .font(.system(size: i == idx ? 28 : 22, weight: .bold))
+                            .foregroundStyle(i == idx ? Color.white : Color.white.opacity(0.32))
+                            .blur(radius: i == idx ? 0 : 0.4)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                             .onTapGesture { pm.seek(to: line.time) }
                             .id(i)
                     }
                 }
-                .padding(.vertical, 60)
-                .animation(.easeInOut(duration: 0.25), value: idx)
+                .padding(.vertical, 80)
+                .animation(.spring(response: 0.35, dampingFraction: 0.8), value: idx)
             }
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .black, location: 0.08),
+                        .init(color: .black, location: 0.92),
+                        .init(color: .clear, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
             .onChange(of: idx) { newValue in
                 guard newValue >= 0 else { return }
-                withAnimation(.easeInOut(duration: 0.4)) { proxy.scrollTo(newValue, anchor: .center) }
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                    proxy.scrollTo(newValue, anchor: .center)
+                }
             }
         }
     }

@@ -1,14 +1,27 @@
 import SwiftUI
 
 enum MusicProvider: String, CaseIterable, Identifiable {
-    case ytMusic, soundCloud, spotify
+    case ytMusic, spotify
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .ytMusic: return "YT Music"
-        case .soundCloud: return "SoundCloud"
         case .spotify: return "Spotify"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .ytMusic: return "play.circle.fill"
+        case .spotify: return "dot.radiowaves.right"
+        }
+    }
+
+    var brandColor: Color {
+        switch self {
+        case .ytMusic: return Color.red
+        case .spotify: return Color(red: 0.11, green: 0.73, blue: 0.33)
         }
     }
 }
@@ -22,23 +35,52 @@ struct MusicView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                Picker("Nguồn", selection: $provider) {
-                    ForEach(MusicProvider.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+                providerBar
                 content
             }
             .navigationTitle("Nhạc")
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $text, prompt: provider == .soundCloud ? "Tìm hoặc dán link SoundCloud" : "Tìm bài hát, nghệ sĩ")
+            .searchable(text: $text, prompt: "Tìm bài hát, nghệ sĩ")
             .onSubmit(of: .search) { submit() }
             .onChange(of: text) { if $0.isEmpty { query = "" } }
             .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK") {}
             }
         }
+    }
+
+    private var providerBar: some View {
+        HStack(spacing: 8) {
+            ForEach(MusicProvider.allCases) { p in
+                let selected = provider == p
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                        provider = p
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: p.icon)
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(p.title)
+                            .font(.subheadline.weight(selected ? .bold : .medium))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background {
+                        if selected {
+                            Capsule().fill(p.brandColor)
+                                .shadow(color: p.brandColor.opacity(0.35), radius: 5, y: 2)
+                        } else {
+                            Capsule().fill(Color(.secondarySystemFill))
+                        }
+                    }
+                    .foregroundStyle(selected ? Color.white : Color.primary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -53,8 +95,6 @@ struct MusicView: View {
                 })
                 .id("ytm|\(query)")
             }
-        case .soundCloud:
-            SoundCloudHomeView(query: query)
         case .spotify:
             SpotifyHomeView(query: query)
         }
@@ -63,13 +103,21 @@ struct MusicView: View {
     private func submit() {
         let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
-        if q.contains("soundcloud.com") {
+        if let parsed = Spotify.parseLink(q) {
+            provider = .spotify
             Task {
                 do {
-                    if let v = try await SoundCloud.shared.resolveLink(q) {
+                    let (_, tracks) = try await Spotify.fetch(q)
+                    guard let first = tracks.first else { return }
+                    if parsed.kind == "track" {
+                        let v = Video(id: "sp:\(parsed.id)", title: first.title, channelTitle: first.artist, source: .spotify)
                         PlayerManager.shared.play(v)
                     } else {
-                        message = "Link này không phải một bài hát"
+                        let matched = await Spotify.matchAll(tracks) { _ in }
+                        let playable = matched.compactMap { $0 }
+                        if let firstPlay = playable.first {
+                            PlayerManager.shared.play(firstPlay, queue: Array(playable.dropFirst()))
+                        }
                     }
                 } catch {
                     message = error.localizedDescription

@@ -471,6 +471,10 @@ actor SpotifyAPI {
 
     // MARK: Playlists
 
+    func playlistInfo(id: String) async throws -> J {
+        try await get("playlists/\(id)")
+    }
+
     func myPlaylists(offset: Int = 0) async throws -> SpotifyListing {
         let j = try await get("me/playlists", paging(offset))
         let items = j["items"].array
@@ -509,6 +513,10 @@ actor SpotifyAPI {
         let items = j["albums"]["items"].array
         return SpotifyListing(cards: items.compactMap { SpotifyMap.albumCard($0) },
                               next: SpotifyMap.next(j["albums"], offset: offset, count: items.count))
+    }
+
+    func albumDetails(id: String) async throws -> J {
+        try await albumInfo(id: id)
     }
 
     private func albumInfo(id: String) async throws -> J {

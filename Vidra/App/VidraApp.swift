@@ -25,27 +25,19 @@ struct VidraApp: App {
 }
 
 struct ContentView: View {
-    @ObservedObject private var pm = PlayerManager.shared
+    @ObservedObject private var modeManager = AppModeManager.shared
     @ObservedObject private var downloads = DownloadManager.shared
 
     var body: some View {
-        TabView {
-            HomeView().withMiniPlayer()
-                .tabItem { Label("Trang chủ", systemImage: "house.fill") }
-            SearchView().withMiniPlayer()
-                .tabItem { Label("Tìm kiếm", systemImage: "magnifyingglass") }
-            MusicView().withMiniPlayer()
-                .tabItem { Label("Nhạc", systemImage: "music.note") }
-            SubscriptionsView().withMiniPlayer()
-                .tabItem { Label("Đăng ký", systemImage: "person.2.fill") }
-            LibraryView().withMiniPlayer()
-                .tabItem { Label("Thư viện", systemImage: "books.vertical.fill") }
+        Group {
+            switch modeManager.currentMode {
+            case .youtube:
+                YouTubeRootView()
+            case .spotify:
+                SpotifyRootView()
+            }
         }
-        .tint(.red)
-        .sheet(isPresented: $pm.showWatch) {
-            // Music gets the dedicated now-playing screen; videos get the video player.
-            if pm.current?.source != nil { NowPlayingView() } else { WatchView() }
-        }
+        .animation(.easeInOut(duration: 0.25), value: modeManager.currentMode)
         .alert(
             "Tải xuống thất bại",
             isPresented: Binding(get: { downloads.lastError != nil }, set: { if !$0 { downloads.lastError = nil } })
@@ -68,31 +60,65 @@ struct MiniPlayerBar: View {
 
     var body: some View {
         if let v = pm.current {
+            let accentColor: Color = {
+                switch v.source {
+                case .spotify?: return Color(red: 0.11, green: 0.73, blue: 0.33)
+                default: return Color.red
+                }
+            }()
             VStack(spacing: 0) {
                 GeometryReader { g in
                     Rectangle()
-                        .fill(Color.red)
+                        .fill(accentColor)
                         .frame(width: pm.duration > 0 ? g.size.width * min(pm.currentTime / pm.duration, 1) : 0)
                 }
-                .frame(height: 2)
+                .frame(height: 2.5)
                 HStack(spacing: 12) {
-                    Thumbnail(url: v.thumbnail).frame(width: 80)
+                    if v.source != nil {
+                        AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+                            ZStack {
+                                Color(.secondarySystemFill)
+                                Image(systemName: "music.note").foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    } else {
+                        Thumbnail(url: v.thumbnail).frame(width: 76)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(v.title.isEmpty ? "Đang tải…" : v.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                        Text(v.title.isEmpty ? "Đang tải…" : v.title).font(.subheadline.weight(.semibold)).lineLimit(1)
                         Text(v.channelTitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer(minLength: 0)
                     Button { pm.togglePlay() } label: {
-                        Image(systemName: pm.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 36, height: 36)
+                        Image(systemName: pm.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title3.bold())
+                            .frame(width: 40, height: 40)
+                            .contentShape(Rectangle())
                     }
-                    Button { pm.next() } label: { Image(systemName: "forward.fill").frame(width: 32, height: 36) }
-                    Button { pm.close() } label: { Image(systemName: "xmark").frame(width: 32, height: 36) }
+                    Button { pm.next() } label: {
+                        Image(systemName: "forward.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 36, height: 40)
+                            .contentShape(Rectangle())
+                    }
+                    Button { pm.close() } label: {
+                        Image(systemName: "xmark")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 36, height: 40)
+                            .contentShape(Rectangle())
+                    }
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
             }
-            .background(.bar)
+            .background(.regularMaterial)
+            .overlay(alignment: .top) {
+                Divider().opacity(0.3)
+            }
             .contentShape(Rectangle())
             .onTapGesture { pm.showWatch = true }
             // Swipe sideways to skip, swipe up to open.

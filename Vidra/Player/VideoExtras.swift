@@ -9,13 +9,15 @@ struct Chapter: Identifiable {
     let title: String
     var id: Double { start }
 
+    private static let regex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"^\s*[\[(]?((?:\d{1,2}:)?\d{1,2}:\d{2})[\])]?\s*[-–—:|]?\s*(.+?)\s*$"#,
+        options: .anchorsMatchLines
+    )
+
     /// Chapters come from timestamp lines in the description (same rule YouTube uses:
     /// first at 0:00, at least three, ascending).
     static func parse(_ description: String) -> [Chapter] {
-        guard let re = try? NSRegularExpression(
-            pattern: #"^\s*[\[(]?((?:\d{1,2}:)?\d{1,2}:\d{2})[\])]?\s*[-–—:|]?\s*(.+?)\s*$"#,
-            options: .anchorsMatchLines
-        ) else { return [] }
+        guard let re = regex else { return [] }
         let ns = description as NSString
         var out: [Chapter] = []
         for m in re.matches(in: description, range: NSRange(location: 0, length: ns.length)) {

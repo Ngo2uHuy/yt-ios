@@ -42,11 +42,22 @@ struct SpotifyHomeView: View {
 // MARK: - Setup / login
 
 struct SpotifySetupView: View {
+    var showModeSwitch: Bool = false
     @ObservedObject private var auth = SpotifyAuth.shared
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                if showModeSwitch {
+                    HStack {
+                        Text("Thư viện Spotify").font(.title2.bold())
+                        Spacer()
+                        AppModeSwitchPill()
+                    }
+                    .padding(.bottom, 4)
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Kết nối Spotify").font(.title2.bold())
                     Text("Xem thư viện, playlist và nghệ sĩ của bạn. Vidra phát bản tương ứng từ YouTube Music vì âm thanh Spotify có DRM.")
@@ -83,11 +94,21 @@ struct SpotifySetupView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 12))
 
-                TextField("Client ID", text: $auth.clientId)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .padding(12)
-                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+                HStack(spacing: 8) {
+                    TextField("Client ID", text: $auth.clientId)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    if let clip = UIPasteboard.general.string, !clip.isEmpty, clip != auth.clientId {
+                        Button("Dán") {
+                            auth.clientId = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        .font(.subheadline.bold())
+                        .tint(.green)
+                    }
+                }
+                .padding(12)
+                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
 
                 Button {
                     Task { await auth.login() }
@@ -117,6 +138,11 @@ struct SpotifySetupView: View {
                 }
             }
             .padding()
+        }
+        .onChange(of: auth.isLoggedIn) { loggedIn in
+            if loggedIn {
+                dismiss()
+            }
         }
     }
 
@@ -192,75 +218,738 @@ final class SpotifyLibraryModel: ObservableObject {
     }
 }
 
+// MARK: - Spotify Library Filter & Sort Models
+
+enum SpotifyLibraryFilter: String, CaseIterable, Identifiable {
+    case all = "Tất cả"
+    case playlists = "Playlists"
+    case liked = "Bài hát đã thích"
+    case artists = "Nghệ sĩ"
+    case downloaded = "Đã tải xuống"
+
+    var id: String { rawValue }
+}
+
+enum SpotifyLibrarySort: String, CaseIterable, Identifiable {
+    case recent = "Gần đây nhất"
+    case added = "Đã thêm gần đây"
+    case alphabetical = "Theo bảng chữ cái"
+
+    var id: String { rawValue }
+}
+
+// MARK: - Authentic Spotify Your Library View
+
 struct SpotifyLibraryView: View {
     @ObservedObject private var auth = SpotifyAuth.shared
+    @ObservedObject private var lib = Library.shared
+    @ObservedObject private var dl = DownloadManager.shared
     @StateObject private var model = SpotifyLibraryModel()
+
+    @State private var selectedFilter: SpotifyLibraryFilter = .all
+    @State private var isGridView: Bool = false
+    @State private var sortOption: SpotifyLibrarySort = .recent
+    @State private var searchQuery: String = ""
+    @State private var isSearchActive: Bool = false
+
+    @State private var showNewPlaylistAlert: Bool = false
+    @State private var newPlaylistName: String = ""
+    @State private var showSpotifyConnect: Bool = false
+    @State private var showImportSheet: Bool = false
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 24) {
-                header
+            LazyVStack(alignment: .leading, spacing: 16) {
+                // 1. Top Header: User Profile, Title, Search, "+", Mode Switch
+                libraryHeader
 
-                if model.loading && !model.loaded {
-                    ProgressView().frame(maxWidth: .infinity).padding(.top, 24)
+                // 2. Search Bar (when toggled)
+                if isSearchActive {
+                    librarySearchBar
                 }
 
-                if let error = model.error {
-                    VStack(spacing: 8) {
-                        Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("Thử lại") { Task { await model.load() } }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding()
+                // 3. Filter Chips: "Tất cả", "Playlists", "Bài hát đã thích", "Nghệ sĩ", "Đã tải xuống"
+                filterChipsRow
+
+                // 4. Sort & Layout Bar
+                sortAndLayoutToolbar
+
+                // 5. Library Content (List or Grid)
+                if isGridView {
+                    gridLayoutContent
+                } else {
+                    listLayoutContent
                 }
 
-                SpotifyTrackSection(title: "Bài hát đã thích", tracks: model.liked,
-                                    loader: { try await SpotifyAPI.shared.likedSongs(offset: $0) })
-                SpotifyShelf(title: "Playlist của bạn", cards: model.playlists)
-                SpotifyShelf(title: "Album đã lưu", cards: model.albums)
-                SpotifyShelf(title: "Nghệ sĩ đang theo dõi", cards: model.artists)
-                SpotifyTrackSection(title: "Top bài hát gần đây", tracks: model.top,
-                                    loader: { try await SpotifyAPI.shared.topTracks(offset: $0) })
-                SpotifyTrackSection(title: "Nghe gần đây", tracks: model.recent, limit: 10)
-                SpotifyShelf(title: "Mới phát hành", cards: model.releases)
-
-                NavigationLink {
-                    SpotifyImportView()
-                } label: {
-                    Label("Nhập playlist bằng link (không cần đăng nhập)", systemImage: "link")
-                        .font(.subheadline)
+                // 6. Spotify Account Sync Banner (If not logged in, non-blocking)
+                if !auth.isLoggedIn {
+                    spotifySyncBanner
                 }
-                .padding(.horizontal)
-                .padding(.bottom, 24)
+            }
+            .padding(.bottom, 36)
+        }
+        .background(SpotifyColor.background.ignoresSafeArea())
+        .task {
+            if auth.isLoggedIn {
+                await auth.loadProfile()
+                if !model.loaded { await model.load() }
             }
         }
-        .task {
-            await auth.loadProfile()
-            if !model.loaded { await model.load() }
+        .refreshable {
+            if auth.isLoggedIn {
+                await model.load()
+            }
         }
-        .refreshable { await model.load() }
+        .sheet(isPresented: $showSpotifyConnect) {
+            SpotifySetupView(showModeSwitch: false)
+        }
+        .sheet(isPresented: $showImportSheet) {
+            SpotifyImportView()
+        }
+        .alert("Tạo danh sách phát mới", isPresented: $showNewPlaylistAlert) {
+            TextField("Tên danh sách phát", text: $newPlaylistName)
+            Button("Tạo") {
+                let trimmed = newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    lib.createPlaylist(trimmed)
+                    newPlaylistName = ""
+                }
+            }
+            Button("Hủy", role: .cancel) {
+                newPlaylistName = ""
+            }
+        } message: {
+            Text("Nhập tên cho danh sách phát Spotify mới của bạn.")
+        }
     }
 
-    private var header: some View {
+    // MARK: - 1. Top Header
+
+    private var libraryHeader: some View {
         HStack(spacing: 12) {
-            Avatar(url: auth.profile?.image, name: auth.profile?.name ?? "S", size: 44)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Thư viện Spotify").font(.caption).foregroundStyle(.secondary)
-                Text(auth.profile?.name ?? "Đang tải…").font(.headline).lineLimit(1)
-            }
-            Spacer()
-            Menu {
-                Button(role: .destructive) {
-                    auth.logout()
-                } label: {
-                    Label("Đăng xuất", systemImage: "rectangle.portrait.and.arrow.right")
+            // User Avatar
+            Button {
+                if auth.isLoggedIn {
+                    showSpotifyConnect = true
+                } else {
+                    showSpotifyConnect = true
                 }
             } label: {
-                Image(systemName: "ellipsis.circle").font(.title3)
+                if let img = auth.profile?.image {
+                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                        avatarPlaceholder
+                    }
+                    .frame(width: 34, height: 34)
+                    .clipShape(Circle())
+                } else {
+                    avatarPlaceholder
+                }
+            }
+            .buttonStyle(.plain)
+
+            // Title
+            Text("Thư viện")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(SpotifyColor.textPrimary)
+
+            Spacer()
+
+            // Search Icon Button
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                    isSearchActive.toggle()
+                    if !isSearchActive { searchQuery = "" }
+                }
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(SpotifyColor.textPrimary)
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+
+            // Plus Icon Button (New Playlist)
+            Button {
+                showNewPlaylistAlert = true
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundColor(SpotifyColor.textPrimary)
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+
+            // Quick App Mode Switch Pill
+            AppModeSwitchPill()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
+    private var avatarPlaceholder: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(red: 0.28, green: 0.14, blue: 0.65), Color(red: 0.11, green: 0.73, blue: 0.33)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .frame(width: 34, height: 34)
+            .clipShape(Circle())
+
+            Text(String(auth.profile?.name.prefix(1) ?? "V"))
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(.white)
+        }
+    }
+
+    // MARK: - 2. Search Bar
+
+    private var librarySearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(SpotifyColor.textSecondary)
+
+            TextField("Tìm kiếm trong Thư viện", text: $searchQuery)
+                .foregroundColor(SpotifyColor.textPrimary)
+                .font(.system(size: 14))
+
+            if !searchQuery.isEmpty {
+                Button {
+                    searchQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(SpotifyColor.textSecondary)
+                }
             }
         }
-        .padding(.horizontal)
-        .padding(.top, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(SpotifyColor.surfaceHighlight, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - 3. Filter Chips
+
+    private var filterChipsRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(SpotifyLibraryFilter.allCases) { filter in
+                    let isSelected = selectedFilter == filter
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+                            selectedFilter = filter
+                        }
+                    } label: {
+                        Text(filter.rawValue)
+                            .font(.system(size: 13, weight: isSelected ? .bold : .medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule()
+                                    .fill(isSelected ? SpotifyColor.brandGreen : SpotifyColor.surfaceHighlight)
+                            )
+                            .foregroundColor(isSelected ? .black : SpotifyColor.textPrimary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+        }
+    }
+
+    // MARK: - 4. Sort & Layout Bar
+
+    private var sortAndLayoutToolbar: some View {
+        HStack {
+            // Sort Dropdown
+            Menu {
+                ForEach(SpotifyLibrarySort.allCases) { sort in
+                    Button {
+                        sortOption = sort
+                    } label: {
+                        if sortOption == sort {
+                            Label(sort.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(sort.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.system(size: 12, weight: .bold))
+                    Text(sortOption.rawValue)
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .foregroundColor(SpotifyColor.textPrimary)
+            }
+
+            Spacer()
+
+            // Grid vs List Toggle
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                    isGridView.toggle()
+                }
+            } label: {
+                Image(systemName: isGridView ? "rectangle.grid.2x2" : "list.bullet")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(SpotifyColor.textPrimary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - 5. List Layout Content
+
+    private var listLayoutContent: some View {
+        VStack(spacing: 12) {
+            // 1. Pinned: Liked Songs ("Bài hát đã thích")
+            if shouldShowLikedSongs {
+                NavigationLink {
+                    SpotifyPlaylistDetailView(
+                        title: "Bài hát đã thích",
+                        subtitle: "Thư viện bài hát yêu thích của bạn",
+                        creator: auth.profile?.name ?? "Bạn",
+                        likesCount: lib.likedTracks.count,
+                        loader: { offset in
+                            if auth.isLoggedIn {
+                                return try await SpotifyAPI.shared.likedSongs(offset: offset)
+                            } else {
+                                let all = lib.likedTracks
+                                let slice = Array(all.dropFirst(offset).prefix(50))
+                                return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                            }
+                        }
+                    )
+                } label: {
+                    HStack(spacing: 14) {
+                        // Purple Gradient Square with White Heart
+                        ZStack {
+                            LinearGradient(
+                                colors: [Color(red: 0.28, green: 0.14, blue: 0.65), Color(red: 0.45, green: 0.58, blue: 0.72)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: 22))
+                                .foregroundColor(.white)
+                        }
+                        .frame(width: 60, height: 60)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Bài hát đã thích")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+
+                            HStack(spacing: 4) {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(SpotifyColor.brandGreen)
+                                Text("Playlist • \(lib.likedTracks.count) bài hát")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+                        }
+
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+
+            // 2. Pinned: Downloaded Songs ("Đã tải xuống")
+            if shouldShowDownloaded {
+                NavigationLink {
+                    SpotifyPlaylistDetailView(
+                        title: "Đã tải xuống",
+                        subtitle: "Các bài hát ngoại tuyến trên thiết bị",
+                        creator: "Vidra Ngoại Tuyến",
+                        likesCount: dl.items.count,
+                        loader: { offset in
+                            let all = dl.items.map(\.video)
+                            let slice = Array(all.dropFirst(offset).prefix(50))
+                            return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                        }
+                    )
+                } label: {
+                    HStack(spacing: 14) {
+                        // Green Gradient Square with Download Arrow
+                        ZStack {
+                            LinearGradient(
+                                colors: [Color(red: 0.08, green: 0.35, blue: 0.22), Color(red: 0.11, green: 0.73, blue: 0.33)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 24))
+                                .foregroundColor(.white)
+                        }
+                        .frame(width: 60, height: 60)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Đã tải xuống")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+
+                            HStack(spacing: 4) {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(SpotifyColor.brandGreen)
+                                Text("Ngoại tuyến • \(dl.items.count) bài hát")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+                        }
+
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+
+            // 3. User Local Playlists
+            if shouldShowPlaylists {
+                ForEach(filteredPlaylists) { playlist in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            title: playlist.name,
+                            subtitle: "Danh sách phát của bạn",
+                            creator: "Bạn",
+                            likesCount: playlist.videos.count,
+                            loader: { offset in
+                                let all = playlist.videos
+                                let slice = Array(all.dropFirst(offset).prefix(50))
+                                return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                            }
+                        )
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let firstThumb = playlist.videos.first?.thumbnail {
+                                    AsyncImage(url: firstThumb) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "music.note.list")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .frame(width: 60, height: 60)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(playlist.name)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text("Playlist • \(playlist.videos.count) bài hát")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 4. Followed Artists / Channels
+            if shouldShowArtists {
+                ForEach(filteredArtists) { channel in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            title: channel.title,
+                            cover: channel.avatar,
+                            subtitle: "Nghệ sĩ",
+                            creator: channel.title,
+                            loader: { offset in
+                                try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
+                            }
+                        )
+                    } label: {
+                        HStack(spacing: 14) {
+                            // Circular Artist Avatar
+                            Avatar(url: channel.avatar, name: channel.title, size: 60)
+                                .clipShape(Circle())
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(channel.title)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text("Nghệ sĩ")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 5. Remote Spotify Playlists (if connected)
+            if auth.isLoggedIn && !model.playlists.isEmpty && shouldShowPlaylists {
+                ForEach(model.playlists) { card in
+                    SpotifyCardLink(card: card, width: nil)
+                        .padding(.horizontal, 16)
+                }
+            }
+        }
+    }
+
+    // MARK: - 6. Grid Layout Content
+
+    private var gridLayoutContent: some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 18) {
+            // Pinned Liked Songs Card
+            if shouldShowLikedSongs {
+                NavigationLink {
+                    SpotifyPlaylistDetailView(
+                        title: "Bài hát đã thích",
+                        subtitle: "Thư viện bài hát yêu thích của bạn",
+                        creator: auth.profile?.name ?? "Bạn",
+                        likesCount: lib.likedTracks.count,
+                        loader: { offset in
+                            if auth.isLoggedIn {
+                                return try await SpotifyAPI.shared.likedSongs(offset: offset)
+                            } else {
+                                let all = lib.likedTracks
+                                let slice = Array(all.dropFirst(offset).prefix(50))
+                                return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                            }
+                        }
+                    )
+                } label: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ZStack {
+                            LinearGradient(
+                                colors: [Color(red: 0.28, green: 0.14, blue: 0.65), Color(red: 0.45, green: 0.58, blue: 0.72)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: 38))
+                                .foregroundColor(.white)
+                        }
+                        .aspectRatio(1, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Bài hát đã thích")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+                                .lineLimit(1)
+
+                            Text("Playlist • \(lib.likedTracks.count) bài hát")
+                                .font(.system(size: 12))
+                                .foregroundColor(SpotifyColor.textSecondary)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
+            // Playlists in Grid
+            if shouldShowPlaylists {
+                ForEach(filteredPlaylists) { playlist in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            title: playlist.name,
+                            subtitle: "Danh sách phát của bạn",
+                            creator: "Bạn",
+                            likesCount: playlist.videos.count,
+                            loader: { offset in
+                                let all = playlist.videos
+                                let slice = Array(all.dropFirst(offset).prefix(50))
+                                return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                            }
+                        )
+                    } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let firstThumb = playlist.videos.first?.thumbnail {
+                                    AsyncImage(url: firstThumb) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "music.note.list")
+                                        .font(.system(size: 32))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .aspectRatio(1, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(playlist.name)
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text("Playlist • \(playlist.videos.count) bài hát")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Artists in Grid (Circular)
+            if shouldShowArtists {
+                ForEach(filteredArtists) { channel in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            title: channel.title,
+                            cover: channel.avatar,
+                            subtitle: "Nghệ sĩ",
+                            creator: channel.title,
+                            loader: { offset in
+                                try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
+                            }
+                        )
+                    } label: {
+                        VStack(alignment: .center, spacing: 8) {
+                            Avatar(url: channel.avatar, name: channel.title, size: 140)
+                                .clipShape(Circle())
+
+                            Text(channel.title)
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+                                .lineLimit(1)
+
+                            Text("Nghệ sĩ")
+                                .font(.system(size: 12))
+                                .foregroundColor(SpotifyColor.textSecondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - 7. Spotify Sync Banner (Non-blocking)
+
+    private var spotifySyncBanner: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "dot.radiowaves.right")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(SpotifyColor.brandGreen)
+
+                Text("Đồng bộ tài khoản Spotify")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(SpotifyColor.textPrimary)
+            }
+
+            Text("Kết nối tài khoản Spotify của bạn để đưa danh sách phát trực tuyến, nghệ sĩ theo dõi và album yêu thích về ứng dụng Vidra.")
+                .font(.system(size: 13))
+                .foregroundColor(SpotifyColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 12) {
+                Button {
+                    showSpotifyConnect = true
+                } label: {
+                    Text("Đăng nhập Spotify")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(SpotifyColor.brandGreen, in: Capsule())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    showImportSheet = true
+                } label: {
+                    Text("Nhập bằng link")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(SpotifyColor.textPrimary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(SpotifyColor.surfaceHighlight, in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(16)
+        .background(SpotifyColor.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+    }
+
+    // MARK: - Helpers & Filtering
+
+    private var shouldShowLikedSongs: Bool {
+        (selectedFilter == .all || selectedFilter == .playlists || selectedFilter == .liked) &&
+        (searchQuery.isEmpty || "bài hát đã thích".contains(searchQuery.lowercased()))
+    }
+
+    private var shouldShowDownloaded: Bool {
+        (selectedFilter == .all || selectedFilter == .downloaded) &&
+        (searchQuery.isEmpty || "đã tải xuống".contains(searchQuery.lowercased()))
+    }
+
+    private var shouldShowPlaylists: Bool {
+        selectedFilter == .all || selectedFilter == .playlists
+    }
+
+    private var shouldShowArtists: Bool {
+        selectedFilter == .all || selectedFilter == .artists
+    }
+
+    private var filteredPlaylists: [LocalPlaylist] {
+        var list = lib.playlists
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.name.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recent, .added:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    private var filteredArtists: [Channel] {
+        var list = lib.subscriptions
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recent, .added:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
     }
 }
 
@@ -552,21 +1241,32 @@ struct SpotifyTrackListView: View {
                     Text(subtitle).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
             }
-            HStack(spacing: 12) {
-                Button {
-                    playAll(shuffle: false)
-                } label: {
-                    Label("Phát", systemImage: "play.fill").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
+            HStack(spacing: 16) {
                 Button {
                     playAll(shuffle: true)
                 } label: {
-                    Label("Trộn bài", systemImage: "shuffle").frame(maxWidth: .infinity)
+                    Image(systemName: "shuffle")
+                        .font(.title3.weight(.medium))
+                        .foregroundStyle(Color(red: 0.11, green: 0.73, blue: 0.33))
                 }
-                .buttonStyle(.bordered)
+                Spacer()
+                Button {
+                    playAll(shuffle: false)
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(Color(red: 0.11, green: 0.73, blue: 0.33))
+                            .frame(width: 52, height: 52)
+                            .shadow(color: Color(red: 0.11, green: 0.73, blue: 0.33).opacity(0.4), radius: 8, y: 3)
+                        Image(systemName: "play.fill")
+                            .font(.title3.bold())
+                            .foregroundStyle(.black)
+                            .offset(x: 2)
+                    }
+                }
             }
-            .tint(.green)
+            .padding(.horizontal, 20)
+            .padding(.top, 4)
             .disabled(model.tracks.isEmpty)
         }
         .frame(maxWidth: .infinity)
@@ -588,10 +1288,7 @@ struct SpotifyPlaylistView: View {
     var subtitle = ""
 
     var body: some View {
-        SpotifyTrackListView(
-            title: name, cover: cover, subtitle: subtitle,
-            failureHint: "Không tải được playlist này. Spotify chặn playlist do Spotify tạo (Daily Mix, Discover Weekly...) và một số playlist khác với ứng dụng mới.",
-            loader: { try await SpotifyAPI.shared.playlistTracks(id: playlistId, offset: $0) })
+        SpotifyPlaylistDetailView(playlistId: playlistId, name: name, cover: cover, subtitle: subtitle)
     }
 }
 
@@ -602,9 +1299,7 @@ struct SpotifyAlbumView: View {
     var subtitle = ""
 
     var body: some View {
-        SpotifyTrackListView(
-            title: name, cover: cover, subtitle: subtitle,
-            loader: { try await SpotifyAPI.shared.albumTracks(id: albumId, offset: $0) })
+        SpotifyPlaylistDetailView(albumId: albumId, name: name, cover: cover, subtitle: subtitle)
     }
 }
 

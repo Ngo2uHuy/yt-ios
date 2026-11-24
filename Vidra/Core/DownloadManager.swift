@@ -1,6 +1,6 @@
 import Foundation
 
-struct DownloadItem: Codable, Identifiable, Hashable {
+struct DownloadItem: Codable, Identifiable, Hashable, Sendable {
     var video: Video
     var file: String
     var audioOnly: Bool
@@ -74,7 +74,13 @@ final class DownloadManager: ObservableObject {
     }
 
     private func saveIndex() {
-        if let data = try? JSONEncoder().encode(items) { try? data.write(to: Self.indexURL, options: .atomic) }
+        let currentItems = items
+        let url = Self.indexURL
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(currentItems) {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
     }
 
     // MARK: - Worker
@@ -82,18 +88,6 @@ final class DownloadManager: ObservableObject {
     private nonisolated static func download(_ video: Video, audioOnly: Bool,
                                              progress: @escaping (Double) -> Void) async throws -> DownloadItem {
         let base = video.id.replacingOccurrences(of: ":", with: "_")
-
-        if video.source == .soundCloud {
-            let r = try await SoundCloud.shared.resolve(video.id)
-            guard case .progressive(let url)? = r.sources.first else {
-                throw YTError.unplayable("Bài này chỉ nghe trực tuyến, không tải được")
-            }
-            let name = "\(base).mp3"
-            let dest = dir.appendingPathComponent(name)
-            let f = DirectFormat(url: url, size: nil, height: nil, bitrate: 0, mime: "audio/mpeg", isDefaultAudio: true)
-            try await fetch(f, to: dest, progress: progress)
-            return DownloadItem(video: video, file: name, audioOnly: true, bytes: fileSize(dest))
-        }
 
         var ytId = video.id
         if video.source == .spotify { ytId = try await TrackMatcher.shared.youTubeId(for: video) }
@@ -119,8 +113,8 @@ final class DownloadManager: ObservableObject {
         try? fm.removeItem(at: dest)
 
         if let vf = formats.video, let af = formats.audio {
-            let tv = fm.temporaryDirectory.appendingPathComponent("\(video.id)-v.mp4")
-            let ta = fm.temporaryDirectory.appendingPathComponent("\(video.id)-a.m4a")
+            let tv = fm.temporaryDirectory.appendingPathComponent("\(base)-v.mp4")
+            let ta = fm.temporaryDirectory.appendingPathComponent("\(base)-a.m4a")
             defer { try? fm.removeItem(at: tv); try? fm.removeItem(at: ta) }
             let vs = Double(vf.size ?? 1), asz = Double(af.size ?? 0), total = max(vs + asz, 1)
             do {
@@ -164,20 +158,30 @@ final class DownloadManager: ObservableObject {
             try Task.checkCancellation()
             var req = URLRequest(url: format.url)
             req.setValue("bytes=\(offset)-\(offset + chunk - 1)", forHTTPHeaderField: "Range")
-            req.setValue(YTClient.androidVR.userAgent, forHTTPHeaderField: "User-Agent")
+            if format.url.host?.contains("googlevideo") == true {
+                req.setValue(YTClient.ios.userAgent, forHTTPHeaderField: "User-Agent")
+            }
             let (data, resp) = try await URLSession.shared.data(for: req)
             let http = resp as? HTTPURLResponse
             guard let code = http?.statusCode, (200..<300).contains(code) else {
                 throw YTError.http(http?.statusCode ?? 0)
             }
-            if total == 0, let range = http?.value(forHTTPHeaderField: "Content-Range"),
-               let t = range.split(separator: "/").last.flatMap({ Int64($0) }) {
-                total = t
+            if total == 0 {
+                if let range = http?.value(forHTTPHeaderField: "Content-Range"),
+                   let t = range.split(separator: "/").last.flatMap({ Int64($0) }) {
+                    total = t
+                } else if let len = http?.value(forHTTPHeaderField: "Content-Length").flatMap({ Int64($0) }) {
+                    total = len
+                }
             }
             if data.isEmpty { break }
             try handle.write(contentsOf: data)
             offset += Int64(data.count)
             if total > 0 { progress(min(Double(offset) / Double(total), 1)) }
+            if code == 200 {
+                progress(1.0)
+                break
+            }
         } while total > 0 && offset < total
     }
 

@@ -18,6 +18,7 @@ jobs:
         run: |
           xcodebuild -project Vidra.xcodeproj -target Vidra -configuration Release -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            SYMROOT=$(pwd)/build \
             build > build.log 2>&1 || { grep -E "error:|BUILD FAILED" build.log | head -80; exit 1; }
           grep -cE "warning:" build.log || true
 

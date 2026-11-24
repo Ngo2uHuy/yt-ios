@@ -8,6 +8,7 @@ final class PlayerUIView: UIView {
 
 struct VideoSurface: UIViewRepresentable {
     let player: AVPlayer
+    var gravity: AVLayerVideoGravity = .resizeAspect
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -15,7 +16,7 @@ struct VideoSurface: UIViewRepresentable {
         let view = PlayerUIView()
         view.backgroundColor = .black
         view.playerLayer.player = player
-        view.playerLayer.videoGravity = .resizeAspect
+        view.playerLayer.videoGravity = gravity
         if AVPictureInPictureController.isPictureInPictureSupported(),
            let pip = AVPictureInPictureController(playerLayer: view.playerLayer) {
             pip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
@@ -28,7 +29,14 @@ struct VideoSurface: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: PlayerUIView, context: Context) {}
+    func updateUIView(_ uiView: PlayerUIView, context: Context) {
+        if uiView.playerLayer.player !== player {
+            uiView.playerLayer.player = player
+        }
+        if uiView.playerLayer.videoGravity != gravity {
+            uiView.playerLayer.videoGravity = gravity
+        }
+    }
 
     final class Coordinator: NSObject, AVPictureInPictureControllerDelegate {
         var pip: AVPictureInPictureController?
@@ -47,7 +55,7 @@ struct VideoSurface: UIViewRepresentable {
 
         /// Detaching the layer is Apple's documented way to keep audio going in background (QA1668).
         @MainActor private func enteredBackground() {
-            guard let view, !(pip?.isPictureInPictureActive ?? false), !Pref.autoPiP else { return }
+            guard let view, !(pip?.isPictureInPictureActive ?? false) else { return }
             view.playerLayer.player = nil
         }
 
@@ -116,6 +124,19 @@ struct PlayerArea: View {
                 ProgressView().tint(.white).scaleEffect(1.4).allowsHitTesting(false)
             }
             if let err = pm.errorText { errorView(err) }
+            if let cue = pm.activeCueText, !cue.isEmpty {
+                Text(cue)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 6))
+                    .padding(.horizontal, 16)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, controlsVisible ? 60 : 20)
+                    .allowsHitTesting(false)
+            }
             if let toast = pm.toast {
                 Text(toast)
                     .font(.footnote.weight(.semibold))
@@ -262,23 +283,32 @@ struct PlayerArea: View {
                 }
 
                 HStack(spacing: 8) {
-                    Text(Fmt.time(scrub ?? pm.currentTime))
-                    Slider(
-                        value: Binding(get: { scrub ?? pm.currentTime }, set: { scrub = $0 }),
-                        in: 0...max(pm.duration, 1),
-                        onEditingChanged: { editing in
-                            if editing {
-                                hideTask?.cancel()
-                            } else {
-                                if let s = scrub { pm.seek(to: s) }
-                                scrub = nil
-                                scheduleHide()
+                    if pm.info?.isLive == true {
+                        Circle().fill(.red).frame(width: 8, height: 8)
+                        Text("TRỰC TIẾP")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.red)
+                        Spacer()
+                        Button { toggleOrientation() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    } else {
+                        Text(Fmt.time(scrub ?? pm.currentTime))
+                        Slider(
+                            value: Binding(get: { scrub ?? pm.currentTime }, set: { scrub = $0 }),
+                            in: 0...max(pm.duration, 1),
+                            onEditingChanged: { editing in
+                                if editing {
+                                    hideTask?.cancel()
+                                } else {
+                                    if let s = scrub { pm.seek(to: s) }
+                                    scrub = nil
+                                    scheduleHide()
+                                }
                             }
-                        }
-                    )
-                    .tint(.red)
-                    Text(Fmt.time(pm.duration))
-                    Button { toggleOrientation() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                        )
+                        .tint(.red)
+                        Text(Fmt.time(pm.duration))
+                        Button { toggleOrientation() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    }
                 }
                 .font(.caption.monospacedDigit())
                 .padding(.horizontal)
@@ -299,10 +329,15 @@ struct PlayerArea: View {
             .pickerStyle(.menu)
 
             Picker(selection: $maxHeight) {
-                Text("Tự động").tag(0)
-                ForEach([1080, 720, 480, 360], id: \.self) { Text("\($0)p").tag($0) }
+                Text("Tự động (Cao nhất)").tag(0)
+                Text("4K (2160p)").tag(2160)
+                Text("2K (1440p)").tag(1440)
+                Text("1080p (FHD)").tag(1080)
+                Text("720p (HD)").tag(720)
+                Text("480p (SD)").tag(480)
+                Text("360p").tag(360)
             } label: {
-                Label("Chất lượng", systemImage: "slider.horizontal.3")
+                Label(qualityLabel(maxHeight), systemImage: "slider.horizontal.3")
             }
             .pickerStyle(.menu)
 
@@ -310,9 +345,48 @@ struct PlayerArea: View {
                 Label("Chỉ âm thanh", systemImage: "headphones")
             }
             Toggle(isOn: $pm.loop) { Label("Lặp lại", systemImage: "repeat.1") }
+            if !pm.captionTracks.isEmpty {
+                Menu {
+                    Button {
+                        pm.selectCaption(nil)
+                    } label: {
+                        if pm.selectedCaption == nil {
+                            Label("Tắt", systemImage: "checkmark")
+                        } else {
+                            Text("Tắt")
+                        }
+                    }
+                    ForEach(pm.captionTracks) { track in
+                        Button {
+                            pm.selectCaption(track)
+                        } label: {
+                            if pm.selectedCaption?.id == track.id {
+                                Label(track.name.isEmpty ? track.languageCode : track.name, systemImage: "checkmark")
+                            } else {
+                                Text(track.name.isEmpty ? track.languageCode : track.name)
+                            }
+                        }
+                    }
+                } label: {
+                    Label(pm.selectedCaption != nil ? "Phụ đề: \(pm.selectedCaption?.name ?? "Bật")" : "Phụ đề", systemImage: "captions.bubble")
+                }
+            }
             SleepMenu()
         } label: {
             Image(systemName: "gearshape")
+        }
+    }
+
+    private func qualityLabel(_ h: Int) -> String {
+        switch h {
+        case 0: return "Chất lượng: Tự động"
+        case 2160: return "Chất lượng: 4K (2160p)"
+        case 1440: return "Chất lượng: 2K (1440p)"
+        case 1080: return "Chất lượng: 1080p"
+        case 720: return "Chất lượng: 720p"
+        case 480: return "Chất lượng: 480p"
+        case 360: return "Chất lượng: 360p"
+        default: return "Chất lượng: \(h)p"
         }
     }
 

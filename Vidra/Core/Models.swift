@@ -20,7 +20,6 @@ struct Video: Identifiable, Codable, Hashable, Sendable {
 
     var shareURL: URL {
         switch source {
-        case .soundCloud?: return link ?? URL(string: "https://soundcloud.com")!
         case .spotify?: return link ?? URL(string: "https://open.spotify.com")!
         case .ytMusic?: return URL(string: "https://music.youtube.com/watch?v=\(id)")!
         case nil: return URL(string: "https://youtu.be/\(id)")!
@@ -28,10 +27,10 @@ struct Video: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// Id conventions: YouTube/YT Music = raw video id, SoundCloud = "sc:<trackId>", Spotify = "sp:<trackId>".
-/// channelId: SoundCloud user = "scu:<userId>", Spotify artist = "spa:<artistId>".
+/// Id conventions: YouTube/YT Music = raw video id, Spotify = "sp:<trackId>".
+/// channelId: Spotify artist = "spa:<artistId>".
 enum MediaSource: String, Codable, Sendable {
-    case ytMusic, soundCloud, spotify
+    case ytMusic, spotify
 }
 
 struct Channel: Identifiable, Codable, Hashable, Sendable {
@@ -41,21 +40,29 @@ struct Channel: Identifiable, Codable, Hashable, Sendable {
     var subscribers: String?
 }
 
+struct ChannelPlaylist: Identifiable, Codable, Hashable, Sendable {
+    var id: String
+    var title: String
+    var thumbnail: URL?
+    var videoCount: String?
+}
+
 struct Page {
     var videos: [Video] = []
     var channels: [Channel] = []
+    var playlists: [ChannelPlaylist] = []
     var continuation: String?
     var title: String?
     var channel: Channel?
 }
 
-struct HistoryItem: Identifiable, Codable, Hashable {
+struct HistoryItem: Identifiable, Codable, Hashable, Sendable {
     var video: Video
     var date: Date
     var id: String { video.id }
 }
 
-struct LocalPlaylist: Identifiable, Codable, Hashable {
+struct LocalPlaylist: Identifiable, Codable, Hashable, Sendable {
     var id = UUID()
     var name: String
     var videos: [Video] = []
@@ -70,20 +77,63 @@ struct Comment: Identifiable {
     let likes: String
 }
 
+struct CaptionTrack: Identifiable, Codable, Hashable, Sendable {
+    var id: String { languageCode + (name.isEmpty ? "" : " - " + name) }
+    var name: String
+    var languageCode: String
+    var url: URL
+}
+
+struct CaptionCue: Identifiable, Sendable {
+    var id: Double { start }
+    let start: Double
+    let end: Double
+    let text: String
+}
+
 struct VideoInfo {
     var description: String
     var viewCount: Int?
     var isLive: Bool
     var storyboard: String?
+    var captions: [CaptionTrack] = []
 }
 
 struct DirectFormat {
     let url: URL
     let size: Int64?
+    let width: Int?
     let height: Int?
+    let fps: Int?
     let bitrate: Int
     let mime: String
     let isDefaultAudio: Bool
+    let initRange: (start: Int, end: Int)?
+    let indexRange: (start: Int, end: Int)?
+
+    init(
+        url: URL,
+        size: Int64?,
+        width: Int? = nil,
+        height: Int?,
+        fps: Int? = nil,
+        bitrate: Int,
+        mime: String,
+        isDefaultAudio: Bool,
+        initRange: (start: Int, end: Int)? = nil,
+        indexRange: (start: Int, end: Int)? = nil
+    ) {
+        self.url = url
+        self.size = size
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.bitrate = bitrate
+        self.mime = mime
+        self.isDefaultAudio = isDefaultAudio
+        self.initRange = initRange
+        self.indexRange = indexRange
+    }
 }
 
 struct DirectSet {
@@ -157,8 +207,10 @@ enum Pref {
         UserDefaults.standard.object(forKey: key) as? Bool ?? fallback
     }
 
-    /// 0 = automatic (highest available).
-    static var maxHeight: Int { UserDefaults.standard.object(forKey: maxHeightKey) as? Int ?? 1080 }
+    /// 0 = automatic (highest available). Supports up to 4K (2160p) with automatic fallback to 1080p if undecodable.
+    static var maxHeight: Int {
+        UserDefaults.standard.object(forKey: maxHeightKey) as? Int ?? 2160
+    }
     static var autoplay: Bool { bool(autoplayKey, true) }
     static var sponsorBlock: Bool { bool(sponsorBlockKey, true) }
     static var autoPiP: Bool { bool(autoPiPKey, true) }
@@ -169,6 +221,13 @@ enum Pref {
 }
 
 enum Fmt {
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .full
+        return f
+    }()
+    private static let relativeLock = NSLock()
+
     static func time(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "0:00" }
         let t = Int(seconds)
@@ -189,8 +248,8 @@ enum Fmt {
     static func rate(_ r: Double) -> String { String(format: "%gx", r) }
 
     static func ago(_ date: Date) -> String {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .full
-        return f.localizedString(for: date, relativeTo: Date())
+        relativeLock.lock()
+        defer { relativeLock.unlock() }
+        return relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
 }

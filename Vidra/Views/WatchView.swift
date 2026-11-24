@@ -1,24 +1,8 @@
 import SwiftUI
 
 struct WatchView: View {
-    @Environment(\.verticalSizeClass) private var vsc
-    @Environment(\.dismiss) private var dismiss
-
     var body: some View {
-        NavigationStack {
-            Group {
-                if vsc == .compact {
-                    PlayerArea(onClose: { dismiss() }).ignoresSafeArea()
-                } else {
-                    VStack(spacing: 0) {
-                        PlayerArea(onClose: { dismiss() }).aspectRatio(16 / 9, contentMode: .fit)
-                        WatchDetails()
-                    }
-                }
-            }
-            .background(vsc == .compact ? Color.black : Color(.systemBackground))
-            .toolbar(.hidden, for: .navigationBar)
-        }
+        YouTubeWatchView()
     }
 }
 
@@ -47,7 +31,7 @@ struct WatchDetails: View {
                         HStack {
                             Text("Hàng đợi (\(pm.queue.count))").font(.headline)
                             Spacer()
-                            Button("Xoá") { pm.queue = [] }.font(.subheadline)
+                            Button("Xoá") { pm.clearQueue() }.font(.subheadline)
                         }
                         ForEach(pm.queue) { q in VideoButton(video: q) }
                     }
@@ -67,7 +51,7 @@ struct WatchDetails: View {
             .task(id: v.id) {
                 votes = nil
                 expanded = false
-                guard v.source != .soundCloud else { return }
+                guard v.source == nil || v.source == .ytMusic else { return }
                 votes = await Extras.votes(v.id)
             }
             .sheet(isPresented: $showComments) {
@@ -90,7 +74,7 @@ struct WatchDetails: View {
 
     @ViewBuilder
     private func channelRow(_ v: Video) -> some View {
-        if let id = v.channelId, v.source != .soundCloud {
+        if let id = v.channelId {
             let known = lib.subscriptions.first { $0.id == id }
             let channel = Channel(id: id, title: v.channelTitle, avatar: known?.avatar)
             HStack {
@@ -113,9 +97,10 @@ struct WatchDetails: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 if let votes {
-                    HStack(spacing: 12) {
-                        Label(Fmt.count(votes.likes), systemImage: "hand.thumbsup")
-                        Label(Fmt.count(votes.dislikes), systemImage: "hand.thumbsdown")
+                    HStack(spacing: 8) {
+                        Label(Fmt.count(votes.likes), systemImage: "hand.thumbsup.fill")
+                        Divider().frame(height: 12)
+                        Label(Fmt.count(votes.dislikes), systemImage: "hand.thumbsdown.fill")
                     }
                     .modifier(Pill())
                 }
@@ -154,9 +139,7 @@ struct WatchDetails: View {
             Label("Đã tải", systemImage: "checkmark.circle.fill").modifier(Pill())
         } else {
             Menu {
-                if v.source != .soundCloud {
-                    Button("Video") { dl.start(v, audioOnly: false) }
-                }
+                Button("Video") { dl.start(v, audioOnly: false) }
                 Button("Chỉ âm thanh") { dl.start(v, audioOnly: true) }
             } label: {
                 Label("Tải xuống", systemImage: "arrow.down.circle").modifier(Pill())

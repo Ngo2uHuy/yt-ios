@@ -21,7 +21,7 @@ enum YTClient {
         case .web: return "2.20251101.01.00"
         case .webRemix: return "1.20251101.01.00"
         case .ios: return "20.10.4"
-        case .androidVR: return "1.62.27"
+        case .androidVR: return "1.65.10"
         }
     }
 
@@ -41,7 +41,7 @@ enum YTClient {
         case .ios:
             return "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
         case .androidVR:
-            return "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            return "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         }
     }
 
@@ -55,6 +55,9 @@ enum YTClient {
         case .androidVR:
             c["deviceMake"] = "Oculus"; c["deviceModel"] = "Quest 3"
             c["osName"] = "Android"; c["osVersion"] = "12L"; c["androidSdkVersion"] = 32
+            c["userAgent"] = userAgent
+            c["timeZone"] = "UTC"
+            c["utcOffsetMinutes"] = 0
         }
         if let visitorData { c["visitorData"] = visitorData }
         return ["client": c]
@@ -66,7 +69,7 @@ actor InnerTube {
     static let hl = Locale.current.language.languageCode?.identifier ?? "en"
     static let gl = Locale.current.region?.identifier ?? "US"
 
-    private var visitorData: String?
+    private var visitorData: String? = "CgtsRGRWV1hiaVNYcyjAl5bYBjIKCgJWThIEGgAgPUgBYqoCCqcCQ3RvQkNBVVNqQUVCREI2UERMUWpuZ0dJUnNwajdLOHZDRTNVZ0x4NkM3UklBcnNUR2ZUbk9JRDc4MFV0Zmh5WWFFQ0xxWENYQ0ZwaHFUUDdPMFZDWXFaZ2lSR0I4VENIYjdrcXJEVmVNQVF2cDE2bHJLOTczR0E3ZFplRmxxUmRTc0VhZHBZdnpkdlVBUTNyYnVqTC0tRUZIX2psTmZRY21jOHU0TkRDSTByTjBOeDVjTFE2YzN6cktuX3pZSXpQMmJ5QUZpZ0ZNa1VCSEZqMWFqUDY2c05mRVFQdW9YS3hWOGRJOTc1cGk3QUpBUjJDMFFEcWNlRzRJUVY0clk4bVp6aUFGWW9DbGx5b1pEOVhWNmJxdFFRTTU4X0lQazBDYTBkdG1Rcw%3D%3D"
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
@@ -132,6 +135,23 @@ actor InnerTube {
         }
         // params = "Videos" tab
         let j = try await post("browse", body: ["browseId": id, "params": "EgZ2aWRlb3PyBgQKAjoA"])
+        var page = YTParse.page(j)
+        let meta = j["metadata"]["channelMetadataRenderer"]
+        page.channel = Channel(
+            id: id,
+            title: meta["title"].string ?? "",
+            avatar: YTParse.thumb(meta["avatar"]),
+            subscribers: j["header"]["c4TabbedHeaderRenderer"]["subscriberCountText"].text
+        )
+        return page
+    }
+
+    func channelPlaylists(_ id: String, continuation: String?) async throws -> Page {
+        if let continuation {
+            return YTParse.page(try await post("browse", body: ["continuation": continuation]))
+        }
+        // params = "Playlists" tab
+        let j = try await post("browse", body: ["browseId": id, "params": "EglwbGF5bGlzdHPyBgQKAjoA"])
         var page = YTParse.page(j)
         let meta = j["metadata"]["channelMetadataRenderer"]
         page.channel = Channel(
@@ -242,50 +262,191 @@ actor InnerTube {
 
     // MARK: - Streams
 
-    private func player(_ id: String, client: YTClient) async throws -> J {
-        try await post("player", client: client, body: ["videoId": id, "contentCheckOk": true, "racyCheckOk": true])
+    private func player(_ id: String, client: YTClient, startTimeSecs: Int? = nil) async throws -> J {
+        var body: [String: Any] = [
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+            "playbackContext": [
+                "contentPlaybackContext": [
+                    "html5Preference": "HTML5_PREF_WANTS"
+                ]
+            ]
+        ]
+        if let s = startTimeSecs, s > 0 { body["startTimeSecs"] = s }
+        return try await post("player", client: client, body: body)
     }
 
-    private func tryPlayer(_ id: String, _ client: YTClient) async -> J? {
-        try? await player(id, client: client)
+    private func tryPlayer(_ id: String, _ client: YTClient, startTimeSecs: Int? = nil) async -> J? {
+        try? await player(id, client: client, startTimeSecs: startTimeSecs)
     }
 
     /// Plays raw streams directly, so no ads are ever requested or shown.
-    func resolve(_ id: String, audioOnly: Bool, maxHeight: Int) async throws -> ResolvedVideo {
-        async let iosRes = tryPlayer(id, .ios)
-        async let vrRes = tryPlayer(id, .androidVR)
-        let ios = await iosRes, vr = await vrRes
+    func resolve(_ id: String, audioOnly: Bool, maxHeight: Int, startTimeSecs: Int? = nil) async throws -> ResolvedVideo {
+        let needsHighRes = !audioOnly && (maxHeight > 1080 || maxHeight == 0)
+        async let iosRes = tryPlayer(id, .ios, startTimeSecs: startTimeSecs)
+        async let vrRes = needsHighRes ? tryPlayer(id, .androidVR, startTimeSecs: startTimeSecs) : nil
+        var ios = await iosRes
+        var vr = await vrRes
 
         func playable(_ j: J?) -> J? { j?["playabilityStatus"]["status"].string == "OK" ? j : nil }
-        let iosOK = playable(ios), vrOK = playable(vr)
+        var iosOK = playable(ios)
+        var vrOK = playable(vr)
+
+        // Fallback to AndroidVR if iOS stream is unavailable/unplayable and VR wasn't fetched yet
+        if iosOK == nil && vrOK == nil && !needsHighRes {
+            vr = await tryPlayer(id, .androidVR, startTimeSecs: startTimeSecs)
+            vrOK = playable(vr)
+        }
+
         guard let meta = iosOK ?? vrOK else {
             let reason = (ios ?? vr)?["playabilityStatus"]["reason"].string
             throw YTError.unplayable(reason ?? "Video không khả dụng")
         }
 
-        let direct = vrOK.map { YTParse.directFormats($0, maxHeight: maxHeight) } ?? DirectSet()
-        let hls = [iosOK, vrOK].compactMap { $0?["streamingData"]["hlsManifestUrl"].string }.compactMap { URL(string: $0) }
+        let directCandidates = [iosOK, vrOK].compactMap { $0 }.map { YTParse.directFormats($0, maxHeight: maxHeight) }
+        let direct = DirectSet(
+            video: directCandidates.compactMap(\.video).first,
+            audio: directCandidates.compactMap(\.audio).first,
+            muxed: directCandidates.compactMap(\.muxed).first
+        )
+
+        // If high resolution (>1080p) is selected, also prepare a 1080p H.264 fallback
+        let fallbackDirect: DirectSet? = {
+            guard (maxHeight > 1080 || maxHeight == 0), (direct.video?.height ?? 0) > 1080 else { return nil }
+            let fCandidates = [iosOK, vrOK].compactMap { $0 }.map { YTParse.directFormats($0, maxHeight: 1080) }
+            return DirectSet(
+                video: fCandidates.compactMap(\.video).first,
+                audio: fCandidates.compactMap(\.audio).first,
+                muxed: fCandidates.compactMap(\.muxed).first
+            )
+        }()
+        let isLive = (vrOK ?? iosOK)?["videoDetails"]["isLive"].bool ?? (vrOK ?? iosOK)?["videoDetails"]["isLiveContent"].bool ?? false
+        let hls = [vrOK, iosOK].compactMap { $0?["streamingData"]["hlsManifestUrl"].string }.compactMap { URL(string: $0) }
 
         // Ordered by preference; the player falls through on failure.
         var sources: [PlaybackSource] = []
-        if audioOnly, let a = direct.audio { sources.append(.progressive(a.url)) }
-        sources += hls.map { PlaybackSource.hls($0) }
-        if !audioOnly, let v = direct.video, let a = direct.audio { sources.append(.composite(video: v.url, audio: a.url)) }
-        if let m = direct.muxed { sources.append(.progressive(m.url)) }
+        if isLive {
+            // Live streams must be played via Apple HLS manifest (which streams sliding window chunks)
+            sources = hls.map { PlaybackSource.hls($0) }
+        } else if audioOnly {
+            if let a = direct.audio {
+                if let audioHLS = await HLSBuilder.buildAudio(id: id, audio: a, startTimeSecs: startTimeSecs) {
+                    sources.append(.hls(audioHLS))
+                }
+                sources.append(.progressive(a.url))
+            }
+            sources += hls.map { PlaybackSource.hls($0) }
+        } else {
+            // 1. Primary high-resolution source (4K / 2K / 1080p)
+            if let v = direct.video, let a = direct.audio {
+                if let dynamicHLS = await HLSBuilder.buildMaster(id: id, video: v, audio: a, startTimeSecs: startTimeSecs) {
+                    sources.append(.hls(dynamicHLS))
+                }
+                sources.append(.composite(video: v.url, audio: a.url))
+            }
+
+            // 2. Fallback to 1080p H.264 if high-res stream is unplayable on this hardware
+            if let fb = fallbackDirect, let fv = fb.video, let fa = fb.audio ?? direct.audio, (fv.height ?? 0) < (direct.video?.height ?? 0) {
+                if let dynamicHLS1080 = await HLSBuilder.buildMaster(id: id, video: fv, audio: fa, startTimeSecs: startTimeSecs) {
+                    sources.append(.hls(dynamicHLS1080))
+                }
+                sources.append(.composite(video: fv.url, audio: fa.url))
+            }
+
+            if let m = direct.muxed { sources.append(.progressive(m.url)) }
+            sources += hls.map { PlaybackSource.hls($0) }
+            if let a = direct.audio {
+                if let audioHLS = await HLSBuilder.buildAudio(id: id, audio: a, startTimeSecs: startTimeSecs) {
+                    sources.append(.hls(audioHLS))
+                }
+                sources.append(.progressive(a.url))
+            }
+        }
         guard !sources.isEmpty else { throw YTError.noStreams }
 
         let details = YTParse.details(meta, id: id)
         var info = details.1
         info.storyboard = [vrOK, iosOK].compactMap { $0?["storyboards"]["playerStoryboardSpecRenderer"]["spec"].string }.first
+        let rawCaptions = [iosOK, vrOK].compactMap { $0?["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"].array }.first ?? []
+        info.captions = rawCaptions.compactMap { ct in
+            guard let base = ct["baseUrl"].string else { return nil }
+            let vttUrlString = base + (base.contains("?") ? "&" : "?") + "fmt=vtt"
+            guard let url = URL(string: vttUrlString) else { return nil }
+            let name = ct["name"].text ?? ct["languageCode"].string ?? ""
+            let lang = ct["languageCode"].string ?? ""
+            return CaptionTrack(name: name, languageCode: lang, url: url)
+        }
         return ResolvedVideo(video: details.0, info: info, sources: sources)
     }
 
-    func directFormats(_ id: String) async throws -> (video: Video, formats: DirectSet) {
-        let j = try await player(id, client: .androidVR)
-        guard j["playabilityStatus"]["status"].string == "OK" else {
-            throw YTError.unplayable(j["playabilityStatus"]["reason"].string ?? "Video không khả dụng")
+    func fetchCaptions(from url: URL) async -> [CaptionCue] {
+        guard let res = try? await session.data(from: url),
+              let text = String(data: res.0, encoding: .utf8) else { return [] }
+        return Self.parseVTT(text)
+    }
+
+    static func parseVTT(_ text: String) -> [CaptionCue] {
+        var cues: [CaptionCue] = []
+        let lines = text.components(separatedBy: .newlines)
+        var i = 0
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+            if line.contains("-->") {
+                let parts = line.components(separatedBy: "-->")
+                if parts.count == 2,
+                   let start = parseVTTTime(parts[0].trimmingCharacters(in: .whitespaces)),
+                   let end = parseVTTTime(parts[1].trimmingCharacters(in: .whitespaces).components(separatedBy: " ").first ?? "") {
+                    i += 1
+                    var textParts: [String] = []
+                    while i < lines.count && !lines[i].trimmingCharacters(in: .whitespaces).isEmpty {
+                        let clean = lines[i].replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                            .trimmingCharacters(in: .whitespaces)
+                        if !clean.isEmpty { textParts.append(clean) }
+                        i += 1
+                    }
+                    let fullText = textParts.joined(separator: "\n")
+                    if !fullText.isEmpty {
+                        cues.append(CaptionCue(start: start, end: end, text: fullText))
+                    }
+                }
+            }
+            i += 1
         }
-        return (YTParse.details(j, id: id).0, YTParse.directFormats(j, maxHeight: Pref.maxHeight))
+        return cues
+    }
+
+    private static func parseVTTTime(_ raw: String) -> Double? {
+        let p = raw.split(separator: ":").map(String.init)
+        guard p.count >= 2 else { return nil }
+        if p.count == 3 {
+            guard let h = Double(p[0]), let m = Double(p[1]), let s = Double(p[2].replacingOccurrences(of: ",", with: ".")) else { return nil }
+            return h * 3600 + m * 60 + s
+        } else if p.count == 2 {
+            guard let m = Double(p[0]), let s = Double(p[1].replacingOccurrences(of: ",", with: ".")) else { return nil }
+            return m * 60 + s
+        }
+        return nil
+    }
+
+    func directFormats(_ id: String) async throws -> (video: Video, formats: DirectSet) {
+        async let iosRes = tryPlayer(id, .ios)
+        async let vrRes = tryPlayer(id, .androidVR)
+        let ios = await iosRes, vr = await vrRes
+
+        func playable(_ j: J?) -> J? { j?["playabilityStatus"]["status"].string == "OK" ? j : nil }
+        guard let meta = playable(ios) ?? playable(vr) else {
+            let reason = (ios ?? vr)?["playabilityStatus"]["reason"].string
+            throw YTError.unplayable(reason ?? "Video không khả dụng")
+        }
+
+        let directCandidates = [playable(ios), playable(vr)].compactMap { $0 }.map { YTParse.directFormats($0, maxHeight: Pref.maxHeight) }
+        let direct = DirectSet(
+            video: directCandidates.compactMap(\.video).first,
+            audio: directCandidates.compactMap(\.audio).first,
+            muxed: directCandidates.compactMap(\.muxed).first
+        )
+        return (YTParse.details(meta, id: id).0, direct)
     }
 }
 
@@ -294,7 +455,7 @@ actor InnerTube {
 enum YTParse {
     private static let itemKeys: Set<String> = [
         "videoRenderer", "compactVideoRenderer", "gridVideoRenderer", "playlistVideoRenderer",
-        "lockupViewModel", "channelRenderer", "continuationItemRenderer",
+        "lockupViewModel", "channelRenderer", "continuationItemRenderer", "playlistRenderer", "gridPlaylistRenderer"
     ]
 
     static func page(_ j: J) -> Page {
@@ -306,8 +467,14 @@ enum YTParse {
                 if let c = channel(value) { page.channels.append(c) }
             case "continuationItemRenderer":
                 if let t = value.first("continuationCommand")?["token"].string { page.continuation = t }
+            case "playlistRenderer", "gridPlaylistRenderer":
+                if let p = playlist(value) { page.playlists.append(p) }
             case "lockupViewModel":
-                if let v = lockup(value), seen.insert(v.id).inserted { page.videos.append(v) }
+                if let v = lockup(value), seen.insert(v.id).inserted {
+                    page.videos.append(v)
+                } else if let p = lockupPlaylist(value) {
+                    page.playlists.append(p)
+                }
             default:
                 if let v = video(value), seen.insert(v.id).inserted { page.videos.append(v) }
             }
@@ -353,6 +520,28 @@ enum YTParse {
         )
     }
 
+    static func lockupPlaylist(_ l: J) -> ChannelPlaylist? {
+        guard let id = l["contentId"].string, l["contentType"].string == "LOCKUP_CONTENT_TYPE_PLAYLIST" else { return nil }
+        let meta = l["metadata"]["lockupMetadataViewModel"]
+        return ChannelPlaylist(
+            id: id,
+            title: meta["title"]["content"].string ?? "",
+            thumbnail: thumb(l["contentImage"]),
+            videoCount: l["contentImage"].first("thumbnailBadgeViewModel")?["text"].string
+        )
+    }
+
+    static func playlist(_ r: J) -> ChannelPlaylist? {
+        guard let id = r["playlistId"].string else { return nil }
+        let count = r["videoCountText"].text ?? r["videoCountShortText"].text ?? r["videoCount"].text
+        return ChannelPlaylist(
+            id: id,
+            title: r["title"].text ?? "",
+            thumbnail: thumb(r["thumbnail"]),
+            videoCount: count
+        )
+    }
+
     static func channel(_ r: J) -> Channel? {
         guard let id = r["channelId"].string else { return nil }
         return Channel(
@@ -388,9 +577,10 @@ enum YTParse {
         guard let id = r["playlistItemData"]["videoId"].string ?? r.first("watchEndpoint")?["videoId"].string else { return nil }
         let cols = r["flexColumns"].array.map { $0["musicResponsiveListItemFlexColumnRenderer"]["text"] }
         let runs = cols.count > 1 ? cols[1]["runs"].array : []
-        let artistRun = runs.first {
-            $0["navigationEndpoint"]["browseEndpoint"]["browseEndpointContextSupportedConfigs"]
-                ["browseEndpointContextMusicConfig"]["pageType"].string == "MUSIC_PAGE_TYPE_ARTIST"
+        // A "[" at the start of a line would begin a new statement, so the subscript chain is split via a local.
+        let artistRun = runs.first { run in
+            let configs = run["navigationEndpoint"]["browseEndpoint"]["browseEndpointContextSupportedConfigs"]
+            return configs["browseEndpointContextMusicConfig"]["pageType"].string == "MUSIC_PAGE_TYPE_ARTIST"
         }
         let parts = runs.compactMap { $0["text"].string?.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && $0 != "•" && $0 != "&" && $0 != "," }
@@ -434,7 +624,7 @@ enum YTParse {
 
     static func details(_ j: J, id: String) -> (Video, VideoInfo) {
         let d = j["videoDetails"]
-        let live = d["isLive"].bool ?? false
+        let live = d["isLive"].bool ?? d["isLiveContent"].bool ?? false
         let views = d["viewCount"].int
         let video = Video(
             id: id,
@@ -452,21 +642,45 @@ enum YTParse {
         let sd = j["streamingData"]
         func format(_ f: J) -> DirectFormat? {
             guard let s = f["url"].string, let url = URL(string: s) else { return nil }
+            let ir = f["initRange"]
+            let initR = ir["start"].string.flatMap { s in ir["end"].string.flatMap { e in Int(s).flatMap { si in Int(e).map { (si, $0) } } } }
+            let xr = f["indexRange"]
+            let indexR = xr["start"].string.flatMap { s in xr["end"].string.flatMap { e in Int(s).flatMap { si in Int(e).map { (si, $0) } } } }
             return DirectFormat(
                 url: url,
                 size: f["contentLength"].string.flatMap { Int64($0) },
+                width: f["width"].int,
                 height: f["height"].int,
+                fps: f["fps"].int,
                 bitrate: f["bitrate"].int ?? 0,
                 mime: f["mimeType"].string ?? "",
-                isDefaultAudio: f["audioTrack"]["audioIsDefault"].bool ?? true
+                isDefaultAudio: f["audioTrack"]["audioIsDefault"].bool ?? true,
+                initRange: initR,
+                indexRange: indexR
             )
         }
         let adaptive = sd["adaptiveFormats"].array.compactMap(format)
-        let cap = maxHeight > 0 ? maxHeight : Int.max
-        // AVPlayer decodes H.264 in hardware on every iPhone; VP9/AV1 are not reliable.
-        let video = adaptive
-            .filter { $0.mime.hasPrefix("video/mp4") && $0.mime.contains("avc1") && ($0.height ?? 0) <= cap }
-            .max { ($0.height ?? 0, $0.bitrate) < ($1.height ?? 0, $1.bitrate) }
+        let cap = maxHeight > 0 ? maxHeight : 2160
+        // Supported video streams in ISO BMFF (MP4) container.
+        // H.264 (avc1) is hardware-accelerated on all iOS devices up to 1080p.
+        // 2K (1440p) and 4K (2160p) are served by YouTube in AV1 (av01) in MP4 container.
+        let mp4Videos = adaptive.filter {
+            $0.mime.hasPrefix("video/mp4") && ($0.height ?? 0) <= cap
+        }
+        let video: DirectFormat? = {
+            if cap > 1080 {
+                // If 2K or 4K requested, select highest resolution available up to cap
+                return mp4Videos.max {
+                    ($0.height ?? 0, $0.fps ?? 30, $0.bitrate) < ($1.height ?? 0, $1.fps ?? 30, $1.bitrate)
+                }
+            } else {
+                // For <= 1080p, prioritize H.264 (avc1) for maximum battery efficiency, falling back to any MP4
+                let avc = mp4Videos.filter { $0.mime.contains("avc1") }
+                return (avc.isEmpty ? mp4Videos : avc).max {
+                    ($0.height ?? 0, $0.fps ?? 30, $0.bitrate) < ($1.height ?? 0, $1.fps ?? 30, $1.bitrate)
+                }
+            }
+        }()
         let audio = adaptive
             .filter { $0.mime.hasPrefix("audio/mp4") && $0.isDefaultAudio }
             .max { $0.bitrate < $1.bitrate }

@@ -16,6 +16,14 @@ struct LyricsResult: Sendable {
 actor LyricsService {
     static let shared = LyricsService()
 
+    private static let cleanPatterns: [(NSRegularExpression, String)] = [
+        (try! NSRegularExpression(pattern: #"\s*[\(\[][^\)\]]*official[^\)\]]*[\)\]]"#, options: .caseInsensitive), ""),
+        (try! NSRegularExpression(pattern: #"\s*\[[^\]]*\]"#, options: .caseInsensitive), ""),
+        (try! NSRegularExpression(pattern: #"\s*[\(\[]?\s*(?:ft\.?|feat\.?|featuring)\s.*$"#, options: .caseInsensitive), ""),
+        (try! NSRegularExpression(pattern: #"\s*-\s*Topic\s*$"#, options: .caseInsensitive), "")
+    ]
+    private static let lrcStamp = try? NSRegularExpression(pattern: #"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]"#)
+
     private struct Item: Decodable {
         let syncedLyrics: String?
         let plainLyrics: String?
@@ -36,16 +44,21 @@ actor LyricsService {
         if item == nil { item = await search(query: "\(title) \(artist)") }
 
         guard let item else {
-            if !Task.isCancelled { misses.insert(video.id) }
+            if !Task.isCancelled {
+                if misses.count > 500 { misses.removeAll() }
+                misses.insert(video.id)
+            }
             return nil
         }
         let synced = Self.parse(item.syncedLyrics ?? "")
         let plain = item.plainLyrics?.trimmingCharacters(in: .whitespacesAndNewlines)
         let result = LyricsResult(synced: synced, plain: (plain?.isEmpty ?? true) ? nil : plain)
         if result.isEmpty {
+            if misses.count > 500 { misses.removeAll() }
             misses.insert(video.id)
             return nil
         }
+        if cache.count > 300 { cache.removeAll() }
         cache[video.id] = result
         return result
     }
@@ -86,14 +99,9 @@ actor LyricsService {
 
     static func cleanTitle(_ raw: String) -> String {
         var s = raw
-        let patterns = [
-            #"\s*[\(\[][^\)\]]*official[^\)\]]*[\)\]]"#,
-            #"\s*\[[^\]]*\]"#,
-            #"\s*[\(\[]?\s*(?:ft\.?|feat\.?|featuring)\s.*$"#,
-            #"\s*-\s*Topic\s*$"#
-        ]
-        for p in patterns {
-            s = s.replacingOccurrences(of: p, with: "", options: [.regularExpression, .caseInsensitive])
+        for (re, replacement) in cleanPatterns {
+            let ns = s as NSString
+            s = re.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: ns.length), withTemplate: replacement)
         }
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? raw : trimmed
@@ -112,8 +120,7 @@ actor LyricsService {
 
     /// "[mm:ss.xx] text" lines; a line may carry several timestamps.
     static func parse(_ lrc: String) -> [LyricLine] {
-        guard !lrc.isEmpty,
-              let stamp = try? NSRegularExpression(pattern: #"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]"#) else { return [] }
+        guard !lrc.isEmpty, let stamp = lrcStamp else { return [] }
         var lines: [LyricLine] = []
         for raw in lrc.components(separatedBy: .newlines) {
             let ns = raw as NSString

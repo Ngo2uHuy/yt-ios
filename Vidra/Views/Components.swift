@@ -9,7 +9,11 @@ struct Thumbnail: View {
         Color(.secondarySystemFill)
             .aspectRatio(16 / 9, contentMode: .fit)
             .overlay {
-                AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear }
+                CachedAsyncImage(url: url, targetSize: CGSize(width: 320, height: 180)) {
+                    $0.resizable().scaledToFill()
+                } placeholder: {
+                    Color.clear
+                }
             }
             .clipped()
             .overlay(alignment: .bottomTrailing) {
@@ -54,7 +58,9 @@ struct VideoRow: View {
                 Color(.secondarySystemFill)
                     .frame(width: 56, height: 56)
                     .overlay {
-                        AsyncImage(url: video.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+                        CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 80, height: 80)) {
+                            $0.resizable().scaledToFill()
+                        } placeholder: {
                             Image(systemName: "music.note").foregroundStyle(.secondary)
                         }
                     }
@@ -83,15 +89,25 @@ struct VideoRow: View {
                 Spacer(minLength: 0)
             }
         } else {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 Thumbnail(url: video.thumbnail, duration: video.duration, progress: progress)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(video.title).font(.body.weight(.semibold)).lineLimit(2)
-                    Text([video.channelTitle, meta].filter { !$0.isEmpty }.joined(separator: " • "))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                HStack(alignment: .top, spacing: 12) {
+                    let known = Library.shared.subscriptions.first { $0.id == video.channelId }
+                    Avatar(url: known?.avatar, name: video.channelTitle, size: 36)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(video.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        Text([video.channelTitle, meta].filter { !$0.isEmpty }.joined(separator: " • "))
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "ellipsis")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
                 }
-                .padding(.horizontal, 4)
+                .padding(.horizontal, 6)
             }
+            .padding(.bottom, 6)
         }
     }
 }
@@ -100,7 +116,6 @@ extension MediaSource {
     var iconName: String {
         switch self {
         case .ytMusic: return "music.note"
-        case .soundCloud: return "cloud.fill"
         case .spotify: return "dot.radiowaves.right"
         }
     }
@@ -108,7 +123,6 @@ extension MediaSource {
     var tint: Color {
         switch self {
         case .ytMusic: return .red
-        case .soundCloud: return .orange
         case .spotify: return .green
         }
     }
@@ -133,9 +147,15 @@ struct VideoButton: View {
 struct VideoMenu: ViewModifier {
     let video: Video
     @ObservedObject private var lib = Library.shared
+    @State private var showRemap = false
 
     func body(content: Content) -> some View {
         content.contextMenu {
+            if video.source == .spotify {
+                Button { showRemap = true } label: {
+                    Label("Đổi bản YouTube Music", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
             Button { PlayerManager.shared.playNext(video) } label: {
                 Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
             }
@@ -153,14 +173,15 @@ struct VideoMenu: ViewModifier {
                 }
             }
             Menu {
-                if video.source != .soundCloud {
-                    Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
-                }
+                Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
                 Button("Chỉ âm thanh") { DownloadManager.shared.start(video, audioOnly: true) }
             } label: {
                 Label("Tải xuống", systemImage: "arrow.down.circle")
             }
             ShareLink(item: video.shareURL) { Label("Chia sẻ", systemImage: "square.and.arrow.up") }
+        }
+        .sheet(isPresented: $showRemap) {
+            SpotifyRemapSheet(video: video)
         }
     }
 }
@@ -175,7 +196,9 @@ struct Avatar: View {
     var size: CGFloat = 40
 
     var body: some View {
-        AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: {
+        CachedAsyncImage(url: url, targetSize: CGSize(width: size, height: size)) {
+            $0.resizable().scaledToFill()
+        } placeholder: {
             ZStack {
                 Color.red.opacity(0.2)
                 Text(name.prefix(1).uppercased()).font(.system(size: size * 0.45, weight: .semibold))
@@ -209,11 +232,19 @@ struct SubscribeButton: View {
         Button {
             lib.toggleSubscription(channel)
         } label: {
-            Text(subscribed ? "Đã đăng ký" : "Đăng ký").font(.subheadline.weight(.semibold))
+            HStack(spacing: 5) {
+                if subscribed {
+                    Image(systemName: "bell.fill").font(.caption2)
+                }
+                Text(subscribed ? "Đã đăng ký" : "Đăng ký")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .padding(.horizontal, 4)
         }
         .buttonStyle(.borderedProminent)
         .buttonBorderShape(.capsule)
-        .tint(subscribed ? .gray : .red)
+        .tint(subscribed ? Color(.secondarySystemFill) : Color.primary)
+        .foregroundStyle(subscribed ? Color.primary : Color(.systemBackground))
     }
 }
 
@@ -245,6 +276,145 @@ struct Pill: ViewModifier {
     }
 }
 
+struct ChannelPlaylistRow: View {
+    let playlist: ChannelPlaylist
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Color(.secondarySystemFill)
+                .frame(width: 88, height: 50)
+                .overlay {
+                    CachedAsyncImage(url: playlist.thumbnail, targetSize: CGSize(width: 120, height: 70)) {
+                        $0.resizable().scaledToFill()
+                    } placeholder: {
+                        Image(systemName: "music.note.list").foregroundStyle(.secondary)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(playlist.title).font(.subheadline.weight(.medium)).lineLimit(2)
+                if let c = playlist.videoCount {
+                    Text(c).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+struct SpotifyRemapSheet: View {
+    let video: Video
+    @Environment(\.dismiss) private var dismiss
+    @State private var query: String
+    @State private var results: [Video] = []
+    @State private var loading = false
+    @State private var error: String?
+
+    init(video: Video) {
+        self.video = video
+        _query = State(initialValue: "\(video.title) \(video.channelTitle)".trimmingCharacters(in: .whitespaces))
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Bài hát Spotify:").font(.caption).foregroundStyle(.secondary)
+                        Text(video.title).font(.headline)
+                        Text(video.channelTitle).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section("Tìm kiếm bản phát YouTube Music") {
+                    HStack {
+                        TextField("Tìm trên YouTube Music", text: $query)
+                            .onSubmit { search() }
+                        Button("Tìm") { search() }
+                            .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty || loading)
+                    }
+                }
+
+                if loading {
+                    ProgressView().frame(maxWidth: .infinity)
+                }
+
+                if let error {
+                    Text(error).font(.footnote).foregroundStyle(.red)
+                }
+
+                if !results.isEmpty {
+                    Section("Chọn bản phát đúng") {
+                        ForEach(results) { item in
+                            Button {
+                                select(item)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Color(.secondarySystemFill)
+                                        .frame(width: 50, height: 50)
+                                        .overlay {
+                                            CachedAsyncImage(url: item.thumbnail, targetSize: CGSize(width: 80, height: 80)) {
+                                                $0.resizable().scaledToFill()
+                                            } placeholder: {
+                                                Image(systemName: "music.note").foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                                        Text([item.channelTitle, item.duration ?? ""].filter { !$0.isEmpty }.joined(separator: " • "))
+                                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "arrow.right.circle").font(.title3).foregroundStyle(.green)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Đổi bản YouTube Music")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Đóng") { dismiss() }
+                }
+            }
+            .task { search() }
+        }
+    }
+
+    private func search() {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        loading = true
+        error = nil
+        Task {
+            do {
+                let page = try await InnerTube.shared.musicSearch(q, continuation: nil)
+                results = page.videos
+            } catch {
+                self.error = error.localizedDescription
+            }
+            loading = false
+        }
+    }
+
+    private func select(_ candidate: Video) {
+        Task {
+            await TrackMatcher.shared.setCustomMatch(for: video.id, youtubeId: candidate.id)
+            if PlayerManager.shared.current?.id == video.id {
+                PlayerManager.shared.retry()
+            } else {
+                PlayerManager.shared.play(video)
+            }
+            dismiss()
+        }
+    }
+}
+
 /// Infinite-scroll list over any continuation-based InnerTube endpoint.
 struct PagedList: View {
     let loader: (String?) async throws -> Page
@@ -254,6 +424,7 @@ struct PagedList: View {
 
     @State private var videos: [Video] = []
     @State private var channels: [Channel] = []
+    @State private var playlists: [ChannelPlaylist] = []
     @State private var token: String?
     @State private var loading = false
     @State private var error: String?
@@ -264,6 +435,9 @@ struct PagedList: View {
             if let header { header.listRowSeparator(.hidden) }
             ForEach(channels) { c in
                 NavigationLink { ChannelView(channel: c) } label: { ChannelRow(channel: c) }
+            }
+            ForEach(playlists) { p in
+                NavigationLink { RemotePlaylistView(id: p.id) } label: { ChannelPlaylistRow(playlist: p) }
             }
             ForEach(videos) { v in
                 VideoButton(video: v, compact: compact)
@@ -276,12 +450,12 @@ struct PagedList: View {
             if let error {
                 VStack(spacing: 8) {
                     Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Button("Thử lại") { Task { await load(reset: videos.isEmpty) } }
+                    Button("Thử lại") { Task { await load(reset: videos.isEmpty && playlists.isEmpty) } }
                 }
                 .frame(maxWidth: .infinity)
                 .listRowSeparator(.hidden)
             }
-            if loaded && !loading && error == nil && videos.isEmpty && channels.isEmpty {
+            if loaded && !loading && error == nil && videos.isEmpty && channels.isEmpty && playlists.isEmpty {
                 EmptyState(icon: "magnifyingglass", title: "Không có kết quả").listRowSeparator(.hidden)
             }
         }
@@ -307,10 +481,13 @@ struct PagedList: View {
             if reset {
                 videos = page.videos
                 channels = page.channels
+                playlists = page.playlists
                 onFirstPage?(page)
             } else {
                 let seen = Set(videos.map(\.id))
                 videos += page.videos.filter { !seen.contains($0.id) }
+                let seenP = Set(playlists.map(\.id))
+                playlists += page.playlists.filter { !seenP.contains($0.id) }
             }
             token = page.continuation
         } catch {

@@ -13,15 +13,17 @@ final class Library: ObservableObject {
     @Published var history: [HistoryItem] = [] { didSet { scheduleSave() } }
     @Published var watchLater: [Video] = [] { didSet { scheduleSave() } }
     @Published var playlists: [LocalPlaylist] = [] { didSet { scheduleSave() } }
-    /// Music tracks from any source (YT Music / SoundCloud / Spotify).
+    /// Music tracks from any source (YT Music / Spotify).
     @Published var likedTracks: [Video] = [] { didSet { scheduleSave() } }
-    /// Followed music artists (SoundCloud users "scu:…", etc.).
+    /// Followed music artists (Spotify artists "spa:…", etc.).
     @Published var followedArtists: [Channel] = [] { didSet { scheduleSave() } }
     // Not @Published: it changes every few seconds during playback.
     private var positions: [String: Double] = [:]
     private var saveTask: Task<Void, Never>?
+    private var throttledSaveTask: Task<Void, Never>?
+    private var lastThrottledSaveTime: Date = .distantPast
 
-    private struct Snapshot: Codable {
+    private struct Snapshot: Codable, Sendable {
         var subscriptions: [Channel]
         var history: [HistoryItem]
         var watchLater: [Video]
@@ -74,9 +76,30 @@ final class Library: ObservableObject {
 
     // MARK: Persistence
 
+    func restoreBackup(from data: Data) -> Bool {
+        guard let s = try? JSONDecoder().decode(Snapshot.self, from: data) else { return false }
+        subscriptions = s.subscriptions
+        history = s.history
+        watchLater = s.watchLater
+        playlists = s.playlists
+        positions = s.positions
+        likedTracks = s.likedTracks
+        followedArtists = s.followedArtists
+        write()
+        return true
+    }
+
     func flush() {
         saveTask?.cancel()
-        write()
+        saveTask = nil
+        throttledSaveTask?.cancel()
+        throttledSaveTask = nil
+        let s = Snapshot(subscriptions: subscriptions, history: history, watchLater: watchLater,
+                         playlists: playlists, positions: positions,
+                         likedTracks: likedTracks, followedArtists: followedArtists)
+        if let data = try? JSONEncoder().encode(s) {
+            try? data.write(to: Self.fileURL, options: .atomic)
+        }
     }
 
     private func scheduleSave() {
@@ -92,8 +115,10 @@ final class Library: ObservableObject {
         let s = Snapshot(subscriptions: subscriptions, history: history, watchLater: watchLater,
                          playlists: playlists, positions: positions,
                          likedTracks: likedTracks, followedArtists: followedArtists)
-        if let data = try? JSONEncoder().encode(s) {
-            try? data.write(to: Self.fileURL, options: .atomic)
+        let fileURL = Self.fileURL
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(s) else { return }
+            try? data.write(to: fileURL, options: .atomic)
         }
     }
 
@@ -151,13 +176,34 @@ final class Library: ObservableObject {
 
     func position(_ id: String) -> Double { positions[id] ?? 0 }
 
-    func setPosition(_ id: String, _ seconds: Double?) {
+    func setPosition(_ id: String, _ seconds: Double?, persist: Bool = false) {
         positions[id] = seconds
         if positions.count > 3000 {
             let keep = Set(history.map(\.id))
             positions = positions.filter { keep.contains($0.key) }
         }
-        scheduleSave()
+        if persist {
+            scheduleSave()
+        } else {
+            scheduleThrottledSave()
+        }
+    }
+
+    private func scheduleThrottledSave() {
+        guard throttledSaveTask == nil else { return }
+        let elapsed = Date().timeIntervalSince(lastThrottledSaveTime)
+        if elapsed >= 30 {
+            lastThrottledSaveTime = Date()
+            write()
+            return
+        }
+        throttledSaveTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(max(1, 30 - elapsed)) * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            self.lastThrottledSaveTime = Date()
+            self.throttledSaveTask = nil
+            self.write()
+        }
     }
 
     // MARK: Music likes & follows
