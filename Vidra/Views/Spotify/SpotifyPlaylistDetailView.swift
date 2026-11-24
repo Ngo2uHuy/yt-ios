@@ -905,7 +905,7 @@ struct SpotifyPlaylistDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {
-                player.start(track)
+                player.play(track)
             }
 
             Spacer()

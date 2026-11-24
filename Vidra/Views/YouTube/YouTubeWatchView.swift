@@ -228,7 +228,7 @@ struct YouTubeWatchDetails: View {
                 }
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
-                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+                .commentsSheetBackgroundInteraction()
             }
             .sheet(isPresented: $showPlaylists) {
                 AddToPlaylistView(video: v)
@@ -1548,6 +1548,19 @@ private struct ReplyRowView: View {
                 }
                 .padding(.top, 1)
             }
+        }
+    }
+}
+
+// MARK: - Compatibility Extensions
+
+private extension View {
+    @ViewBuilder
+    func commentsSheetBackgroundInteraction() -> some View {
+        if #available(iOS 16.4, *) {
+            self.presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        } else {
+            self
         }
     }
 }

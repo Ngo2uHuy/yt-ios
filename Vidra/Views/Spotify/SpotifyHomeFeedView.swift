@@ -8,7 +8,6 @@ private extension Color {
     static let spotifyCardHover = Color(red: 0.22, green: 0.22, blue: 0.22)   // #383838
     static let spotifyGreen = Color(red: 0.11, green: 0.73, blue: 0.33)       // #1DB954
     static let spotifySubtext = Color(red: 0.70, green: 0.70, blue: 0.70)     // #B3B3B3
-    static let spotifyDarkGray = Color(red: 0.12, green: 0.12, blue: 0.12)
 }
 
 // MARK: - Models

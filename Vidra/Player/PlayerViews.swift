@@ -115,13 +115,17 @@ struct VideoSurface: UIViewRepresentable {
         }
 
         func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
-            let dur = PlayerManager.shared.duration
-            guard dur > 0 else { return CMTimeRange(start: .zero, duration: .indefinite) }
-            return CMTimeRange(start: .zero, duration: CMTime(seconds: dur, preferredTimescale: 600))
+            MainActor.assumeIsolated {
+                let dur = PlayerManager.shared.duration
+                guard dur > 0 else { return CMTimeRange(start: .zero, duration: .indefinite) }
+                return CMTimeRange(start: .zero, duration: CMTime(seconds: dur, preferredTimescale: 600))
+            }
         }
 
         func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
-            return !PlayerManager.shared.isPlaying
+            MainActor.assumeIsolated {
+                !PlayerManager.shared.isPlaying
+            }
         }
     }
 }
@@ -742,7 +746,7 @@ struct YouTubeInteractiveScrubber: View {
                 .frame(width: 10, height: 5)
         }
         .frame(width: previewWidth)
-        .position(x: clampedCenterX, y: storyboard != nil ? - (CGFloat(storyboard!.height) / 2 + 28) : -26)
+        .position(x: clampedCenterX, y: storyboard != nil ? -(CGFloat(storyboard!.height) / 2 + 28) : -26)
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
         .animation(.easeOut(duration: 0.15), value: effectiveTime)
     }

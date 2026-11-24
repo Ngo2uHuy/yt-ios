@@ -53,6 +53,7 @@ extension Color {
     static let spotifyTextPrimary = SpotifyColor.textPrimary
     static let spotifyTextSecondary = SpotifyColor.textSecondary
     static let spotifyCardBackground = SpotifyColor.cardBackground
+    static let spotifyDarkGray = Color(red: 0.12, green: 0.12, blue: 0.12)
 }
 
 // MARK: - Filter Chips Model
