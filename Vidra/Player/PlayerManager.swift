@@ -101,7 +101,7 @@ final class PlayerManager: NSObject, ObservableObject {
                 return
             }
         }
-        if let c = current {
+        if let c = current, c.id != video.id {
             savePosition()
             pushBack(c)
         }
@@ -140,9 +140,10 @@ final class PlayerManager: NSObject, ObservableObject {
 
         // If player has an active item, seek directly in AVPlayer for zero-latency response
         if player.currentItem != nil {
+            let tol = target <= 0.1 ? CMTime.zero : CMTime(seconds: 1, preferredTimescale: 600)
             player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
-                        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
-                        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)) { [weak self] finished in
+                        toleranceBefore: tol,
+                        toleranceAfter: tol) { [weak self] finished in
                 Task { @MainActor in
                     if finished {
                         self?.updateNowPlaying()
@@ -175,7 +176,7 @@ final class PlayerManager: NSObject, ObservableObject {
                 } else {
                     r = try await InnerTube.shared.resolve(v.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: sec)
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.current?.id == v.id else { return }
 
                 self.sources = r.sources
                 self.sourceIndex = 0
@@ -183,11 +184,11 @@ final class PlayerManager: NSObject, ObservableObject {
                     self.isLoading = false
                     return
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.current?.id == v.id else { return }
 
                 self.attach(item)
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.current?.id == v.id else { return }
                 self.isLoading = false
                 self.errorText = error.localizedDescription
             }
@@ -308,8 +309,15 @@ final class PlayerManager: NSObject, ObservableObject {
         }
         savePosition(persist: true)
         loadTask?.cancel()
+        loadTask = nil
         captionTask?.cancel()
+        captionTask = nil
         preloadTask?.cancel()
+        preloadTask = nil
+        seekTask?.cancel()
+        seekTask = nil
+        itemObservation?.invalidate()
+        itemObservation = nil
         preloadedNext = nil
         captionTracks = []
         selectedCaption = nil
@@ -360,7 +368,13 @@ final class PlayerManager: NSObject, ObservableObject {
             SpotifyRemote.shared.pause()
         }
         loadTask?.cancel()
+        loadTask = nil
+        seekTask?.cancel()
+        seekTask = nil
         captionTask?.cancel()
+        captionTask = nil
+        itemObservation?.invalidate()
+        itemObservation = nil
 
         let resume = Library.shared.position(video.id)
         let seekTarget = resume > 5 ? resume : nil
@@ -632,13 +646,17 @@ final class PlayerManager: NSObject, ObservableObject {
             if (Pref.maxHeight > 1080 || Pref.maxHeight == 0) && sourceIndex == 0 {
                 showToast("Không giải mã được 4K/2K, tự động chuyển về 1080p")
             }
-            if currentTime > 5 {
-                seekWithReload(target: currentTime)
-                return
-            }
             sourceIndex += 1
-            loadTask?.cancel()
-            loadTask = Task { await loadCurrentSource() }
+            if sourceIndex < sources.count {
+                pendingSeek = currentTime > 0 ? currentTime : nil
+                loadTask?.cancel()
+                loadTask = Task { await loadCurrentSource() }
+            } else if currentTime > 5 {
+                seekWithReload(target: currentTime)
+            } else {
+                errorText = "Không phát được video này"
+                isLoading = false
+            }
         default:
             break
         }
@@ -777,6 +795,8 @@ final class PlayerManager: NSObject, ObservableObject {
             updated.channelTitle = artist
             updated.duration = Fmt.time(duration)
             self.current = updated
+            Library.shared.addHistory(updated)
+            loadArtwork(for: updated)
         }
         updateNowPlaying()
     }
@@ -870,7 +890,7 @@ final class PlayerManager: NSObject, ObservableObject {
     private func loadArtwork(for v: Video) {
         guard let url = v.thumbnail else { return }
         Task {
-            guard let res = try? await URLSession.shared.data(from: url), let img = UIImage(data: res.0),
+            guard let img = await ImageCache.shared.load(url: url),
                   current?.id == v.id else { return }
             artwork = Self.makeArtwork(img)
             updateNowPlaying()

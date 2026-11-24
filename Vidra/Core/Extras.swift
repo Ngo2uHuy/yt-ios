@@ -150,7 +150,10 @@ final class RSSParser: NSObject, XMLParserDelegate {
 
 enum Media {
     static func asset(_ url: URL) -> AVURLAsset {
-        AVURLAsset(url: url)
+        if url.host?.contains("googlevideo") == true {
+            return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": YTClient.ios.userAgent]])
+        }
+        return AVURLAsset(url: url)
     }
 
     /// Joins separate video-only and audio-only streams (how YouTube serves >360p) into one item.

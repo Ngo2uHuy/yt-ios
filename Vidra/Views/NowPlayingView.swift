@@ -19,19 +19,8 @@ final class ArtworkColorCache {
             return await existingTask.value
         }
 
-        // Fast path: if ImageCache already loaded this image in memory, skip network fetch completely
-        let preloadedImage = ImageCache.shared.image(for: url)
-
         let task = Task<Color?, Never> {
-            let uiImage: UIImage?
-            if let preloadedImage {
-                uiImage = preloadedImage
-            } else if let result = try? await URLSession.shared.data(from: url) {
-                uiImage = UIImage(data: result.0)
-            } else {
-                uiImage = nil
-            }
-            guard let uiImage else { return nil }
+            guard let uiImage = await ImageCache.shared.load(url: url) else { return nil }
 
             let rgb = await Task.detached(priority: .utility) { () -> (Double, Double, Double)? in
                 let size = CGSize(width: 24, height: 24)

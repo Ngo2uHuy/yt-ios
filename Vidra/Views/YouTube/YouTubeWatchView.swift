@@ -193,11 +193,21 @@ struct YouTubeWatchDetails: View {
             .environment(\.openURL, OpenURLAction { url in handleURL(url) })
             .task(id: v.id) {
                 votes = nil
-                userLiked = false
+                userLiked = lib.isLiked(v.id)
                 userDisliked = false
                 topComment = nil
                 topCommentCount = nil
                 loadVideoMeta(v)
+            }
+            .onChange(of: pm.commentsToken) { token in
+                if let token, topComment == nil {
+                    Task {
+                        if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
+                            self.topComment = first
+                            self.topCommentCount = res.items.count > 0 ? "\(res.items.count)+" : nil
+                        }
+                    }
+                }
             }
             .sheet(isPresented: $showComments) {
                 NavigationStack {
@@ -559,9 +569,11 @@ struct YouTubeWatchDetails: View {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 if userLiked {
                     userLiked = false
+                    if lib.isLiked(v.id) { lib.toggleLike(v) }
                 } else {
                     userLiked = true
                     userDisliked = false
+                    if !lib.isLiked(v.id) { lib.toggleLike(v) }
                 }
             } label: {
                 HStack(spacing: 6) {

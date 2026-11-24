@@ -102,8 +102,8 @@ final class HLSServer: @unchecked Sendable {
             routeKeys.remove(at: existing)
         }
         routeKeys.append(path)
-        // Keep at most 40 recent playlist paths in memory (~100 KB total)
-        while routeKeys.count > 40 {
+        // Keep at most 100 recent playlist paths in memory (~200 KB total)
+        while routeKeys.count > 100 {
             let old = routeKeys.removeFirst()
             routes.removeValue(forKey: old)
             routes.removeValue(forKey: old.removingPercentEncoding ?? old)
@@ -383,10 +383,11 @@ enum HLSBuilder {
             lines.append("#EXT-X-TARGETDURATION:2")
             lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            lines.append("#EXT-X-MAP:URI=\"\(vUrlStr)&sq=0\"")
+            let vSep = vUrlStr.contains("?") ? "&" : "?"
+            lines.append("#EXT-X-MAP:URI=\"\(vUrlStr)\(vSep)sq=0\"")
             for s in windowStart...currentSeq {
                 lines.append("#EXTINF:1.000,")
-                lines.append("\(vUrlStr)&sq=\(s)")
+                lines.append("\(vUrlStr)\(vSep)sq=\(s)")
             }
             let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
             return ("application/vnd.apple.mpegurl", data)
@@ -402,10 +403,11 @@ enum HLSBuilder {
             lines.append("#EXT-X-TARGETDURATION:2")
             lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)&sq=0\"")
+            let aSep = aUrlStr.contains("?") ? "&" : "?"
+            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)\(aSep)sq=0\"")
             for s in windowStart...currentSeq {
                 lines.append("#EXTINF:1.000,")
-                lines.append("\(aUrlStr)&sq=\(s)")
+                lines.append("\(aUrlStr)\(aSep)sq=\(s)")
             }
             let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
             return ("application/vnd.apple.mpegurl", data)
@@ -447,10 +449,11 @@ enum HLSBuilder {
             lines.append("#EXT-X-TARGETDURATION:2")
             lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)&sq=0\"")
+            let aSep = aUrlStr.contains("?") ? "&" : "?"
+            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)\(aSep)sq=0\"")
             for s in windowStart...currentSeq {
                 lines.append("#EXTINF:1.000,")
-                lines.append("\(aUrlStr)&sq=\(s)")
+                lines.append("\(aUrlStr)\(aSep)sq=\(s)")
             }
             let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
             return ("application/vnd.apple.mpegurl", data)
