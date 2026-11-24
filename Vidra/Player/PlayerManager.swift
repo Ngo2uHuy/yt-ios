@@ -914,6 +914,7 @@ final class PlayerManager: NSObject, ObservableObject {
     private func handleBufferEmpty(_ empty: Bool) {
         if empty && isPlaying {
             isLoading = true
+            updateNowPlaying()
         }
     }
 
@@ -923,6 +924,7 @@ final class PlayerManager: NSObject, ObservableObject {
             if player.timeControlStatus == .paused && isPlaying {
                 player.play()
             }
+            updateNowPlaying()
         }
     }
 
@@ -996,49 +998,62 @@ final class PlayerManager: NSObject, ObservableObject {
 
     private func setupRemoteCommands() {
         let c = MPRemoteCommandCenter.shared()
+
+        c.playCommand.isEnabled = true
         c.playCommand.addTarget { [weak self] _ in
             Task { @MainActor in
-                if self?.isUsingSpotifyRemote == true {
-                    SpotifyRemote.shared.resume()
-                } else {
-                    self?.player.play()
-                }
+                self?.resume()
+                self?.updateNowPlaying()
             }
             return .success
         }
+
+        c.pauseCommand.isEnabled = true
         c.pauseCommand.addTarget { [weak self] _ in
             Task { @MainActor in
-                if self?.isUsingSpotifyRemote == true {
-                    SpotifyRemote.shared.pause()
-                } else {
-                    self?.player.pause()
-                }
+                self?.pause()
+                self?.updateNowPlaying()
             }
             return .success
         }
+
+        c.togglePlayPauseCommand.isEnabled = true
         c.togglePlayPauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.togglePlay() }
+            Task { @MainActor in
+                self?.togglePlay()
+                self?.updateNowPlaying()
+            }
             return .success
         }
+
+        c.nextTrackCommand.isEnabled = true
         c.nextTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor in self?.next() }
             return .success
         }
+
+        c.previousTrackCommand.isEnabled = true
         c.previousTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor in self?.previous() }
             return .success
         }
+
+        c.skipForwardCommand.isEnabled = true
         c.skipForwardCommand.preferredIntervals = [10]
         c.skipForwardCommand.addTarget { [weak self] _ in
             Task { @MainActor in self?.seek(by: 10) }
             return .success
         }
+
+        c.skipBackwardCommand.isEnabled = true
         c.skipBackwardCommand.preferredIntervals = [10]
         c.skipBackwardCommand.addTarget { [weak self] _ in
             Task { @MainActor in self?.seek(by: -10) }
             return .success
         }
+
         c.likeCommand.isActive = true
+        c.likeCommand.isEnabled = true
         c.likeCommand.addTarget { [weak self] _ in
             guard let v = self?.current else { return .noActionableNowPlayingItem }
             Task { @MainActor in
@@ -1047,35 +1062,70 @@ final class PlayerManager: NSObject, ObservableObject {
             }
             return .success
         }
+
+        // Enable interactive scrubbing on Lock Screen, Control Center, Dynamic Island
+        c.changePlaybackPositionCommand.isEnabled = true
         c.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let e = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             let t = e.positionTime
-            Task { @MainActor in self?.seek(to: t) }
+            Task { @MainActor in
+                self?.seek(to: t)
+                self?.updateNowPlaying()
+            }
             return .success
         }
     }
 
     private func updateNowPlaying() {
-        guard let v = current else { return }
+        guard let v = current else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+            return
+        }
+
+        let effectiveRate = (isPlaying && !isLoading && player.timeControlStatus == .playing) ? Double(rate) : 0.0
+
         var np: [String: Any] = [
             MPMediaItemPropertyTitle: v.title,
             MPMediaItemPropertyArtist: v.channelTitle,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(rate) : 0.0,
+            MPMediaItemPropertyAlbumTitle: v.channelTitle,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: max(0, currentTime),
+            MPNowPlayingInfoPropertyPlaybackRate: effectiveRate,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: Double(rate),
+            MPNowPlayingInfoPropertyMediaType: NSNumber(value: (audioOnly || v.source != nil) ? MPNowPlayingInfoMediaType.audio.rawValue : MPNowPlayingInfoMediaType.video.rawValue)
         ]
-        if duration > 0 { np[MPMediaItemPropertyPlaybackDuration] = duration }
-        if let artwork { np[MPMediaItemPropertyArtwork] = artwork }
+
+        if duration > 0 {
+            np[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+        if let artwork {
+            np[MPMediaItemPropertyArtwork] = artwork
+        }
+
         MPNowPlayingInfoCenter.default().nowPlayingInfo = np
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
     }
 
     private func loadArtwork(for v: Video) {
-        guard let url = v.thumbnail else { return }
+        let urls: [URL] = [
+            v.artwork,
+            v.thumbnail,
+            URL(string: "https://i.ytimg.com/vi/\(v.id)/maxresdefault.jpg"),
+            URL(string: "https://i.ytimg.com/vi/\(v.id)/hq720.jpg"),
+            URL(string: "https://i.ytimg.com/vi/\(v.id)/mqdefault.jpg")
+        ].compactMap { $0 }
+
         Task {
-            guard let img = await ImageCache.shared.load(url: url),
-                  current?.id == v.id else { return }
-            artwork = Self.makeArtwork(img)
-            updateNowPlaying()
+            for url in urls {
+                if let img = await ImageCache.shared.load(url: url), current?.id == v.id {
+                    // Check that the returned image is not YouTube's 120x90 transparent/error placeholder
+                    if img.size.width > 120 {
+                        self.artwork = Self.makeArtwork(img)
+                        self.updateNowPlaying()
+                        return
+                    }
+                }
+            }
         }
     }
 
