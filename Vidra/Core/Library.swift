@@ -164,6 +164,7 @@ final class Library: ObservableObject {
 
     func addHistory(_ video: Video) {
         guard Pref.saveHistory else { return }
+        if history.first?.video.id == video.id { return }
         history.removeAll { $0.video.id == video.id }
         history.insert(HistoryItem(video: video, date: Date()), at: 0)
         if history.count > 1000 { history.removeLast(history.count - 1000) }

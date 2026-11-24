@@ -202,19 +202,19 @@ final class SpotifyRemote: NSObject, ObservableObject {
         position = seconds
         #if canImport(SpotifyiOS)
         let ms = Int(seconds * 1000)
-        appRemote?.playerAPI?.seekToPosition(ms, callback: nil)
+        appRemote?.playerAPI?.seek(toPosition: ms, callback: nil)
         #endif
     }
 
     func next() {
         #if canImport(SpotifyiOS)
-        appRemote?.playerAPI?.skipToNext(nil)
+        appRemote?.playerAPI?.skip(toNext: nil)
         #endif
     }
 
     func previous() {
         #if canImport(SpotifyiOS)
-        appRemote?.playerAPI?.skipToPrevious(nil)
+        appRemote?.playerAPI?.skip(toPrevious: nil)
         #endif
     }
 

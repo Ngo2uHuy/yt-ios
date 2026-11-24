@@ -135,7 +135,7 @@ final class HLSServer: @unchecked Sendable {
             let dynamicHandler = self.dynamicRoutes[rawPath] ?? self.dynamicRoutes[decodedPath]
             self.lock.unlock()
 
-            let responsePair: (contentType: String, body: Data)? = {
+            let responsePair: (contentType: String, data: Data)? = {
                 if let matched { return (matched.contentType, matched.data) }
                 if let dynamicHandler { return dynamicHandler() }
                 return nil

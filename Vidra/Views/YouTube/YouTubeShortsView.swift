@@ -518,18 +518,15 @@ struct ShortsCardView: View {
         ZStack {
             Color.black
 
-            // High-resolution background thumbnail placeholder
-            AsyncImage(url: video.thumbnail) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .clipped()
-                default:
-                    Color.black
-                }
+            // High-resolution background thumbnail placeholder using cached downsampling
+            CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 540, height: 960)) { img in
+                img
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+            } placeholder: {
+                Color.black
             }
 
             // Realtime Video Surface

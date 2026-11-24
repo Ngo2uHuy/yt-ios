@@ -48,6 +48,7 @@ struct YouTubeWatchView: View {
             .background(vsc == .compact ? Color.black : Color(.systemBackground))
             .toolbar(.hidden, for: .navigationBar)
             .task(id: currentVideo?.id) {
+                guard ambientMode else { return }
                 await updateAmbientColor(for: currentVideo?.thumbnail)
             }
             .onReceive(PlayerManager.shared.$current) { v in
@@ -818,36 +819,37 @@ struct YouTubeWatchDetails: View {
 
     private func loadVideoMeta(_ v: Video) {
         Task {
-            // Lấy thông tin Like/Dislike từ Return YouTube Dislike API
-            if v.source == nil || v.source == .ytMusic {
-                votes = await Extras.votes(v.id)
-            }
-
-            // Lấy bình luận nổi bật đầu tiên nếu có token
-            if let token = pm.commentsToken {
-                do {
-                    let res = try await InnerTube.shared.comments(token)
-                    if let first = res.items.first {
-                        topComment = first
-                        topCommentCount = res.items.count > 0 ? "\(res.items.count)+" : nil
-                    }
-                } catch {
-                    topComment = nil
+            async let votesRes: Votes? = {
+                if v.source == nil || v.source == .ytMusic {
+                    return await Extras.votes(v.id)
                 }
-            }
+                return nil
+            }()
 
-            // Lấy thông tin kênh (ảnh đại diện, số lượng đăng ký)
-            if let chId = v.channelId, !chId.isEmpty {
+            async let commentRes: (Comment?, String?) = {
+                guard let token = pm.commentsToken else { return (nil, nil) }
+                if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
+                    return (first, res.items.count > 0 ? "\(res.items.count)+" : nil)
+                }
+                return (nil, nil)
+            }()
+
+            async let channelRes: Channel? = {
+                guard let chId = v.channelId, !chId.isEmpty else { return nil }
                 if let known = lib.subscriptions.first(where: { $0.id == chId }) {
-                    channelDetail = known
-                } else {
-                    do {
-                        let page = try await InnerTube.shared.channelVideos(chId, continuation: nil)
-                        if let ch = page.channel {
-                            channelDetail = ch
-                        }
-                    } catch {}
+                    return known
                 }
+                let page = try? await InnerTube.shared.channelVideos(chId, continuation: nil)
+                return page?.channel
+            }()
+
+            let (vRes, cRes, chRes) = await (votesRes, commentRes, channelRes)
+            guard currentVideo?.id == v.id || pm.current?.id == v.id else { return }
+            self.votes = vRes
+            self.topComment = cRes.0
+            self.topCommentCount = cRes.1
+            if let chRes {
+                self.channelDetail = chRes
             }
         }
     }
