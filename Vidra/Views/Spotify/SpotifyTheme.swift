@@ -106,7 +106,7 @@ struct SpotifyHeader: View {
                 onAvatarTap?()
             } label: {
                 if let avatarURL {
-                    AsyncImage(url: avatarURL) { img in
+                    CachedAsyncImage(url: avatarURL, targetSize: CGSize(width: 32, height: 32)) { img in
                         img.resizable().scaledToFill()
                     } placeholder: {
                         avatarPlaceholder

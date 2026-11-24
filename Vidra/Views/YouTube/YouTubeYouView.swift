@@ -529,18 +529,11 @@ struct YouTubeHistoryCard: View {
                         .frame(width: 156, height: 88)
                         .overlay {
                             if let url = video.thumbnail {
-                                AsyncImage(url: url) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image.resizable().scaledToFill()
-                                    case .failure:
-                                        Color(.secondarySystemFill)
-                                            .overlay(Image(systemName: "play.rectangle.fill").foregroundStyle(.secondary))
-                                    case .empty:
-                                        Color(.secondarySystemFill)
-                                    @unknown default:
-                                        Color(.secondarySystemFill)
-                                    }
+                                CachedAsyncImage(url: url, targetSize: CGSize(width: 156, height: 88)) { image in
+                                    image.resizable().scaledToFill()
+                                } placeholder: {
+                                    Color(.secondarySystemFill)
+                                        .overlay(Image(systemName: "play.rectangle.fill").foregroundStyle(.secondary))
                                 }
                             } else {
                                 Color(.secondarySystemFill)
@@ -636,13 +629,10 @@ struct YouTubePlaylistCard: View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottomTrailing) {
                 if let thumbnail {
-                    AsyncImage(url: thumbnail) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        default:
-                            placeholderBackground
-                        }
+                    CachedAsyncImage(url: thumbnail, targetSize: CGSize(width: 140, height: 80)) { image in
+                        image.resizable().scaledToFill()
+                    } placeholder: {
+                        placeholderBackground
                     }
                     .frame(width: 140, height: 80)
                     .clipped()

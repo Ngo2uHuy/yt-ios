@@ -743,7 +743,7 @@ struct YouTubeVideoActionSheet: View {
             // Header summary preview
             HStack(spacing: 12) {
                 // Thumbnail preview
-                AsyncImage(url: video.thumbnail) { img in
+                CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 68, height: 38)) { img in
                     img.resizable().scaledToFill()
                 } placeholder: {
                     Color(.secondarySystemFill)

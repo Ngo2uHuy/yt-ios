@@ -510,7 +510,7 @@ struct LibraryView: View {
                                     Color(.secondarySystemFill)
                                         .frame(width: 48, height: 48)
                                         .overlay {
-                                            AsyncImage(url: p.videos.first?.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+                                            CachedAsyncImage(url: p.videos.first?.thumbnail, targetSize: CGSize(width: 48, height: 48)) { $0.resizable().scaledToFill() } placeholder: {
                                                 Image(systemName: "music.note.list").foregroundStyle(.secondary)
                                             }
                                         }

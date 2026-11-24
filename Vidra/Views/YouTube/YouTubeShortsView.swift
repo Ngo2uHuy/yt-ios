@@ -933,20 +933,17 @@ struct SoundDiscView: View {
                 .shadow(color: .black.opacity(0.5), radius: 4)
 
             // Inner Album Cover / Artwork
-            AsyncImage(url: thumbnailURL) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 22, height: 22)
-                        .clipShape(Circle())
-                default:
-                    Circle()
-                        .fill(Color.red.opacity(0.8))
-                        .frame(width: 22, height: 22)
-                        .overlay(Image(systemName: "music.note").font(.system(size: 10)).foregroundStyle(.white))
-                }
+            CachedAsyncImage(url: thumbnailURL, targetSize: CGSize(width: 24, height: 24)) { image in
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 22, height: 22)
+                    .clipShape(Circle())
+            } placeholder: {
+                Circle()
+                    .fill(Color.red.opacity(0.8))
+                    .frame(width: 22, height: 22)
+                    .overlay(Image(systemName: "music.note").font(.system(size: 10)).foregroundStyle(.white))
             }
         }
         .rotationEffect(.degrees(isPlaying ? angle : 0))

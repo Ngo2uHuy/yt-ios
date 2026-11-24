@@ -339,7 +339,7 @@ struct SpotifyLibraryView: View {
                 }
             } label: {
                 if let img = auth.profile?.image {
-                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                    CachedAsyncImage(url: img, targetSize: CGSize(width: 34, height: 34)) { $0.resizable().scaledToFill() } placeholder: {
                         avatarPlaceholder
                     }
                     .frame(width: 34, height: 34)
@@ -654,7 +654,7 @@ struct SpotifyLibraryView: View {
                                 ZStack {
                                     Color.spotifyDarkGray
                                     if let thumb = item.video.thumbnail {
-                                        AsyncImage(url: thumb) { $0.resizable().scaledToFill() } placeholder: {
+                                        CachedAsyncImage(url: thumb, targetSize: CGSize(width: 48, height: 48)) { $0.resizable().scaledToFill() } placeholder: {
                                             Color.clear
                                         }
                                     } else {
@@ -711,7 +711,7 @@ struct SpotifyLibraryView: View {
                             ZStack {
                                 SpotifyColor.surfaceHighlight
                                 if let firstThumb = playlist.videos.first?.thumbnail {
-                                    AsyncImage(url: firstThumb) { $0.resizable().scaledToFill() } placeholder: {
+                                    CachedAsyncImage(url: firstThumb, targetSize: CGSize(width: 60, height: 60)) { $0.resizable().scaledToFill() } placeholder: {
                                         Color.clear
                                     }
                                 } else {
@@ -758,7 +758,7 @@ struct SpotifyLibraryView: View {
                             ZStack {
                                 SpotifyColor.surfaceHighlight
                                 if let img = card.image {
-                                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                                    CachedAsyncImage(url: img, targetSize: CGSize(width: 60, height: 60)) { $0.resizable().scaledToFill() } placeholder: {
                                         Color.clear
                                     }
                                 } else {
@@ -956,7 +956,7 @@ struct SpotifyLibraryView: View {
                             ZStack {
                                 SpotifyColor.surfaceHighlight
                                 if let firstThumb = playlist.videos.first?.thumbnail {
-                                    AsyncImage(url: firstThumb) { $0.resizable().scaledToFill() } placeholder: {
+                                    CachedAsyncImage(url: firstThumb, targetSize: CGSize(width: 180, height: 180)) { $0.resizable().scaledToFill() } placeholder: {
                                         Color.clear
                                     }
                                 } else {
@@ -999,7 +999,7 @@ struct SpotifyLibraryView: View {
                             ZStack {
                                 SpotifyColor.surfaceHighlight
                                 if let img = card.image {
-                                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                                    CachedAsyncImage(url: img, targetSize: CGSize(width: 180, height: 180)) { $0.resizable().scaledToFill() } placeholder: {
                                         Color.clear
                                     }
                                 } else {
@@ -1319,7 +1319,8 @@ struct SpotifyCardView: View {
             Color(.secondarySystemFill)
                 .aspectRatio(1, contentMode: .fit)
                 .overlay {
-                    AsyncImage(url: card.image) { $0.resizable().scaledToFill() } placeholder: {
+                    let cardSize = CGSize(width: width ?? 140, height: width ?? 140)
+                    CachedAsyncImage(url: card.image, targetSize: cardSize) { $0.resizable().scaledToFill() } placeholder: {
                         Image(systemName: placeholderIcon).font(.title).foregroundStyle(.secondary)
                     }
                 }
@@ -1527,7 +1528,7 @@ struct SpotifyTrackListView: View {
             Color(.secondarySystemFill)
                 .frame(width: 180, height: 180)
                 .overlay {
-                    AsyncImage(url: cover) { $0.resizable().scaledToFill() } placeholder: {
+                    CachedAsyncImage(url: cover, targetSize: CGSize(width: 180, height: 180)) { $0.resizable().scaledToFill() } placeholder: {
                         Image(systemName: "music.note").font(.largeTitle).foregroundStyle(.secondary)
                     }
                 }
@@ -1751,7 +1752,7 @@ struct SpotifyArtistView: View {
                 .frame(height: 240)
                 .frame(maxWidth: .infinity)
                 .overlay {
-                    AsyncImage(url: model.info?.image) { $0.resizable().scaledToFill() } placeholder: {
+                    CachedAsyncImage(url: model.info?.image, targetSize: CGSize(width: 400, height: 240)) { $0.resizable().scaledToFill() } placeholder: {
                         Image(systemName: "person.fill").font(.system(size: 56)).foregroundStyle(.secondary)
                     }
                 }

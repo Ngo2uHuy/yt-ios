@@ -162,7 +162,7 @@ struct PlayerArea: View {
             Color.black
             VideoSurface(player: pm.player, gravity: videoGravity)
             if pm.showsArtwork, let v = pm.current {
-                AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFit() } placeholder: { Color.black }
+                CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 480, height: 270)) { $0.resizable().scaledToFit() } placeholder: { Color.black }
                     .overlay(alignment: .topLeading) {
                         Label("Âm thanh", systemImage: "headphones")
                             .font(.caption)

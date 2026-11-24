@@ -198,7 +198,7 @@ struct NowPlayingView: View {
 
     private func artwork(_ v: Video) -> some View {
         ZStack {
-            AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+            CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 360, height: 360)) { $0.resizable().scaledToFill() } placeholder: {
                 ZStack {
                     Color.white.opacity(0.1)
                     Image(systemName: "music.note").font(.system(size: 60)).foregroundStyle(Color.white.opacity(0.4))
@@ -527,7 +527,7 @@ private struct QueueSheet: View {
 
     private func row(_ v: Video) -> some View {
         HStack(spacing: 12) {
-            AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+            CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 44, height: 44)) { $0.resizable().scaledToFill() } placeholder: {
                 Color.gray.opacity(0.25)
             }
             .frame(width: 44, height: 44)

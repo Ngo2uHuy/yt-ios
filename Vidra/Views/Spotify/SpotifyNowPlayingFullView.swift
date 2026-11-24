@@ -1366,7 +1366,7 @@ struct SpotifyQueueSheet: View {
 
     private func nowPlayingRow(_ v: Video) -> some View {
         HStack(spacing: 12) {
-            AsyncImage(url: v.thumbnail) { img in
+            CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 48, height: 48)) { img in
                 img.resizable().scaledToFill()
             } placeholder: {
                 Color.gray.opacity(0.3)
@@ -1395,7 +1395,7 @@ struct SpotifyQueueSheet: View {
 
     private func queueRow(_ v: Video) -> some View {
         HStack(spacing: 12) {
-            AsyncImage(url: v.thumbnail) { img in
+            CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 46, height: 46)) { img in
                 img.resizable().scaledToFill()
             } placeholder: {
                 Color.gray.opacity(0.3)

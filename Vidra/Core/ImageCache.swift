@@ -2,26 +2,54 @@ import Foundation
 import SwiftUI
 import UIKit
 import ImageIO
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - High-Performance Memory Decoded Image Cache
 
-/// Thread-safe in-memory bitmap cache with automatic memory pressure handling,
-/// off-main-thread ImageIO downsampling, GPU texture pre-warming, and in-flight request deduplication.
-/// Eliminates JPEG/PNG decoding overhead during 60/120Hz list and grid scrolling.
+/// Thread-safe in-memory bitmap cache with strict memory bounds (< 120MB app RAM),
+/// off-main-thread ImageIO downsampling accurately calculated by display frame size × device scale,
+/// GPU texture pre-warming, in-flight request deduplication, and automatic memory warning purging.
 final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
 
-    private let cache = NSCache<NSURL, UIImage>()
-    private var inFlight: [NSURL: Task<UIImage?, Never>] = [:]
+    private let cache = NSCache<NSString, UIImage>()
+    private var inFlight: [NSString: Task<UIImage?, Never>] = [:]
     private let inFlightLock = NSLock()
 
+    /// Hardware device scale factor (e.g. 2.0x on standard screens, 3.0x on Retina Super Retina Pro).
+    let screenScale: CGFloat = {
+        #if canImport(UIKit)
+        if Thread.isMainThread {
+            return UIScreen.main.scale
+        }
+        #endif
+        return 2.0
+    }()
+
+    /// Memory budget for cached textures (40 MB max) ensuring app stays well below 120MB RAM limit.
+    static let maxCacheCostBytes = 40 * 1024 * 1024 // 40 MB
+    static let maxCacheCount = 150
+
     private init() {
-        cache.countLimit = 400
-        cache.totalCostLimit = 160 * 1024 * 1024 // 160 MB memory limit
+        cache.countLimit = Self.maxCacheCount
+        cache.totalCostLimit = Self.maxCacheCostBytes
 
         #if canImport(UIKit)
+        // Auto-purge cache when iOS triggers memory pressure warning
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.clear()
+            URLCache.shared.removeAllCachedResponses()
+        }
+
+        // Auto-purge cache when app enters background to prevent jetsam termination
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
             queue: nil
         ) { [weak self] _ in
@@ -30,39 +58,98 @@ final class ImageCache: @unchecked Sendable {
         #endif
     }
 
-    func image(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
+    /// Current resident memory of the process in Megabytes (MB).
+    static var currentProcessMemoryMB: Double {
+        #if canImport(Darwin)
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / 4)
+        let kerr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        if kerr == KERN_SUCCESS {
+            return Double(info.resident_size) / (1024 * 1024)
+        }
+        #endif
+        return 0
     }
 
-    func insert(_ image: UIImage, for url: URL) {
+    /// Automatically purges cached textures if total process memory approaches the 120MB ceiling.
+    private func checkMemoryPressure() {
+        #if canImport(Darwin)
+        let mem = Self.currentProcessMemoryMB
+        if mem > 100.0 { // Enforce RAM stays strictly under 120MB
+            clear()
+        }
+        #endif
+    }
+
+    func cacheKey(for url: URL, targetSize: CGSize?, scale: CGFloat) -> NSString {
+        if let size = targetSize, size.width > 0, size.height > 0 {
+            let pxW = Int((size.width * scale).rounded())
+            let pxH = Int((size.height * scale).rounded())
+            return "\(url.absoluteString)@\(pxW)x\(pxH)" as NSString
+        }
+        return url.absoluteString as NSString
+    }
+
+    func image(for url: URL, targetSize: CGSize? = nil, scale: CGFloat? = nil) -> UIImage? {
+        let actualScale = scale ?? screenScale
+        let key = cacheKey(for: url, targetSize: targetSize, scale: actualScale)
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+        if targetSize != nil {
+            let baseKey = cacheKey(for: url, targetSize: nil, scale: actualScale)
+            return cache.object(forKey: baseKey)
+        }
+        return nil
+    }
+
+    func insert(_ image: UIImage, for url: URL, targetSize: CGSize? = nil, scale: CGFloat? = nil) {
+        checkMemoryPressure()
+        let actualScale = scale ?? image.scale
+        let key = cacheKey(for: url, targetSize: targetSize, scale: actualScale)
         let pixelCount = Int(image.size.width * image.scale * image.size.height * image.scale)
         let cost = pixelCount * 4
-        cache.setObject(image, forKey: url as NSURL, cost: cost)
+        cache.setObject(image, forKey: key, cost: cost)
     }
 
     func remove(for url: URL) {
-        cache.removeObject(forKey: url as NSURL)
+        cache.removeObject(forKey: url.absoluteString as NSString)
     }
 
     func clear() {
         inFlightLock.lock()
+        for (_, task) in inFlight {
+            task.cancel()
+        }
         inFlight.removeAll()
         inFlightLock.unlock()
         cache.removeAllObjects()
     }
 
-    /// Asynchronously loads, downsamples, and decodes an image off the main thread with request deduplication.
-    func load(url: URL, targetSize: CGSize? = nil) async -> UIImage? {
-        let nsUrl = url as NSURL
+    /// Asynchronously loads, downsamples using ImageIO according to display frame size × device scale,
+    /// and pre-decodes the bitmap off the main thread with request deduplication.
+    func load(url: URL, targetSize: CGSize? = nil, scale: CGFloat? = nil) async -> UIImage? {
+        let actualScale = scale ?? screenScale
+        let key = cacheKey(for: url, targetSize: targetSize, scale: actualScale)
 
         // 1. In-memory cache hit
-        if let cached = cache.object(forKey: nsUrl) {
+        if let cached = cache.object(forKey: key) {
             return cached
         }
+        if targetSize != nil {
+            let baseKey = cacheKey(for: url, targetSize: nil, scale: actualScale)
+            if let cached = cache.object(forKey: baseKey) {
+                return cached
+            }
+        }
 
-        // 2. Request deduplication (share existing task if already downloading)
+        // 2. Request deduplication
         inFlightLock.lock()
-        if let existing = inFlight[nsUrl] {
+        if let existing = inFlight[key] {
             inFlightLock.unlock()
             return await existing.value
         }
@@ -79,9 +166,16 @@ final class ImageCache: @unchecked Sendable {
             let decoded = await Task.detached(priority: .userInitiated) { () -> UIImage? in
                 let img: UIImage?
                 if let size = targetSize, size.width > 0, size.height > 0 {
-                    img = ImageCache.downsample(data: data, to: size)
+                    img = ImageCache.downsample(data: data, to: size, scale: actualScale)
                 } else {
+                    // Default safe downsampling: cap at max screen dimension to prevent uncompressed 4K/1080p RAM bloat
+                    #if canImport(UIKit)
+                    let screenBounds = UIScreen.main.bounds.size
+                    let safeSize = CGSize(width: min(screenBounds.width, 480), height: min(screenBounds.height, 854))
+                    img = ImageCache.downsample(data: data, to: safeSize, scale: actualScale)
+                    #else
                     img = UIImage(data: data)
+                    #endif
                 }
                 if #available(iOS 15.0, *) {
                     return img?.preparingForDisplay() ?? img
@@ -90,26 +184,29 @@ final class ImageCache: @unchecked Sendable {
             }.value
 
             guard let image = decoded, !Task.isCancelled else { return nil }
-            self.insert(image, for: url)
+            self.insert(image, for: url, targetSize: targetSize, scale: actualScale)
             return image
         }
 
-        inFlight[nsUrl] = task
+        inFlight[key] = task
         inFlightLock.unlock()
 
         let result = await task.value
 
         inFlightLock.lock()
-        inFlight.removeValue(forKey: nsUrl)
+        inFlight.removeValue(forKey: key)
         inFlightLock.unlock()
 
         return result
     }
 
-    /// Downsamples an image directly from raw data to the target display size using ImageIO.
+    /// Downsamples an image directly from raw data to the exact target display size × scale using ImageIO.
     /// Recommended by Apple WWDC to prevent decoding full-resolution textures into memory.
-    static func downsample(data: Data, to pointSize: CGSize, scale: CGFloat = 2.0) -> UIImage? {
-        let maxDimensionInPixels = max(pointSize.width, pointSize.height) * scale
+    static func downsample(data: Data, to pointSize: CGSize, scale: CGFloat? = nil) -> UIImage? {
+        let actualScale = scale ?? ImageCache.shared.screenScale
+        let maxDimensionInPixels = max(pointSize.width, pointSize.height) * actualScale
+        guard maxDimensionInPixels > 0 else { return UIImage(data: data) }
+
         let options: [CFString: Any] = [
             kCGImageSourceShouldCache: false
         ]
@@ -129,13 +226,14 @@ final class ImageCache: @unchecked Sendable {
             return UIImage(data: data)
         }
 
-        return UIImage(cgImage: downsampledImage)
+        return UIImage(cgImage: downsampledImage, scale: actualScale, orientation: .up)
     }
 }
 
 // MARK: - CachedAsyncImage Component
 
-/// Drop-in replacement for SwiftUI's `AsyncImage` with in-memory bitmap cache and zero-delay synchronous rendering.
+/// Drop-in replacement for SwiftUI's `AsyncImage` with in-memory bitmap cache,
+/// ImageIO downsampling matching target display frame × device scale, and zero-delay synchronous rendering.
 struct CachedAsyncImage<Content: View, Placeholder: View>: View {
     let url: URL?
     var targetSize: CGSize? = nil
@@ -143,6 +241,16 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
     @ViewBuilder let placeholder: () -> Placeholder
 
     @State private var uiImage: UIImage?
+
+    private var cacheKey: String {
+        let urlStr = url?.absoluteString ?? ""
+        if let targetSize {
+            let pxW = Int(targetSize.width.rounded())
+            let pxH = Int(targetSize.height.rounded())
+            return "\(urlStr)_\(pxW)x\(pxH)"
+        }
+        return urlStr
+    }
 
     init(
         url: URL?,
@@ -155,7 +263,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
         self.content = content
         self.placeholder = placeholder
 
-        if let url, let cached = ImageCache.shared.image(for: url) {
+        if let url, let cached = ImageCache.shared.image(for: url, targetSize: targetSize) {
             _uiImage = State(initialValue: cached)
         }
     }
@@ -168,14 +276,14 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: url) {
+        .task(id: cacheKey) {
             guard let url else {
                 uiImage = nil
                 return
             }
 
             // 1. Fast cache check
-            if let cached = ImageCache.shared.image(for: url) {
+            if let cached = ImageCache.shared.image(for: url, targetSize: targetSize) {
                 if uiImage !== cached {
                     uiImage = cached
                 }

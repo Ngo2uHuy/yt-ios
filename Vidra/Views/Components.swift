@@ -4,15 +4,19 @@ struct Thumbnail: View {
     let url: URL?
     var duration: String?
     var progress: Double?
+    var targetSize: CGSize? = nil
 
     var body: some View {
         Color(.secondarySystemFill)
             .aspectRatio(16 / 9, contentMode: .fit)
             .overlay {
-                CachedAsyncImage(url: url) {
-                    $0.resizable().scaledToFill()
-                } placeholder: {
-                    Color.clear
+                GeometryReader { geo in
+                    let frameSize = targetSize ?? (geo.size.width > 0 && geo.size.height > 0 ? geo.size : nil)
+                    CachedAsyncImage(url: url, targetSize: frameSize) {
+                        $0.resizable().scaledToFill()
+                    } placeholder: {
+                        Color.clear
+                    }
                 }
             }
             .clipped()

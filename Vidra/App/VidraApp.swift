@@ -78,7 +78,7 @@ struct MiniPlayerBar: View {
                 .frame(height: 2.5)
                 HStack(spacing: 12) {
                     if v.source != nil {
-                        AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFill() } placeholder: {
+                        CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 44, height: 44)) { $0.resizable().scaledToFill() } placeholder: {
                             ZStack {
                                 Color(.secondarySystemFill)
                                 Image(systemName: "music.note").foregroundStyle(.secondary)
