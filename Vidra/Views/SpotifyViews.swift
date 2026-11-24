@@ -220,20 +220,19 @@ final class SpotifyLibraryModel: ObservableObject {
 
 // MARK: - Spotify Library Filter & Sort Models
 
-enum SpotifyLibraryFilter: String, CaseIterable, Identifiable {
-    case all = "Tất cả"
+enum SpotifyLibraryFilter: String, CaseIterable, Identifiable, Sendable {
     case playlists = "Playlists"
-    case liked = "Bài hát đã thích"
     case artists = "Nghệ sĩ"
+    case albums = "Albums"
     case downloaded = "Đã tải xuống"
 
     var id: String { rawValue }
 }
 
-enum SpotifyLibrarySort: String, CaseIterable, Identifiable {
-    case recent = "Gần đây nhất"
-    case added = "Đã thêm gần đây"
-    case alphabetical = "Theo bảng chữ cái"
+enum SpotifyLibrarySort: String, CaseIterable, Identifiable, Sendable {
+    case recentPlayed = "Mới phát gần đây"
+    case recentlyAdded = "Mới thêm gần đây"
+    case alphabetical = "Thứ tự A-Z"
 
     var id: String { rawValue }
 }
@@ -246,9 +245,9 @@ struct SpotifyLibraryView: View {
     @ObservedObject private var dl = DownloadManager.shared
     @StateObject private var model = SpotifyLibraryModel()
 
-    @State private var selectedFilter: SpotifyLibraryFilter = .all
+    @State private var selectedFilter: SpotifyLibraryFilter?
     @State private var isGridView: Bool = false
-    @State private var sortOption: SpotifyLibrarySort = .recent
+    @State private var sortOption: SpotifyLibrarySort = .recentPlayed
     @State private var searchQuery: String = ""
     @State private var isSearchActive: Bool = false
 
@@ -256,6 +255,10 @@ struct SpotifyLibraryView: View {
     @State private var newPlaylistName: String = ""
     @State private var showSpotifyConnect: Bool = false
     @State private var showImportSheet: Bool = false
+
+    init(initialFilter: SpotifyLibraryFilter? = nil) {
+        _selectedFilter = State(initialValue: initialFilter)
+    }
 
     var body: some View {
         ScrollView {
@@ -433,11 +436,35 @@ struct SpotifyLibraryView: View {
     private var filterChipsRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if selectedFilter != nil {
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+                            selectedFilter = nil
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .bold))
+                            Text("Tất cả")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Capsule().fill(SpotifyColor.surfaceHighlight))
+                        .foregroundColor(SpotifyColor.textPrimary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 ForEach(SpotifyLibraryFilter.allCases) { filter in
                     let isSelected = selectedFilter == filter
                     Button {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
-                            selectedFilter = filter
+                            if selectedFilter == filter {
+                                selectedFilter = nil
+                            } else {
+                                selectedFilter = filter
+                            }
                         }
                     } label: {
                         Text(filter.rawValue)
@@ -616,6 +643,52 @@ struct SpotifyLibraryView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+
+                // When specifically filtered to "Đã tải xuống", list individual downloaded songs
+                if selectedFilter == .downloaded && !filteredDownloads.isEmpty {
+                    ForEach(filteredDownloads) { item in
+                        Button {
+                            PlayerManager.shared.play(item.video, queue: filteredDownloads.map(\.video))
+                        } label: {
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    Color.spotifyDarkGray
+                                    if let thumb = item.video.thumbnail {
+                                        AsyncImage(url: thumb) { $0.resizable().scaledToFill() } placeholder: {
+                                            Color.clear
+                                        }
+                                    } else {
+                                        Image(systemName: "arrow.down.circle")
+                                            .foregroundColor(SpotifyColor.textSecondary)
+                                    }
+                                }
+                                .frame(width: 48, height: 48)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.video.title)
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(SpotifyColor.textPrimary)
+                                        .lineLimit(1)
+                                    Text(item.video.channelTitle)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                        .lineLimit(1)
+                                }
+
+                                Spacer()
+
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 15))
+                                    .foregroundColor(SpotifyColor.brandGreen)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.leading, 12)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
 
             // 3. User Local Playlists
@@ -670,7 +743,55 @@ struct SpotifyLibraryView: View {
                 }
             }
 
-            // 4. Followed Artists / Channels
+            // 4. Albums
+            if shouldShowAlbums {
+                ForEach(filteredAlbums) { card in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            albumId: card.id,
+                            name: card.title,
+                            cover: card.image,
+                            subtitle: card.subtitle
+                        )
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let img = card.image {
+                                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "opticaldisc")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .frame(width: 60, height: 60)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(card.title)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text("Album • \(card.subtitle.isEmpty ? "Nghệ sĩ" : card.subtitle)")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                                    .lineLimit(1)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 5. Followed Artists / Channels
             if shouldShowArtists {
                 ForEach(filteredArtists) { channel in
                     NavigationLink {
@@ -709,9 +830,9 @@ struct SpotifyLibraryView: View {
                 }
             }
 
-            // 5. Remote Spotify Playlists (if connected)
-            if auth.isLoggedIn && !model.playlists.isEmpty && shouldShowPlaylists {
-                ForEach(model.playlists) { card in
+            // 6. Remote Spotify Playlists (if connected)
+            if auth.isLoggedIn && !filteredRemotePlaylists.isEmpty && shouldShowPlaylists {
+                ForEach(filteredRemotePlaylists) { card in
                     SpotifyCardLink(card: card, width: nil)
                         .padding(.horizontal, 16)
                 }
@@ -771,6 +892,50 @@ struct SpotifyLibraryView: View {
                 .buttonStyle(.plain)
             }
 
+            // Pinned Downloaded Songs Card
+            if shouldShowDownloaded {
+                NavigationLink {
+                    SpotifyPlaylistDetailView(
+                        title: "Đã tải xuống",
+                        subtitle: "Các bài hát ngoại tuyến trên thiết bị",
+                        creator: "Vidra Ngoại Tuyến",
+                        likesCount: dl.items.count,
+                        loader: { offset in
+                            let all = dl.items.map(\.video)
+                            let slice = Array(all.dropFirst(offset).prefix(50))
+                            return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                        }
+                    )
+                } label: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ZStack {
+                            LinearGradient(
+                                colors: [Color(red: 0.08, green: 0.35, blue: 0.22), Color(red: 0.11, green: 0.73, blue: 0.33)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 38))
+                                .foregroundColor(.white)
+                        }
+                        .aspectRatio(1, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Đã tải xuống")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+                                .lineLimit(1)
+
+                            Text("Ngoại tuyến • \(dl.items.count) bài hát")
+                                .font(.system(size: 12))
+                                .foregroundColor(SpotifyColor.textSecondary)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
             // Playlists in Grid
             if shouldShowPlaylists {
                 ForEach(filteredPlaylists) { playlist in
@@ -812,6 +977,50 @@ struct SpotifyLibraryView: View {
                                 Text("Playlist • \(playlist.videos.count) bài hát")
                                     .font(.system(size: 12))
                                     .foregroundColor(SpotifyColor.textSecondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Albums in Grid
+            if shouldShowAlbums {
+                ForEach(filteredAlbums) { card in
+                    NavigationLink {
+                        SpotifyPlaylistDetailView(
+                            albumId: card.id,
+                            name: card.title,
+                            cover: card.image,
+                            subtitle: card.subtitle
+                        )
+                    } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let img = card.image {
+                                    AsyncImage(url: img) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "opticaldisc")
+                                        .font(.system(size: 32))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .aspectRatio(1, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(card.title)
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text("Album • \(card.subtitle.isEmpty ? "Nghệ sĩ" : card.subtitle)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                                    .lineLimit(1)
                             }
                         }
                     }
@@ -909,21 +1118,25 @@ struct SpotifyLibraryView: View {
     // MARK: - Helpers & Filtering
 
     private var shouldShowLikedSongs: Bool {
-        (selectedFilter == .all || selectedFilter == .playlists || selectedFilter == .liked) &&
+        (selectedFilter == nil || selectedFilter == .playlists) &&
         (searchQuery.isEmpty || "bài hát đã thích".contains(searchQuery.lowercased()))
     }
 
     private var shouldShowDownloaded: Bool {
-        (selectedFilter == .all || selectedFilter == .downloaded) &&
+        (selectedFilter == nil || selectedFilter == .downloaded) &&
         (searchQuery.isEmpty || "đã tải xuống".contains(searchQuery.lowercased()))
     }
 
     private var shouldShowPlaylists: Bool {
-        selectedFilter == .all || selectedFilter == .playlists
+        selectedFilter == nil || selectedFilter == .playlists
     }
 
     private var shouldShowArtists: Bool {
-        selectedFilter == .all || selectedFilter == .artists
+        selectedFilter == nil || selectedFilter == .artists
+    }
+
+    private var shouldShowAlbums: Bool {
+        selectedFilter == nil || selectedFilter == .albums
     }
 
     private var filteredPlaylists: [LocalPlaylist] {
@@ -932,10 +1145,31 @@ struct SpotifyLibraryView: View {
             list = list.filter { $0.name.localizedCaseInsensitiveContains(searchQuery) }
         }
         switch sortOption {
-        case .recent, .added:
+        case .recentPlayed:
+            let historyIds = lib.history.map(\.video.id)
+            return list.sorted { p1, p2 in
+                let idx1 = p1.videos.compactMap { historyIds.firstIndex(of: $0.id) }.min() ?? Int.max
+                let idx2 = p2.videos.compactMap { historyIds.firstIndex(of: $0.id) }.min() ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return p1.name.localizedCompare(p2.name) == .orderedAscending
+            }
+        case .recentlyAdded:
             return list
         case .alphabetical:
             return list.sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    private var filteredRemotePlaylists: [SpotifyCard] {
+        var list = model.playlists
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) || $0.subtitle.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recentPlayed, .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
         }
     }
 
@@ -945,10 +1179,74 @@ struct SpotifyLibraryView: View {
             list = list.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) }
         }
         switch sortOption {
-        case .recent, .added:
+        case .recentPlayed:
+            let historyChannelIds = lib.history.compactMap(\.video.channelId)
+            let historyChannelTitles = lib.history.map(\.video.channelTitle)
+            return list.sorted { c1, c2 in
+                let idx1 = historyChannelIds.firstIndex(of: c1.id) ?? historyChannelTitles.firstIndex(of: c1.title) ?? Int.max
+                let idx2 = historyChannelIds.firstIndex(of: c2.id) ?? historyChannelTitles.firstIndex(of: c2.title) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return c1.title.localizedCompare(c2.title) == .orderedAscending
+            }
+        case .recentlyAdded:
             return list
         case .alphabetical:
             return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
+    }
+
+    private var filteredAlbums: [SpotifyCard] {
+        var list = model.albums
+        if list.isEmpty {
+            let grouped = Dictionary(grouping: lib.likedTracks.filter { !($0.published ?? "").isEmpty }) { $0.published ?? "" }
+            list = grouped.compactMap { (albumName, tracks) -> SpotifyCard? in
+                guard !albumName.isEmpty, let first = tracks.first else { return nil }
+                return SpotifyCard(
+                    id: "local_album_\(albumName)",
+                    kind: .album,
+                    title: albumName,
+                    subtitle: first.channelTitle,
+                    image: first.thumbnail
+                )
+            }
+        }
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) || $0.subtitle.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recentPlayed:
+            let historyTitles = lib.history.map(\.video.title)
+            return list.sorted { a1, a2 in
+                let idx1 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a1.title) }) ?? Int.max
+                let idx2 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a2.title) }) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return a1.title.localizedCompare(a2.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
+    }
+
+    private var filteredDownloads: [DownloadItem] {
+        var list = dl.items
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.video.title.localizedCaseInsensitiveContains(searchQuery) || $0.video.channelTitle.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recentPlayed:
+            let historyIds = lib.history.map(\.video.id)
+            return list.sorted { d1, d2 in
+                let idx1 = historyIds.firstIndex(of: d1.video.id) ?? Int.max
+                let idx2 = historyIds.firstIndex(of: d2.video.id) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return d1.video.title.localizedCompare(d2.video.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return Array(list.reversed())
+        case .alphabetical:
+            return list.sorted { $0.video.title.localizedCompare($1.video.title) == .orderedAscending }
         }
     }
 }

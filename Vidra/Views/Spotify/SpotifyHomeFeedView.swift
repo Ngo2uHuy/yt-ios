@@ -593,10 +593,9 @@ final class SpotifyHomeFeedModel: ObservableObject {
 struct SpotifyHomeFeedView: View {
     @StateObject private var model = SpotifyHomeFeedModel()
     @ObservedObject private var auth = SpotifyAuth.shared
-    @State private var selectedFilter = "Tất cả"
+    @State private var libraryFilter: SpotifyLibraryFilter? = nil
+    @State private var librarySort: SpotifyLibrarySort = .recentPlayed
     @State private var showLoginSheet = false
-
-    private let filterChips = ["Tất cả", "Nhạc", "Podcasts"]
 
     private var greetingText: String {
         let hour = Calendar.current.component(.hour, from: Date())
@@ -642,6 +641,9 @@ struct SpotifyHomeFeedView: View {
 
                     // 3. Quick Access Grid (2 columns x 3 rows)
                     quickAccessGridSection
+
+                    // 3.1 Your Library Shelf & Quick Filter
+                    yourLibrarySection
 
                     // 4. Horizontal Carousels
                     madeForYouCarouselSection
@@ -782,20 +784,42 @@ struct SpotifyHomeFeedView: View {
                 .buttonStyle(.plain)
             }
 
-            // Filter Chips
+            // Quick Filter Chips: "Tất cả", "Playlists", "Nghệ sĩ", "Albums", "Đã tải xuống"
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(filterChips, id: \.self) { chip in
-                        let isSelected = selectedFilter == chip
+                    let isAllSelected = libraryFilter == nil
+                    Button {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
+                            libraryFilter = nil
+                        }
+                    } label: {
+                        Text("Tất cả")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule()
+                                    .fill(isAllSelected ? Color.spotifyGreen : Color.spotifyCard)
+                            )
+                            .foregroundStyle(isAllSelected ? Color.black : Color.white)
+                    }
+                    .buttonStyle(.plain)
+
+                    ForEach(SpotifyLibraryFilter.allCases) { filter in
+                        let isSelected = libraryFilter == filter
                         Button {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
-                                selectedFilter = chip
+                                if libraryFilter == filter {
+                                    libraryFilter = nil
+                                } else {
+                                    libraryFilter = filter
+                                }
                             }
                         } label: {
-                            Text(chip)
+                            Text(filter.rawValue)
                                 .font(.subheadline.weight(.semibold))
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 8)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
                                 .background(
                                     Capsule()
                                         .fill(isSelected ? Color.spotifyGreen : Color.spotifyCard)
@@ -808,7 +832,35 @@ struct SpotifyHomeFeedView: View {
             }
             .padding(.leading, 4)
 
-            Spacer(minLength: 4)
+            // Sort Menu: "Mới phát gần đây", "Mới thêm gần đây", "Thứ tự A-Z"
+            Menu {
+                ForEach(SpotifyLibrarySort.allCases) { sort in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            librarySort = sort
+                        }
+                    } label: {
+                        if librarySort == sort {
+                            Label(sort.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(sort.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.system(size: 10, weight: .bold))
+                    Text(librarySort.rawValue)
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(Color.spotifySubtext)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.spotifyCard, in: Capsule())
+            }
+
+            Spacer(minLength: 2)
 
             // Nút chuyển lại chế độ YouTube
             AppModeSwitchPill()
@@ -879,6 +931,482 @@ struct SpotifyHomeFeedView: View {
             }
         }
         .padding(.horizontal, 16)
+    }
+
+    // MARK: - Library Quick Filter & Shelf
+
+    private var yourLibrarySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header with Title, Sort Menu, and View All link
+            HStack {
+                Text("Thư viện của bạn")
+                    .font(.title2.bold())
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                // Sort Dropdown Menu
+                Menu {
+                    ForEach(SpotifyLibrarySort.allCases) { sort in
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                librarySort = sort
+                            }
+                        } label: {
+                            if librarySort == sort {
+                                Label(sort.rawValue, systemImage: "checkmark")
+                            } else {
+                                Text(sort.rawValue)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.arrow.down")
+                            .font(.system(size: 11, weight: .bold))
+                        Text(librarySort.rawValue)
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.spotifyCard, in: Capsule())
+                }
+
+                NavigationLink {
+                    SpotifyLibraryView(initialFilter: libraryFilter)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Color.spotifySubtext)
+                        .padding(.leading, 4)
+                }
+            }
+            .padding(.horizontal, 16)
+
+            // Quick Filter Chips row
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    if libraryFilter != nil {
+                        Button {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) {
+                                libraryFilter = nil
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 10, weight: .bold))
+                                Text("Tất cả")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(Color.spotifyCard))
+                            .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    ForEach(SpotifyLibraryFilter.allCases) { filter in
+                        let isSelected = (libraryFilter == filter)
+                        Button {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) {
+                                if libraryFilter == filter {
+                                    libraryFilter = nil
+                                } else {
+                                    libraryFilter = filter
+                                }
+                            }
+                        } label: {
+                            Text(filter.rawValue)
+                                .font(.system(size: 12, weight: isSelected ? .bold : .semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule()
+                                        .fill(isSelected ? Color.spotifyGreen : Color.spotifyCard)
+                                )
+                                .foregroundStyle(isSelected ? Color.black : Color.white)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+
+            // Horizontal Carousel of Sorted Items
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 14) {
+                    // Pinned Liked Songs Card (if playlists or all)
+                    if libraryFilter == nil || libraryFilter == .playlists {
+                        NavigationLink {
+                            SpotifyPlaylistDetailView(
+                                title: "Bài hát đã thích",
+                                subtitle: "Thư viện bài hát yêu thích của bạn",
+                                creator: auth.profile?.name ?? "Bạn",
+                                likesCount: Library.shared.likedTracks.count,
+                                loader: { offset in
+                                    if auth.isLoggedIn {
+                                        return try await SpotifyAPI.shared.likedSongs(offset: offset)
+                                    } else {
+                                        let all = Library.shared.likedTracks
+                                        let slice = Array(all.dropFirst(offset).prefix(50))
+                                        return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                                    }
+                                }
+                            )
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ZStack {
+                                    LinearGradient(
+                                        colors: [Color(red: 0.28, green: 0.14, blue: 0.65), Color(red: 0.45, green: 0.58, blue: 0.72)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                    Image(systemName: "heart.fill")
+                                        .font(.system(size: 32, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                                .frame(width: 130, height: 130)
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Bài hát đã thích")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                    Text("\(Library.shared.likedTracks.count) bài hát")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Color.spotifySubtext)
+                                }
+                                .frame(width: 130, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Pinned Downloaded Songs Card (if downloaded or all)
+                    if libraryFilter == nil || libraryFilter == .downloaded {
+                        NavigationLink {
+                            SpotifyPlaylistDetailView(
+                                title: "Đã tải xuống",
+                                subtitle: "Các bài hát ngoại tuyến trên thiết bị",
+                                creator: "Vidra Ngoại Tuyến",
+                                likesCount: DownloadManager.shared.items.count,
+                                loader: { offset in
+                                    let all = DownloadManager.shared.items.map(\.video)
+                                    let slice = Array(all.dropFirst(offset).prefix(50))
+                                    return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                                }
+                            )
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ZStack {
+                                    LinearGradient(
+                                        colors: [Color(red: 0.08, green: 0.35, blue: 0.22), Color(red: 0.11, green: 0.73, blue: 0.33)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.system(size: 32, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                                .frame(width: 130, height: 130)
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Đã tải xuống")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                    Text("\(DownloadManager.shared.items.count) bài hát")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Color.spotifySubtext)
+                                }
+                                .frame(width: 130, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Playlists
+                    if libraryFilter == nil || libraryFilter == .playlists {
+                        ForEach(homeSortedPlaylists) { playlist in
+                            NavigationLink {
+                                SpotifyPlaylistDetailView(
+                                    title: playlist.name,
+                                    subtitle: "Danh sách phát của bạn",
+                                    creator: "Bạn",
+                                    likesCount: playlist.videos.count,
+                                    loader: { offset in
+                                        let all = playlist.videos
+                                        let slice = Array(all.dropFirst(offset).prefix(50))
+                                        return Page(videos: slice, continuation: offset + 50 < all.count ? "\(offset + 50)" : nil)
+                                    }
+                                )
+                            } label: {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ZStack {
+                                        Color.spotifyCard
+                                        if let firstThumb = playlist.videos.first?.thumbnail {
+                                            CachedAsyncImage(url: firstThumb, targetSize: CGSize(width: 260, height: 260)) { img in
+                                                img.resizable().scaledToFill()
+                                            } placeholder: {
+                                                Color.spotifyDarkGray
+                                            }
+                                        } else {
+                                            Image(systemName: "music.note.list")
+                                                .font(.system(size: 28))
+                                                .foregroundStyle(Color.spotifySubtext)
+                                        }
+                                    }
+                                    .frame(width: 130, height: 130)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(playlist.name)
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Text("Playlist • \(playlist.videos.count) bài")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color.spotifySubtext)
+                                    }
+                                    .frame(width: 130, alignment: .leading)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Artists
+                    if libraryFilter == nil || libraryFilter == .artists {
+                        ForEach(homeSortedArtists) { channel in
+                            NavigationLink {
+                                SpotifyPlaylistDetailView(
+                                    title: channel.title,
+                                    cover: channel.avatar,
+                                    subtitle: "Nghệ sĩ",
+                                    creator: channel.title,
+                                    loader: { offset in
+                                        try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
+                                    }
+                                )
+                            } label: {
+                                VStack(alignment: .center, spacing: 8) {
+                                    Avatar(url: channel.avatar, name: channel.title, size: 130)
+                                        .clipShape(Circle())
+
+                                    VStack(alignment: .center, spacing: 2) {
+                                        Text(channel.title)
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Text("Nghệ sĩ")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color.spotifySubtext)
+                                    }
+                                    .frame(width: 130)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Albums
+                    if libraryFilter == nil || libraryFilter == .albums {
+                        ForEach(homeSortedAlbums) { album in
+                            NavigationLink {
+                                SpotifyPlaylistDetailView(
+                                    albumId: album.id,
+                                    name: album.title,
+                                    cover: album.image,
+                                    subtitle: album.subtitle
+                                )
+                            } label: {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ZStack {
+                                        Color.spotifyCard
+                                        if let img = album.image {
+                                            CachedAsyncImage(url: img, targetSize: CGSize(width: 260, height: 260)) { i in
+                                                i.resizable().scaledToFill()
+                                            } placeholder: {
+                                                Color.spotifyDarkGray
+                                            }
+                                        } else {
+                                            Image(systemName: "opticaldisc")
+                                                .font(.system(size: 28))
+                                                .foregroundStyle(Color.spotifySubtext)
+                                        }
+                                    }
+                                    .frame(width: 130, height: 130)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(album.title)
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Text("Album • \(album.subtitle.isEmpty ? "Nghệ sĩ" : album.subtitle)")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color.spotifySubtext)
+                                            .lineLimit(1)
+                                    }
+                                    .frame(width: 130, alignment: .leading)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Downloaded Tracks (if filtered to downloaded)
+                    if libraryFilter == .downloaded {
+                        ForEach(homeSortedDownloads) { item in
+                            Button {
+                                PlayerManager.shared.play(item.video, queue: homeSortedDownloads.map(\.video))
+                            } label: {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ZStack {
+                                        Color.spotifyCard
+                                        if let thumb = item.video.thumbnail {
+                                            CachedAsyncImage(url: thumb, targetSize: CGSize(width: 260, height: 260)) { img in
+                                                img.resizable().scaledToFill()
+                                            } placeholder: {
+                                                Color.spotifyDarkGray
+                                            }
+                                        } else {
+                                            Image(systemName: "arrow.down.circle")
+                                                .font(.system(size: 28))
+                                                .foregroundStyle(Color.spotifySubtext)
+                                        }
+                                    }
+                                    .frame(width: 130, height: 130)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.video.title)
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Text(item.video.channelTitle)
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color.spotifySubtext)
+                                            .lineLimit(1)
+                                    }
+                                    .frame(width: 130, alignment: .leading)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Link to Full Library
+                    NavigationLink {
+                        SpotifyLibraryView(initialFilter: libraryFilter)
+                    } label: {
+                        VStack(alignment: .center, spacing: 8) {
+                            ZStack {
+                                Color.spotifyCard
+                                Image(systemName: "arrow.right.circle.fill")
+                                    .font(.system(size: 32))
+                                    .foregroundStyle(Color.spotifyGreen)
+                            }
+                            .frame(width: 130, height: 130)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            Text("Mở Thư viện")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    private var homeSortedPlaylists: [LocalPlaylist] {
+        let list = Library.shared.playlists
+        switch librarySort {
+        case .recentPlayed:
+            let historyIds = Library.shared.history.map(\.video.id)
+            return list.sorted { p1, p2 in
+                let idx1 = p1.videos.compactMap { historyIds.firstIndex(of: $0.id) }.min() ?? Int.max
+                let idx2 = p2.videos.compactMap { historyIds.firstIndex(of: $0.id) }.min() ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return p1.name.localizedCompare(p2.name) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    private var homeSortedArtists: [Channel] {
+        let list = Library.shared.subscriptions
+        switch librarySort {
+        case .recentPlayed:
+            let historyChannelIds = Library.shared.history.compactMap(\.video.channelId)
+            let historyChannelTitles = Library.shared.history.map(\.video.channelTitle)
+            return list.sorted { c1, c2 in
+                let idx1 = historyChannelIds.firstIndex(of: c1.id) ?? historyChannelTitles.firstIndex(of: c1.title) ?? Int.max
+                let idx2 = historyChannelIds.firstIndex(of: c2.id) ?? historyChannelTitles.firstIndex(of: c2.title) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return c1.title.localizedCompare(c2.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
+    }
+
+    private var homeSortedAlbums: [SpotifyCard] {
+        let grouped = Dictionary(grouping: Library.shared.likedTracks.filter { !($0.published ?? "").isEmpty }) { $0.published ?? "" }
+        let list = grouped.compactMap { (albumName, tracks) -> SpotifyCard? in
+            guard !albumName.isEmpty, let first = tracks.first else { return nil }
+            return SpotifyCard(
+                id: "local_album_\(albumName)",
+                kind: .album,
+                title: albumName,
+                subtitle: first.channelTitle,
+                image: first.thumbnail
+            )
+        }
+        switch librarySort {
+        case .recentPlayed:
+            let historyTitles = Library.shared.history.map(\.video.title)
+            return list.sorted { a1, a2 in
+                let idx1 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a1.title) }) ?? Int.max
+                let idx2 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a2.title) }) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return a1.title.localizedCompare(a2.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
+    }
+
+    private var homeSortedDownloads: [DownloadItem] {
+        let list = DownloadManager.shared.items
+        switch librarySort {
+        case .recentPlayed:
+            let historyIds = Library.shared.history.map(\.video.id)
+            return list.sorted { d1, d2 in
+                let idx1 = historyIds.firstIndex(of: d1.video.id) ?? Int.max
+                let idx2 = historyIds.firstIndex(of: d2.video.id) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return d1.video.title.localizedCompare(d2.video.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return Array(list.reversed())
+        case .alphabetical:
+            return list.sorted { $0.video.title.localizedCompare($1.video.title) == .orderedAscending }
+        }
     }
 
     // MARK: - Carousels
