@@ -72,7 +72,12 @@ actor InnerTube {
     private var visitorData: String? = "CgtsRGRWV1hiaVNYcyjAl5bYBjIKCgJWThIEGgAgPUgBYqoCCqcCQ3RvQkNBVVNqQUVCREI2UERMUWpuZ0dJUnNwajdLOHZDRTNVZ0x4NkM3UklBcnNUR2ZUbk9JRDc4MFV0Zmh5WWFFQ0xxWENYQ0ZwaHFUUDdPMFZDWXFaZ2lSR0I4VENIYjdrcXJEVmVNQVF2cDE2bHJLOTczR0E3ZFplRmxxUmRTc0VhZHBZdnpkdlVBUTNyYnVqTC0tRUZIX2psTmZRY21jOHU0TkRDSTByTjBOeDVjTFE2YzN6cktuX3pZSXpQMmJ5QUZpZ0ZNa1VCSEZqMWFqUDY2c05mRVFQdW9YS3hWOGRJOTc1cGk3QUpBUjJDMFFEcWNlRzRJUVY0clk4bVp6aUFGWW9DbGx5b1pEOVhWNmJxdFFRTTU4X0lQazBDYTBkdG1Rcw%3D%3D"
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 30
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.httpShouldUsePipelining = true
+        cfg.waitsForConnectivity = true
+        cfg.requestCachePolicy = .useProtocolCachePolicy
         return URLSession(configuration: cfg)
     }()
 
@@ -88,6 +93,7 @@ actor InnerTube {
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("gzip, deflate, br", forHTTPHeaderField: "Accept-Encoding")
         req.setValue(client.userAgent, forHTTPHeaderField: "User-Agent")
         req.setValue(client.nameId, forHTTPHeaderField: "X-YouTube-Client-Name")
         req.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")

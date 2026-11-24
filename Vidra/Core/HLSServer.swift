@@ -25,7 +25,9 @@ final class HLSServer: @unchecked Sendable {
 
     func start() {
         do {
-            let params = NWParameters.tcp
+            let tcpOptions = NWProtocolTCP.Options()
+            tcpOptions.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcpOptions)
             params.allowLocalEndpointReuse = true
             params.requiredInterfaceType = .loopback
             let l = try NWListener(using: params, on: .any)

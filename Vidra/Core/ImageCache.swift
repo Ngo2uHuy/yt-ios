@@ -5,16 +5,19 @@ import ImageIO
 
 // MARK: - High-Performance Memory Decoded Image Cache
 
-/// Thread-safe in-memory bitmap cache with automatic memory pressure handling and cost tracking.
+/// Thread-safe in-memory bitmap cache with automatic memory pressure handling,
+/// off-main-thread ImageIO downsampling, GPU texture pre-warming, and in-flight request deduplication.
 /// Eliminates JPEG/PNG decoding overhead during 60/120Hz list and grid scrolling.
 final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
 
     private let cache = NSCache<NSURL, UIImage>()
+    private var inFlight: [NSURL: Task<UIImage?, Never>] = [:]
+    private let inFlightLock = NSLock()
 
     private init() {
-        cache.countLimit = 350
-        cache.totalCostLimit = 150 * 1024 * 1024 // 150 MB memory limit
+        cache.countLimit = 400
+        cache.totalCostLimit = 160 * 1024 * 1024 // 160 MB memory limit
 
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(
@@ -42,7 +45,65 @@ final class ImageCache: @unchecked Sendable {
     }
 
     func clear() {
+        inFlightLock.lock()
+        inFlight.removeAll()
+        inFlightLock.unlock()
         cache.removeAllObjects()
+    }
+
+    /// Asynchronously loads, downsamples, and decodes an image off the main thread with request deduplication.
+    func load(url: URL, targetSize: CGSize? = nil) async -> UIImage? {
+        let nsUrl = url as NSURL
+
+        // 1. In-memory cache hit
+        if let cached = cache.object(forKey: nsUrl) {
+            return cached
+        }
+
+        // 2. Request deduplication (share existing task if already downloading)
+        inFlightLock.lock()
+        if let existing = inFlight[nsUrl] {
+            inFlightLock.unlock()
+            return await existing.value
+        }
+
+        let task = Task<UIImage?, Never> {
+            guard !Task.isCancelled else { return nil }
+
+            guard let (data, _) = try? await URLSession.shared.data(from: url),
+                  !Task.isCancelled else {
+                return nil
+            }
+
+            // Decode and prepare for display off the main thread
+            let decoded = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                let img: UIImage?
+                if let size = targetSize, size.width > 0, size.height > 0 {
+                    img = ImageCache.downsample(data: data, to: size)
+                } else {
+                    img = UIImage(data: data)
+                }
+                if #available(iOS 15.0, *) {
+                    return img?.preparingForDisplay() ?? img
+                }
+                return img
+            }.value
+
+            guard let image = decoded, !Task.isCancelled else { return nil }
+            self.insert(image, for: url)
+            return image
+        }
+
+        inFlight[nsUrl] = task
+        inFlightLock.unlock()
+
+        let result = await task.value
+
+        inFlightLock.lock()
+        inFlight.removeValue(forKey: nsUrl)
+        inFlightLock.unlock()
+
+        return result
     }
 
     /// Downsamples an image directly from raw data to the target display size using ImageIO.
@@ -122,26 +183,11 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
             }
             uiImage = nil
 
-            // 2. Background asynchronous fetch & decode
-            do {
-                let (data, _) = try await URLSession.shared.data(from: url)
-                guard !Task.isCancelled else { return }
-
-                let decoded: UIImage?
-                if let size = targetSize, size.width > 0, size.height > 0 {
-                    decoded = ImageCache.downsample(data: data, to: size)
-                } else {
-                    decoded = UIImage(data: data)
-                }
-
-                guard let img = decoded, !Task.isCancelled else { return }
-                ImageCache.shared.insert(img, for: url)
-
+            // 2. High-performance deduplicated asynchronous fetch & off-thread decode
+            if let img = await ImageCache.shared.load(url: url, targetSize: targetSize), !Task.isCancelled {
                 withAnimation(.easeIn(duration: 0.16)) {
                     uiImage = img
                 }
-            } catch {
-                // Keep placeholder visible on failure
             }
         }
     }

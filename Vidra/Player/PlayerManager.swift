@@ -365,7 +365,8 @@ final class PlayerManager: NSObject, ObservableObject {
         let resume = Library.shared.position(video.id)
         let seekTarget = resume > 5 ? resume : nil
 
-        if let p = preloadedNext, p.video.id == video.id {
+        let canUseSpotifyDirect = video.source == .spotify && SpotifyRemote.shared.isAvailable
+        if !canUseSpotifyDirect, let p = preloadedNext, p.video.id == video.id {
             preloadedNext = nil
             preloadTask?.cancel()
             preloadTask = nil
@@ -537,6 +538,7 @@ final class PlayerManager: NSObject, ObservableObject {
             return nil
         }()
         guard let v = nextCandidate, v.id != preloadedNext?.video.id else { return }
+        if v.source == .spotify && SpotifyRemote.shared.isAvailable { return }
         let wantsAudioOnly = self.audioOnly || (v.source != nil && Pref.musicAudioOnly)
         preloadTask = Task {
             var r: ResolvedVideo?
@@ -565,12 +567,13 @@ final class PlayerManager: NSObject, ObservableObject {
 
     private func loadCurrentSource() async {
         let id = current?.id
+        let isLive = info?.isLive ?? false
         while sourceIndex < sources.count {
-            let item = try? await makeItem(sources[sourceIndex])
+            let item = try? await makeItem(sources[sourceIndex], isLive: isLive)
             // The user may have switched videos while a composite was loading.
             if Task.isCancelled || current?.id != id { return }
             if let item {
-                attach(item)
+                attach(item, isLive: isLive)
                 return
             }
             sourceIndex += 1
@@ -579,7 +582,7 @@ final class PlayerManager: NSObject, ObservableObject {
         isLoading = false
     }
 
-    private func makeItem(_ source: PlaybackSource) async throws -> AVPlayerItem {
+    private func makeItem(_ source: PlaybackSource, isLive: Bool = false) async throws -> AVPlayerItem {
         let item: AVPlayerItem
         switch source {
         case .hls(let url):
@@ -590,11 +593,12 @@ final class PlayerManager: NSObject, ObservableObject {
         case .composite(let v, let a):
             item = AVPlayerItem(asset: try await Media.composition(video: Media.asset(v), audio: Media.asset(a)))
         }
-        applyQuality(to: item)
+        applyQuality(to: item, isLive: isLive)
         return item
     }
 
-    private func attach(_ item: AVPlayerItem) {
+    private func attach(_ item: AVPlayerItem, isLive: Bool = false) {
+        player.automaticallyWaitsToMinimizeStalling = !isLive
         itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             let status = item.status
             Task { @MainActor in self?.itemStatusChanged(item, status) }
@@ -640,11 +644,17 @@ final class PlayerManager: NSObject, ObservableObject {
         }
     }
 
-    private func applyQuality(to item: AVPlayerItem) {
+    private func applyQuality(to item: AVPlayerItem, isLive: Bool = false) {
         let h = Double(Pref.maxHeight)
         item.preferredMaximumResolution = h > 0 ? CGSize(width: h * 16 / 9, height: h) : .zero
-        item.preferredForwardBufferDuration = 25.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+        if isLive {
+            item.automaticallyPreservesTimeOffsetFromLive = true
+            item.configuredTimeOffsetFromLive = CMTime(seconds: 2.0, preferredTimescale: 600)
+            item.preferredForwardBufferDuration = 4.0
+        } else {
+            item.preferredForwardBufferDuration = 20.0
+        }
     }
 
     // MARK: - Observers
