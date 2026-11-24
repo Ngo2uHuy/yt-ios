@@ -193,62 +193,6 @@ struct WatchDetails: View {
     }
 }
 
-struct CommentsView: View {
-    let token: String?
-
-    @State private var comments: [Comment] = []
-    @State private var next: String?
-    @State private var loading = false
-    @State private var error: String?
-    @State private var started = false
-
-    var body: some View {
-        List {
-            ForEach(comments) { c in
-                HStack(alignment: .top, spacing: 10) {
-                    Avatar(url: c.avatar, name: c.author, size: 32)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("\(c.author) • \(c.published)").font(.caption).foregroundStyle(.secondary)
-                        Text(c.text).font(.subheadline)
-                        if !c.likes.isEmpty {
-                            Label(c.likes, systemImage: "hand.thumbsup").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .onAppear { if c.id == comments.last?.id { Task { await load() } } }
-            }
-            if loading { ProgressView().frame(maxWidth: .infinity) }
-            if let error { Text(error).foregroundStyle(.secondary) }
-            if started && !loading && comments.isEmpty && error == nil {
-                Text("Không có bình luận").foregroundStyle(.secondary)
-            }
-        }
-        .listStyle(.plain)
-        .navigationTitle("Bình luận")
-        .navigationBarTitleDisplayMode(.inline)
-        .task {
-            guard !started else { return }
-            started = true
-            next = token
-            await load()
-        }
-    }
-
-    private func load() async {
-        guard let t = next, !loading else { return }
-        loading = true
-        do {
-            let r = try await InnerTube.shared.comments(t)
-            let seen = Set(comments.map(\.id))
-            comments += r.items.filter { !seen.contains($0.id) }
-            next = r.next
-        } catch {
-            self.error = error.localizedDescription
-        }
-        loading = false
-    }
-}
-
 struct AddToPlaylistView: View {
     let video: Video
     @ObservedObject private var lib = Library.shared

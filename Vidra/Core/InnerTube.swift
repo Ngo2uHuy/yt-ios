@@ -193,30 +193,89 @@ actor InnerTube {
     func comments(_ token: String) async throws -> (items: [Comment], next: String?) {
         let j = try await post("next", body: ["continuation": token])
         var items: [Comment] = []
-        for (_, p) in j.collect(["commentEntityPayload"]) {
-            let props = p["properties"]
-            items.append(Comment(
-                id: props["commentId"].string ?? UUID().uuidString,
-                author: p["author"]["displayName"].string ?? "",
-                avatar: p["author"]["avatarThumbnailUrl"].string.flatMap { URL(string: $0) },
-                text: props["content"]["content"].string ?? "",
-                published: props["publishedTime"].string ?? "",
-                likes: p["toolbar"]["likeCountNotliked"].string ?? ""
-            ))
-        }
-        if items.isEmpty {
-            for (_, c) in j.collect(["commentRenderer"]) {
+
+        // 1. Phân tích commentThreadRenderer (bao gồm bình luận gốc, số lượng replies, token replies, creator heart và badge tác giả)
+        let threads = j.collect(["commentThreadRenderer"])
+        if !threads.isEmpty {
+            for (_, thread) in threads {
+                let c = thread["comment"]["commentRenderer"]
+                guard !c.isNull else { continue }
+                let repliesRenderer = thread["replies"]["commentRepliesRenderer"]
+                let repliesToken = repliesRenderer.first("continuationCommand")?["token"].string
+                    ?? repliesRenderer.first("token")?["token"].string
+                let replyCount = thread["replyCount"].int ?? c["replyCount"].int ?? (Int(c["replyCount"].string ?? "") ?? 0)
+                let isHearted = c["actionButtons"]["commentActionButtonsRenderer"]["creatorHeart"] != nil
+                let isPinned = thread["pinnedCommentBadge"] != nil || c["pinnedCommentBadge"] != nil
+                let isOwner = c["authorIsChannelOwner"].bool ?? false
+
                 items.append(Comment(
                     id: c["commentId"].string ?? UUID().uuidString,
                     author: c["authorText"].text ?? "",
                     avatar: YTParse.thumb(c["authorThumbnail"]),
                     text: c["contentText"].text ?? "",
                     published: c["publishedTimeText"].text ?? "",
-                    likes: c["voteCount"].text ?? ""
+                    likes: c["voteCount"].text ?? "",
+                    isChannelOwner: isOwner,
+                    isHeartedByCreator: isHearted,
+                    isPinned: isPinned,
+                    replyCount: replyCount,
+                    repliesToken: repliesToken
                 ))
             }
         }
-        // Only top-level continuations; nested ones belong to reply threads.
+
+        // 2. Dự phòng commentEntityPayload nếu YouTube trả về định dạng payload hiện đại
+        if items.isEmpty {
+            for (_, p) in j.collect(["commentEntityPayload"]) {
+                let props = p["properties"]
+                let toolbar = p["toolbar"]
+                let author = p["author"]
+                let isOwner = author["isCreator"].bool ?? false
+                let isHearted = toolbar["heartState"].string == "CREATOR_HEART_STATE_HEARTED"
+                let replyCount = toolbar["replyCount"].int ?? (Int(toolbar["replyCount"].string ?? "") ?? 0)
+                let isPinned = p["pinnedText"] != nil || props["isPinned"].bool == true
+
+                items.append(Comment(
+                    id: props["commentId"].string ?? UUID().uuidString,
+                    author: author["displayName"].string ?? "",
+                    avatar: author["avatarThumbnailUrl"].string.flatMap { URL(string: $0) },
+                    text: props["content"]["content"].string ?? "",
+                    published: props["publishedTime"].string ?? "",
+                    likes: toolbar["likeCountNotliked"].string ?? "",
+                    isChannelOwner: isOwner,
+                    isHeartedByCreator: isHearted,
+                    isPinned: isPinned,
+                    replyCount: replyCount,
+                    repliesToken: nil
+                ))
+            }
+        }
+
+        // 3. Dự phòng commentRenderer trực tiếp (khi duyệt danh sách phản hồi replies)
+        if items.isEmpty {
+            for (_, c) in j.collect(["commentRenderer"]) {
+                let isOwner = c["authorIsChannelOwner"].bool ?? false
+                let isHearted = c["actionButtons"]["commentActionButtonsRenderer"]["creatorHeart"] != nil
+                let isPinned = c["pinnedCommentBadge"] != nil
+                let replyCount = c["replyCount"].int ?? (Int(c["replyCount"].string ?? "") ?? 0)
+
+                items.append(Comment(
+                    id: c["commentId"].string ?? UUID().uuidString,
+                    author: c["authorText"].text ?? "",
+                    avatar: YTParse.thumb(c["authorThumbnail"]),
+                    text: c["contentText"].text ?? "",
+                    published: c["publishedTimeText"].text ?? "",
+                    likes: c["voteCount"].text ?? "",
+                    isChannelOwner: isOwner,
+                    isHeartedByCreator: isHearted,
+                    isPinned: isPinned,
+                    replyCount: replyCount,
+                    repliesToken: nil
+                ))
+            }
+        }
+
+        // Token phân trang cho danh sách bình luận tiếp theo hoặc trang phản hồi kế
         var next: String?
         for e in j["onResponseReceivedEndpoints"].array {
             let reload = e["reloadContinuationItemsCommand"]["continuationItems"]

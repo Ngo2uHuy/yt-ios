@@ -220,9 +220,15 @@ struct YouTubeWatchDetails: View {
             }
             .sheet(isPresented: $showComments) {
                 NavigationStack {
-                    CommentsView(token: pm.commentsToken)
+                    CommentsView(
+                        token: pm.commentsToken,
+                        channelTitle: v.channelTitle,
+                        channelAvatar: channelDetail?.avatar
+                    )
                 }
                 .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
             }
             .sheet(isPresented: $showPlaylists) {
                 AddToPlaylistView(video: v)
@@ -1145,5 +1151,403 @@ struct YouTubeDescriptionSheet: View {
             }
         }
         return a
+    }
+}
+
+// MARK: - YouTube Native Comments Sheet
+
+struct CommentsView: View {
+    let token: String?
+    var channelTitle: String? = nil
+    var channelAvatar: URL? = nil
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var comments: [Comment] = []
+    @State private var nextToken: String?
+    @State private var isLoading = false
+    @State private var errorText: String?
+    @State private var hasStarted = false
+    @State private var expandedReplies: Set<String> = []
+    @State private var loadingReplies: Set<String> = []
+    @State private var selectedFilter: CommentFilter = .top
+
+    enum CommentFilter: String, CaseIterable {
+        case top = "Hàng đầu"
+        case newest = "Mới nhất"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerBar
+
+            Divider()
+
+            if isLoading && comments.isEmpty {
+                VStack(spacing: 12) {
+                    ProgressView().tint(.primary).scaleEffect(1.2)
+                    Text("Đang tải bình luận…").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let err = errorText, comments.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.title).foregroundStyle(.red)
+                    Text(err).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal)
+                    Button("Thử lại") {
+                        Task { await loadComments(reset: true) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if comments.isEmpty && hasStarted {
+                VStack(spacing: 8) {
+                    Image(systemName: "bubble.left.and.bubble.right").font(.largeTitle).foregroundStyle(.secondary)
+                    Text("Chưa có bình luận nào").font(.subheadline.weight(.semibold))
+                    Text("Hãy là người đầu tiên bình luận về video này.").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                commentsScrollView
+            }
+        }
+        .background(Color(.systemBackground))
+        .navigationBarHidden(true)
+        .task {
+            guard !hasStarted else { return }
+            hasStarted = true
+            nextToken = token
+            await loadComments(reset: false)
+        }
+    }
+
+    private var headerBar: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Bình luận")
+                    .font(.headline.weight(.bold))
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(6)
+                        .background(Color(.secondarySystemFill), in: Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+
+            // Bộ lọc: Hàng đầu / Mới nhất
+            HStack(spacing: 8) {
+                ForEach(CommentFilter.allCases, id: \.self) { filter in
+                    Button {
+                        selectedFilter = filter
+                    } label: {
+                        Text(filter.rawValue)
+                            .font(.system(size: 13, weight: .semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                selectedFilter == filter ? Color.primary : Color(.secondarySystemFill),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(
+                                selectedFilter == filter ? Color(.systemBackground) : Color.primary
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private var commentsScrollView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                ForEach(comments) { c in
+                    VStack(alignment: .leading, spacing: 10) {
+                        // Thẻ bình luận chính
+                        CommentRowView(
+                            comment: c,
+                            channelTitle: channelTitle,
+                            channelAvatar: channelAvatar
+                        )
+
+                        // Nút hiển thị / ẩn danh sách câu trả lời (Replies)
+                        if c.replyCount > 0 || !c.replies.isEmpty || c.repliesToken != nil {
+                            Button {
+                                toggleReplies(for: c)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: expandedReplies.contains(c.id) ? "chevron.up" : "chevron.down")
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text(expandedReplies.contains(c.id)
+                                        ? "Ẩn câu trả lời"
+                                        : (c.replyCount > 0 ? "Xem \(c.replyCount) câu trả lời" : "Xem câu trả lời"))
+                                        .font(.caption.weight(.bold))
+                                }
+                                .foregroundStyle(Color.blue)
+                            }
+                            .padding(.leading, 46)
+                        }
+
+                        // Danh sách phân cấp các câu trả lời khi mở rộng
+                        if expandedReplies.contains(c.id) {
+                            if loadingReplies.contains(c.id) {
+                                HStack {
+                                    ProgressView()
+                                        .scaleEffect(0.85)
+                                    Text("Đang tải câu trả lời…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.leading, 46)
+                            } else {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    ForEach(c.replies) { reply in
+                                        ReplyRowView(
+                                            reply: reply,
+                                            channelTitle: channelTitle,
+                                            channelAvatar: channelAvatar
+                                        )
+                                    }
+                                }
+                                .padding(.leading, 46)
+                            }
+                        }
+                    }
+                    .onAppear {
+                        if c.id == comments.last?.id {
+                            Task { await loadComments(reset: false) }
+                        }
+                    }
+                }
+
+                if isLoading && !comments.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView().tint(.secondary)
+                        Spacer()
+                    }
+                    .padding(.vertical, 12)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .refreshable {
+            await loadComments(reset: true)
+        }
+    }
+
+    private func toggleReplies(for comment: Comment) {
+        if expandedReplies.contains(comment.id) {
+            expandedReplies.remove(comment.id)
+        } else {
+            expandedReplies.insert(comment.id)
+            if comment.replies.isEmpty, let token = comment.repliesToken {
+                loadReplies(for: comment.id, token: token)
+            }
+        }
+    }
+
+    private func loadReplies(for commentId: String, token: String) {
+        loadingReplies.insert(commentId)
+        Task {
+            if let res = try? await InnerTube.shared.comments(token) {
+                if let idx = comments.firstIndex(where: { $0.id == commentId }) {
+                    comments[idx].replies = res.items
+                }
+            }
+            loadingReplies.remove(commentId)
+        }
+    }
+
+    private func loadComments(reset: Bool) async {
+        if reset {
+            nextToken = token
+            comments.removeAll()
+            expandedReplies.removeAll()
+        }
+        guard let t = nextToken, !isLoading else { return }
+        isLoading = true
+        errorText = nil
+        do {
+            let res = try await InnerTube.shared.comments(t)
+            let seen = Set(comments.map(\.id))
+            let newItems = res.items.filter { !seen.contains($0.id) }
+            comments.append(contentsOf: newItems)
+            nextToken = res.next
+        } catch {
+            if comments.isEmpty {
+                errorText = error.localizedDescription
+            }
+        }
+        isLoading = false
+    }
+}
+
+// MARK: - CommentRowView
+
+private struct CommentRowView: View {
+    let comment: Comment
+    let channelTitle: String?
+    let channelAvatar: URL?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Avatar(url: comment.avatar, name: comment.author, size: 34)
+
+            VStack(alignment: .leading, spacing: 5) {
+                // Nhãn bình luận được ghim (Pinned Badge)
+                if comment.isPinned {
+                    HStack(spacing: 4) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 10))
+                        Text("Được ghim bởi \(channelTitle ?? "chủ kênh")")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+
+                // Dòng tên tác giả + Huy hiệu tác giả (Channel Badge) + Ngày đăng
+                HStack(spacing: 6) {
+                    if comment.isChannelOwner || (channelTitle != nil && comment.author == channelTitle) {
+                        HStack(spacing: 3) {
+                            Text(comment.author)
+                                .font(.system(size: 12, weight: .bold))
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 10))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.12), in: Capsule())
+                    } else {
+                        Text("@\(comment.author)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("• \(comment.published)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
+                // Nội dung bình luận
+                Text(comment.text)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+
+                // Hàng nút tương tác: Like, Dislike, Nút thả tim của chủ kênh
+                HStack(spacing: 16) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "hand.thumbsup")
+                            .font(.system(size: 12))
+                        if !comment.likes.isEmpty {
+                            Text(comment.likes)
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+
+                    Image(systemName: "hand.thumbsdown")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+
+                    // Nút thả tim của chủ kênh (Creator Heart)
+                    if comment.isHeartedByCreator {
+                        HStack(spacing: -5) {
+                            Avatar(url: channelAvatar, name: channelTitle ?? "Kênh", size: 16)
+                                .clipShape(Circle())
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.red)
+                        }
+                    }
+
+                    Text("Phản hồi")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+}
+
+// MARK: - ReplyRowView
+
+private struct ReplyRowView: View {
+    let reply: Comment
+    let channelTitle: String?
+    let channelAvatar: URL?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Avatar(url: reply.avatar, name: reply.author, size: 26)
+
+            VStack(alignment: .leading, spacing: 4) {
+                // Tên tác giả + Huy hiệu nếu là chủ kênh
+                HStack(spacing: 6) {
+                    if reply.isChannelOwner || (channelTitle != nil && reply.author == channelTitle) {
+                        HStack(spacing: 3) {
+                            Text(reply.author)
+                                .font(.system(size: 11, weight: .bold))
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 9))
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.primary.opacity(0.12), in: Capsule())
+                    } else {
+                        Text("@\(reply.author)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("• \(reply.published)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+
+                // Nội dung câu trả lời
+                Text(reply.text)
+                    .font(.footnote)
+                    .foregroundStyle(.primary)
+
+                // Nút thích & Thả tim của chủ kênh
+                HStack(spacing: 14) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "hand.thumbsup")
+                            .font(.system(size: 11))
+                        if !reply.likes.isEmpty {
+                            Text(reply.likes)
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+
+                    Image(systemName: "hand.thumbsdown")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+
+                    if reply.isHeartedByCreator {
+                        HStack(spacing: -5) {
+                            Avatar(url: channelAvatar, name: channelTitle ?? "Kênh", size: 14)
+                                .clipShape(Circle())
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                .padding(.top, 1)
+            }
+        }
     }
 }

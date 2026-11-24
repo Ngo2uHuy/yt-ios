@@ -71,13 +71,47 @@ struct LocalPlaylist: Identifiable, Codable, Hashable, Sendable {
     var videos: [Video] = []
 }
 
-struct Comment: Identifiable {
+struct Comment: Identifiable, Sendable {
     let id: String
     let author: String
     let avatar: URL?
     let text: String
     let published: String
     let likes: String
+    var isChannelOwner: Bool = false
+    var isHeartedByCreator: Bool = false
+    var isPinned: Bool = false
+    var replyCount: Int = 0
+    var repliesToken: String? = nil
+    var replies: [Comment] = []
+
+    init(
+        id: String,
+        author: String,
+        avatar: URL?,
+        text: String,
+        published: String,
+        likes: String,
+        isChannelOwner: Bool = false,
+        isHeartedByCreator: Bool = false,
+        isPinned: Bool = false,
+        replyCount: Int = 0,
+        repliesToken: String? = nil,
+        replies: [Comment] = []
+    ) {
+        self.id = id
+        self.author = author
+        self.avatar = avatar
+        self.text = text
+        self.published = published
+        self.likes = likes
+        self.isChannelOwner = isChannelOwner
+        self.isHeartedByCreator = isHeartedByCreator
+        self.isPinned = isPinned
+        self.replyCount = replyCount
+        self.repliesToken = repliesToken
+        self.replies = replies
+    }
 }
 
 struct CaptionTrack: Identifiable, Codable, Hashable, Sendable {
