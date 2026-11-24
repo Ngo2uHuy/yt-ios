@@ -4,22 +4,30 @@ import Foundation
 struct Votes: Decodable {
     let likes: Int
     let dislikes: Int
+    let rating: Double?
+    let viewCount: Int?
 }
 
 struct SponsorSegment: Decodable {
     let segment: [Double]
     let category: String
+    let actionType: String?
+    let UUID: String?
 
     var start: Double { segment.first ?? 0 }
     var end: Double { segment.last ?? 0 }
 
     var label: String {
         switch category {
-        case "sponsor": return "Tài trợ"
-        case "selfpromo": return "Tự quảng bá"
-        case "interaction": return "Kêu gọi đăng ký"
-        case "music_offtopic": return "Đoạn không phải nhạc"
-        default: return category
+        case "sponsor": return "Đoạn tài trợ"
+        case "selfpromo": return "Tự quảng cáo"
+        case "interaction": return "Kêu gọi tương tác"
+        case "intro": return "Đoạn mở đầu (Intro)"
+        case "outro": return "Đoạn kết thúc (Outro)"
+        case "preview": return "Xem trước / Recap"
+        case "music_offtopic": return "Đoạn ngoài âm nhạc"
+        case "filler": return "Đoạn thừa"
+        default: return "Phân đoạn quảng cáo"
         }
     }
 }
@@ -32,21 +40,46 @@ enum Extras {
         return URLSession(configuration: cfg)
     }()
 
-    /// Return YouTube Dislike community API.
-    static func votes(_ id: String) async -> Votes? {
-        guard let url = URL(string: "https://returnyoutubedislikeapi.com/votes?videoId=\(id)"),
-              let res = try? await session.data(from: url) else { return nil }
-        return try? JSONDecoder().decode(Votes.self, from: res.0)
+    private static let votesCache = NSCache<NSString, CacheEntry<Votes>>()
+    private static let segmentsCache = NSCache<NSString, CacheEntry<[SponsorSegment]>>()
+
+    private final class CacheEntry<T>: @unchecked Sendable {
+        let value: T
+        let timestamp = Date()
+        init(_ value: T) { self.value = value }
     }
 
+    /// Return YouTube Dislike community API with memory caching.
+    static func votes(_ id: String) async -> Votes? {
+        if let cached = votesCache.object(forKey: id as NSString) {
+            if Date().timeIntervalSince(cached.timestamp) < 300 {
+                return cached.value
+            }
+        }
+        guard let url = URL(string: "https://returnyoutubedislikeapi.com/votes?videoId=\(id)"),
+              let res = try? await session.data(from: url),
+              let votes = try? JSONDecoder().decode(Votes.self, from: res.0) else { return nil }
+        votesCache.setObject(CacheEntry(votes), forKey: id as NSString)
+        return votes
+    }
+
+    /// SponsorBlock API to skip sponsors, self-promo, intros, outros, and fillers.
     static func segments(_ id: String) async -> [SponsorSegment] {
+        if let cached = segmentsCache.object(forKey: id as NSString) {
+            if Date().timeIntervalSince(cached.timestamp) < 600 {
+                return cached.value
+            }
+        }
         var c = URLComponents(string: "https://sponsor.ajay.app/api/skipSegments")!
         c.queryItems = [
             .init(name: "videoID", value: id),
-            .init(name: "categories", value: #"["sponsor","selfpromo","interaction","music_offtopic"]"#),
+            .init(name: "categories", value: #"["sponsor","selfpromo","interaction","intro","outro","preview","music_offtopic","filler"]"#),
+            .init(name: "actionTypes", value: #"["skip","mute"]"#),
         ]
         guard let url = c.url, let res = try? await session.data(from: url) else { return [] }
-        return (try? JSONDecoder().decode([SponsorSegment].self, from: res.0)) ?? []
+        let segs = (try? JSONDecoder().decode([SponsorSegment].self, from: res.0)) ?? []
+        segmentsCache.setObject(CacheEntry(segs), forKey: id as NSString)
+        return segs
     }
 
     /// Per-channel RSS is cheap and needs no login, unlike the real subscription feed.

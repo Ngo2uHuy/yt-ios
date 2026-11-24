@@ -364,6 +364,7 @@ struct PlayerArea: View {
                             duration: pm.duration,
                             chapters: pm.chapters,
                             storyboard: pm.storyboard,
+                            segments: pm.segments,
                             onSeek: { s in pm.seek(to: s) },
                             onScrubStart: { hideTask?.cancel() },
                             onScrubEnd: { scheduleHide() }
@@ -511,6 +512,7 @@ struct YouTubeInteractiveScrubber: View {
     let duration: Double
     var chapters: [Chapter] = []
     var storyboard: Storyboard? = nil
+    var segments: [SponsorSegment] = []
     var onSeek: (Double) -> Void
     var onScrubStart: () -> Void
     var onScrubEnd: () -> Void
@@ -538,6 +540,20 @@ struct YouTubeInteractiveScrubber: View {
                 Capsule()
                     .fill(Color.red)
                     .frame(width: max(0, width * CGFloat(progress)), height: trackHeight)
+
+                // SponsorBlock highlighted segments on track
+                ForEach(segments.indices, id: \.self) { idx in
+                    let seg = segments[idx]
+                    if seg.end > seg.start && seg.start < total {
+                        let segStart = max(0, seg.start / total)
+                        let segEnd = min(1.0, seg.end / total)
+                        let segWidth = max(2, width * CGFloat(segEnd - segStart))
+                        Capsule()
+                            .fill(Color.green.opacity(0.85))
+                            .frame(width: segWidth, height: trackHeight)
+                            .offset(x: width * CGFloat(segStart))
+                    }
+                }
 
                 // Chapter tick notches along the track
                 ForEach(chapters.indices, id: \.self) { idx in
@@ -612,6 +628,7 @@ struct YouTubeInteractiveScrubber: View {
         let previewWidth: CGFloat = storyboard != nil ? CGFloat(storyboard!.width) : 130
         let clampedCenterX = min(max(previewWidth / 2 + 6, thumbX), width - previewWidth / 2 - 6)
         let currentChapter = Chapter.at(effectiveTime, in: chapters)
+        let currentSponsor = segments.first(where: { effectiveTime >= $0.start && effectiveTime <= $0.end })
 
         VStack(spacing: 4) {
             if let sb = storyboard {
@@ -624,6 +641,12 @@ struct YouTubeInteractiveScrubber: View {
                     Text(currentChapter.title)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                if let currentSponsor {
+                    Text("🛡️ \(currentSponsor.label)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Color.green)
                         .lineLimit(1)
                 }
                 Text(Fmt.time(effectiveTime))

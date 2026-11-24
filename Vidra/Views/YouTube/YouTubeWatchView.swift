@@ -595,7 +595,7 @@ struct YouTubeWatchDetails: View {
                 .fill(Color.primary.opacity(0.15))
                 .frame(width: 1, height: 16)
 
-            // Nút Không thích
+            // Nút Không thích hiển thị chính xác lượt Dislike từ Return YouTube Dislike API
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 if userDisliked {
@@ -605,12 +605,18 @@ struct YouTubeWatchDetails: View {
                     userLiked = false
                 }
             } label: {
-                Image(systemName: userDisliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
-                    .font(.subheadline)
-                    .foregroundStyle(userDisliked ? Color.blue : Color.primary)
-                    .padding(.leading, 10)
-                    .padding(.trailing, 14)
-                    .padding(.vertical, 8)
+                HStack(spacing: 5) {
+                    Image(systemName: userDisliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+                        .font(.subheadline)
+                    if !displayDislikeCount.isEmpty {
+                        Text(displayDislikeCount)
+                            .font(.subheadline.weight(.medium))
+                    }
+                }
+                .foregroundStyle(userDisliked ? Color.blue : Color.primary)
+                .padding(.leading, 10)
+                .padding(.trailing, 14)
+                .padding(.vertical, 8)
             }
             .buttonStyle(SpringPressButtonStyle())
         }
@@ -621,6 +627,14 @@ struct YouTubeWatchDetails: View {
         let base = votes?.likes ?? 0
         let total = base + (userLiked ? 1 : 0)
         return total > 0 ? Fmt.count(total) : "Thích"
+    }
+
+    private var displayDislikeCount: String {
+        if let d = votes?.dislikes {
+            let total = d + (userDisliked ? 1 : 0)
+            return total > 0 ? Fmt.count(total) : ""
+        }
+        return userDisliked ? "1" : ""
     }
 
     /// Nút Tải xuống hiển thị tiến trình phần trăm thời gian thực
@@ -1029,11 +1043,16 @@ struct YouTubeDescriptionSheet: View {
                         .font(.headline)
                         .foregroundStyle(.primary)
 
-                    // Hộp thông số thống kê (Lượt thích, Lượt xem, Ngày đăng)
+                    // Hộp thông số thống kê (Lượt thích, Không thích, Lượt xem, Ngày đăng)
                     HStack(spacing: 0) {
                         statCell(
                             title: votes != nil ? Fmt.count(votes!.likes) : "Thích",
                             subtitle: "Lượt thích"
+                        )
+                        Divider().frame(height: 28)
+                        statCell(
+                            title: votes != nil ? Fmt.count(votes!.dislikes) : "–",
+                            subtitle: "Không thích"
                         )
                         Divider().frame(height: 28)
                         statCell(

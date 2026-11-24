@@ -49,7 +49,8 @@ final class PlayerManager: NSObject, ObservableObject {
 
     private var sources: [PlaybackSource] = []
     private var sourceIndex = 0
-    private var segments: [SponsorSegment] = []
+    @Published private(set) var segments: [SponsorSegment] = []
+    private var lastSkippedSegmentEnd: Double?
     private var backStack: [Video] = []
     private var pendingSeek: Double?
     private var lastSaved: Double = 0
@@ -450,6 +451,7 @@ final class PlayerManager: NSObject, ObservableObject {
             related = []
             commentsToken = nil
             segments = []
+            lastSkippedSegmentEnd = nil
             errorText = nil
             isLoading = p.item.status != .readyToPlay
             currentTime = 0
@@ -484,6 +486,7 @@ final class PlayerManager: NSObject, ObservableObject {
         related = []
         commentsToken = nil
         segments = []
+        lastSkippedSegmentEnd = nil
         captionTracks = []
         selectedCaption = nil
         activeCueText = nil
@@ -604,7 +607,7 @@ final class PlayerManager: NSObject, ObservableObject {
             related = upNext
             commentsToken = token
         }
-        if Pref.sponsorBlock, video.source == nil || video.source == .ytMusic {
+        if Pref.sponsorBlock {
             Task {
                 let s = await Extras.segments(video.id)
                 if current?.id == video.id { segments = s }
@@ -953,9 +956,14 @@ final class PlayerManager: NSObject, ObservableObject {
         } else if activeCueText != nil {
             activeCueText = nil
         }
-        if Pref.sponsorBlock, let seg = segments.first(where: { t >= $0.start && t < $0.end - 1 }) {
-            seek(to: seg.end)
-            showToast("Đã bỏ qua: \(seg.label)")
+        if Pref.sponsorBlock, let seg = segments.first(where: { t >= ($0.start - 0.2) && t < ($0.end - 0.3) }) {
+            if lastSkippedSegmentEnd != seg.end {
+                lastSkippedSegmentEnd = seg.end
+                seek(to: seg.end)
+                showToast("Đã tự động bỏ qua: \(seg.label)")
+            }
+        } else if let l = lastSkippedSegmentEnd, t >= l + 0.5 || t < l - 2 {
+            lastSkippedSegmentEnd = nil
         }
         if abs(t - lastSaved) >= 30 { savePosition(persist: false) }
         if duration > 0 && currentTime >= duration - 15 {
