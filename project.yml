@@ -3,11 +3,17 @@ options:
   bundleIdPrefix: com.vidra
   deploymentTarget:
     iOS: "16.0"
+packages:
+  SpotifyiOS:
+    url: https://github.com/spotify/ios-sdk
+    exactVersion: 5.0.1
 targets:
   Vidra:
     type: application
     platform: iOS
     sources: [Vidra]
+    dependencies:
+      - package: SpotifyiOS
     info:
       path: Vidra/Info.plist
       properties:
@@ -27,6 +33,8 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: com.vidra.app
             CFBundleURLSchemes: [vidra]
+        LSApplicationQueriesSchemes:
+          - spotify
         # Required for playback with the screen off / app in background.
         UIBackgroundModes: [audio]
         UISupportedInterfaceOrientations:
@@ -51,3 +59,4 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_STYLE: Automatic
+        OTHER_LDFLAGS: ["$(inherited)", "-ObjC"]

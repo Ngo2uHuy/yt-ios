@@ -14,6 +14,9 @@ struct VidraApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .onOpenURL { url in
+                    SpotifyRemote.shared.handleURL(url)
+                }
         }
         .onChange(of: scenePhase) { phase in
             if phase == .background {

@@ -41,6 +41,11 @@ final class PlayerManager: NSObject, ObservableObject {
         return audioOnly || Pref.musicAudioOnly
     }
 
+    /// Whether current track is playing directly through the Spotify App Remote.
+    var isUsingSpotifyRemote: Bool {
+        current?.source == .spotify && SpotifyRemote.shared.isAvailable && SpotifyRemote.shared.isConnected
+    }
+
     private var sources: [PlaybackSource] = []
     private var sourceIndex = 0
     private var segments: [SponsorSegment] = []
@@ -86,9 +91,15 @@ final class PlayerManager: NSObject, ObservableObject {
         if showWatchSheet {
             showWatch = true
         }
-        if current?.id == video.id, player.currentItem != nil {
-            player.play()
-            return
+        if current?.id == video.id {
+            if isUsingSpotifyRemote {
+                SpotifyRemote.shared.resume()
+                return
+            }
+            if player.currentItem != nil {
+                player.play()
+                return
+            }
         }
         if let c = current {
             savePosition()
@@ -102,6 +113,10 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     func togglePlay() {
+        if isUsingSpotifyRemote {
+            SpotifyRemote.shared.togglePlay()
+            return
+        }
         if isPlaying {
             player.pause()
         } else if player.currentItem == nil, let v = current {
@@ -116,6 +131,12 @@ final class PlayerManager: NSObject, ObservableObject {
     func seek(to seconds: Double) {
         let target = max(0, duration > 0 ? min(seconds, duration - 0.5) : seconds)
         currentTime = target
+
+        if isUsingSpotifyRemote {
+            SpotifyRemote.shared.seek(to: target)
+            updateNowPlaying()
+            return
+        }
 
         // If player has an active item, seek directly in AVPlayer for zero-latency response
         if player.currentItem != nil {
@@ -274,6 +295,9 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     func close() {
+        if isUsingSpotifyRemote {
+            SpotifyRemote.shared.pause()
+        }
         savePosition(persist: true)
         loadTask?.cancel()
         captionTask?.cancel()
@@ -324,6 +348,9 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     private func start(_ video: Video) {
+        if video.source != .spotify && SpotifyRemote.shared.isConnected {
+            SpotifyRemote.shared.pause()
+        }
         loadTask?.cancel()
         captionTask?.cancel()
 
@@ -400,6 +427,19 @@ final class PlayerManager: NSObject, ObservableObject {
         let wantsAudioOnly = self.audioOnly || (video.source != nil && Pref.musicAudioOnly)
 
         loadTask = Task {
+            if video.source == .spotify && SpotifyRemote.shared.isAvailable {
+                let directSuccess = await SpotifyRemote.shared.play(trackId: video.id, video: video)
+                if directSuccess {
+                    guard !Task.isCancelled else { return }
+                    self.isLoading = false
+                    self.isPlaying = true
+                    self.currentTime = 0
+                    self.duration = Fmt.seconds(video.duration) ?? 0
+                    self.updateNowPlaying()
+                    Library.shared.addHistory(video)
+                    return
+                }
+            }
             if let file = DownloadManager.shared.localFile(for: video.id) {
                 sources = [.file(file)]
                 Library.shared.addHistory(video)
@@ -706,6 +746,15 @@ final class PlayerManager: NSObject, ObservableObject {
         next(auto: true)
     }
 
+    func syncFromSpotifyRemote(isPaused: Bool, position: Double, duration: Double, title: String, artist: String) {
+        guard current?.source == .spotify else { return }
+        self.isPlaying = !isPaused
+        self.currentTime = position
+        if duration > 0 { self.duration = duration }
+        self.isLoading = false
+        updateNowPlaying()
+    }
+
     private func showToast(_ text: String) {
         toast = text
         toastTask?.cancel()
@@ -720,11 +769,23 @@ final class PlayerManager: NSObject, ObservableObject {
     private func setupRemoteCommands() {
         let c = MPRemoteCommandCenter.shared()
         c.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.player.play() }
+            Task { @MainActor in
+                if self?.isUsingSpotifyRemote == true {
+                    SpotifyRemote.shared.resume()
+                } else {
+                    self?.player.play()
+                }
+            }
             return .success
         }
         c.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.player.pause() }
+            Task { @MainActor in
+                if self?.isUsingSpotifyRemote == true {
+                    SpotifyRemote.shared.pause()
+                } else {
+                    self?.player.pause()
+                }
+            }
             return .success
         }
         c.togglePlayPauseCommand.addTarget { [weak self] _ in

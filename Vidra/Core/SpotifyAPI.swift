@@ -89,7 +89,7 @@ final class SpotifyAuth: ObservableObject {
     }
 
     static let redirectURI = "vidra://spotify-callback"
-    private static let scopes = "user-library-read playlist-read-private playlist-read-collaborative user-follow-read user-top-read user-read-recently-played user-read-private"
+    private static let scopes = "user-library-read playlist-read-private playlist-read-collaborative user-follow-read user-top-read user-read-recently-played user-read-private app-remote-control streaming user-read-playback-state user-modify-playback-state"
     private static let clientIdKey = "spotifyClientId"
 
     @Published var clientId: String {
