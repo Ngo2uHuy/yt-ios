@@ -736,10 +736,25 @@ final class PlayerManager: NSObject, ObservableObject {
         }
         nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             guard let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  AVAudioSession.InterruptionType(rawValue: typeRaw) == .ended,
-                  let optRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
-                  AVAudioSession.InterruptionOptions(rawValue: optRaw).contains(.shouldResume) else { return }
-            Task { @MainActor in self?.player.play() }
+                  let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+            if type == .began {
+                Task { @MainActor in self?.player.pause() }
+            } else if type == .ended {
+                let optRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                if AVAudioSession.InterruptionOptions(rawValue: optRaw).contains(.shouldResume) {
+                    Task { @MainActor in self?.player.play() }
+                }
+            }
+        }
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  let reasonValue = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+            if reason == .oldDeviceUnavailable {
+                Task { @MainActor in
+                    self.player.pause()
+                }
+            }
         }
     }
 
