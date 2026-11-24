@@ -28,6 +28,9 @@ final class SpotifyRemote: NSObject, ObservableObject {
 
     private let redirectURI = URL(string: SpotifyAuth.redirectURI)!
     private var pendingURI: String?
+    private var progressTask: Task<Void, Never>?
+    private var lastStateTimestamp: Date = Date()
+    private var basePosition: Double = 0
 
     #if canImport(SpotifyiOS)
     private var appRemote: SPTAppRemote?
@@ -106,6 +109,9 @@ final class SpotifyRemote: NSObject, ObservableObject {
                         self?.artistTitle = video.channelTitle
                         self?.duration = Fmt.seconds(video.duration) ?? 0
                         self?.isPaused = false
+                        self?.basePosition = 0
+                        self?.lastStateTimestamp = Date()
+                        self?.startProgressTimer()
                         cont.resume(returning: true)
                     }
                 }
@@ -167,6 +173,7 @@ final class SpotifyRemote: NSObject, ObservableObject {
     }
 
     func pause() {
+        stopProgressTimer()
         #if canImport(SpotifyiOS)
         appRemote?.playerAPI?.pause { [weak self] _, error in
             if error == nil { self?.isPaused = true }
@@ -175,6 +182,9 @@ final class SpotifyRemote: NSObject, ObservableObject {
     }
 
     func resume() {
+        basePosition = position
+        lastStateTimestamp = Date()
+        startProgressTimer()
         #if canImport(SpotifyiOS)
         appRemote?.playerAPI?.resume { [weak self] _, error in
             if error == nil { self?.isPaused = false }
@@ -187,10 +197,12 @@ final class SpotifyRemote: NSObject, ObservableObject {
     }
 
     func seek(to seconds: Double) {
+        basePosition = seconds
+        lastStateTimestamp = Date()
+        position = seconds
         #if canImport(SpotifyiOS)
         let ms = Int(seconds * 1000)
         appRemote?.playerAPI?.seekToPosition(ms, callback: nil)
-        position = seconds
         #endif
     }
 
@@ -204,6 +216,35 @@ final class SpotifyRemote: NSObject, ObservableObject {
         #if canImport(SpotifyiOS)
         appRemote?.playerAPI?.skipToPrevious(nil)
         #endif
+    }
+
+    func stopProgressTimer() {
+        progressTask?.cancel()
+        progressTask = nil
+    }
+
+    func startProgressTimer() {
+        stopProgressTimer()
+        lastStateTimestamp = Date()
+        basePosition = position
+        progressTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self, !self.isPaused else { break }
+                let elapsed = Date().timeIntervalSince(self.lastStateTimestamp)
+                let currentPos = self.basePosition + elapsed
+                let capped = self.duration > 0 ? min(currentPos, self.duration) : currentPos
+                self.position = capped
+                PlayerManager.shared.syncFromSpotifyRemote(
+                    isPaused: self.isPaused,
+                    position: capped,
+                    duration: self.duration,
+                    title: self.trackTitle,
+                    artist: self.artistTitle,
+                    uri: self.currentTrackURI
+                )
+            }
+        }
     }
 
     /// Handles incoming deep links (vidra://spotify-callback) when returning from Spotify.
@@ -251,6 +292,7 @@ extension SpotifyRemote: SPTAppRemoteDelegate {
 
     nonisolated func appRemote(_ appRemote: SPTAppRemote, didDisconnectWithError error: Error?) {
         Task { @MainActor in
+            self.stopProgressTimer()
             self.isConnected = false
             self.isConnecting = false
             self.lastError = error?.localizedDescription
@@ -262,12 +304,20 @@ extension SpotifyRemote: SPTAppRemotePlayerStateDelegate {
     nonisolated func playerStateDidChange(_ playerState: SPTAppRemotePlayerState) {
         Task { @MainActor in
             self.isPaused = playerState.isPaused
-            self.position = Double(playerState.playbackPosition) / 1000.0
+            self.basePosition = Double(playerState.playbackPosition) / 1000.0
+            self.position = self.basePosition
+            self.lastStateTimestamp = Date()
             self.duration = Double(playerState.track.duration) / 1000.0
             self.trackTitle = playerState.track.name
             self.artistTitle = playerState.track.artist.name
             self.albumTitle = playerState.track.album.name
             self.currentTrackURI = playerState.track.uri
+
+            if !playerState.isPaused {
+                self.startProgressTimer()
+            } else {
+                self.stopProgressTimer()
+            }
 
             // Synchronize with Vidra's PlayerManager
             PlayerManager.shared.syncFromSpotifyRemote(
@@ -275,7 +325,8 @@ extension SpotifyRemote: SPTAppRemotePlayerStateDelegate {
                 position: self.position,
                 duration: self.duration,
                 title: playerState.track.name,
-                artist: playerState.track.artist.name
+                artist: playerState.track.artist.name,
+                uri: playerState.track.uri
             )
         }
     }

@@ -15,6 +15,7 @@ final class HLSServer: @unchecked Sendable {
     private var routes: [String: (contentType: String, data: Data)] = [:]
     private var dynamicRoutes: [String: DynamicRouteHandler] = [:]
     private var routeKeys: [String] = [] // LRU tracking
+    private var dynamicRouteKeys: [String] = [] // LRU tracking for dynamic live routes
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "vidra.hls.server", qos: .userInitiated)
 
@@ -74,6 +75,15 @@ final class HLSServer: @unchecked Sendable {
         dynamicRoutes[path] = handler
         let decoded = path.removingPercentEncoding ?? path
         if decoded != path { dynamicRoutes[decoded] = handler }
+        if let existing = dynamicRouteKeys.firstIndex(of: path) {
+            dynamicRouteKeys.remove(at: existing)
+        }
+        dynamicRouteKeys.append(path)
+        while dynamicRouteKeys.count > 20 {
+            let old = dynamicRouteKeys.removeFirst()
+            dynamicRoutes.removeValue(forKey: old)
+            dynamicRoutes.removeValue(forKey: old.removingPercentEncoding ?? old)
+        }
         lock.unlock()
         return URL(string: "http://127.0.0.1:\(p)\(path)")
     }

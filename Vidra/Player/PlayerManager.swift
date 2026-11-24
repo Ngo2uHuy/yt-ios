@@ -215,6 +215,10 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     func next(auto: Bool = false) {
+        if isUsingSpotifyRemote && queue.isEmpty {
+            SpotifyRemote.shared.next()
+            return
+        }
         guard let c = current else { return }
         var candidate: Video?
         if !queue.isEmpty {
@@ -230,6 +234,10 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     func previous() {
+        if isUsingSpotifyRemote && currentTime <= 5 && backStack.isEmpty {
+            SpotifyRemote.shared.previous()
+            return
+        }
         guard currentTime <= 5, let v = backStack.popLast() else {
             seek(to: 0)
             return
@@ -746,12 +754,20 @@ final class PlayerManager: NSObject, ObservableObject {
         next(auto: true)
     }
 
-    func syncFromSpotifyRemote(isPaused: Bool, position: Double, duration: Double, title: String, artist: String) {
+    func syncFromSpotifyRemote(isPaused: Bool, position: Double, duration: Double, title: String, artist: String, uri: String? = nil) {
         guard current?.source == .spotify else { return }
         self.isPlaying = !isPaused
         self.currentTime = position
         if duration > 0 { self.duration = duration }
         self.isLoading = false
+        if let uri, let c = current, !title.isEmpty, c.id != uri {
+            var updated = c
+            updated.id = uri
+            updated.title = title
+            updated.channelTitle = artist
+            updated.duration = Fmt.time(duration)
+            self.current = updated
+        }
         updateNowPlaying()
     }
 
