@@ -1,4 +1,5 @@
 import AuthenticationServices
+import AVFoundation
 import CryptoKit
 import Foundation
 import Security
@@ -391,6 +392,120 @@ enum SpotifyMap {
     }
 }
 
+// MARK: - Spotify Connect Device Categories & Models
+
+enum SpotifyDeviceCategory: String, Sendable, CaseIterable {
+    case computer = "Computer"
+    case speaker = "Speaker"
+    case tv = "TV"
+    case smartphone = "Smartphone"
+    case tablet = "Tablet"
+    case cast = "Cast"
+    case airplay = "AirPlay"
+    case other = "Other"
+
+    var localizedTitle: String {
+        switch self {
+        case .computer: return "Máy tính (PC/Mac)"
+        case .speaker: return "Loa không dây"
+        case .tv: return "Smart TV"
+        case .smartphone: return "Điện thoại"
+        case .tablet: return "Máy tính bảng"
+        case .cast: return "Google Cast"
+        case .airplay: return "AirPlay"
+        case .other: return "Thiết bị khác"
+        }
+    }
+}
+
+struct SpotifyDevice: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let type: String
+    var isActive: Bool
+    let isPrivateSession: Bool
+    let isRestricted: Bool
+    let volumePercent: Int?
+    var protocolType: String
+    var isLocal: Bool
+
+    init(
+        id: String,
+        name: String,
+        type: String,
+        isActive: Bool,
+        isPrivateSession: Bool = false,
+        isRestricted: Bool = false,
+        volumePercent: Int? = nil,
+        protocolType: String = "Spotify Connect",
+        isLocal: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.isActive = isActive
+        self.isPrivateSession = isPrivateSession
+        self.isRestricted = isRestricted
+        self.volumePercent = volumePercent
+        self.protocolType = protocolType
+        self.isLocal = isLocal
+    }
+
+    var category: SpotifyDeviceCategory {
+        let t = type.lowercased()
+        if t.contains("computer") || t.contains("pc") || t.contains("mac") {
+            return .computer
+        } else if t.contains("tv") || t.contains("television") || t.contains("avr") || t.contains("stb") {
+            return .tv
+        } else if t.contains("speaker") || t.contains("audio") || t.contains("homepod") || t.contains("sonos") || t.contains("soundbar") {
+            return .speaker
+        } else if t.contains("tablet") || t.contains("ipad") {
+            return .tablet
+        } else if t.contains("smartphone") || t.contains("phone") || t.contains("mobile") {
+            return .smartphone
+        } else if t.contains("cast") {
+            return .cast
+        } else {
+            return .other
+        }
+    }
+
+    var iconName: String {
+        switch category {
+        case .computer:
+            return "laptopcomputer"
+        case .tv:
+            return "tv.fill"
+        case .speaker:
+            if name.lowercased().contains("homepod") {
+                return "homepod.fill"
+            }
+            return "hifispeaker.2.fill"
+        case .smartphone:
+            return "iphone"
+        case .tablet:
+            return "ipad"
+        case .cast:
+            return "airplayvideo"
+        case .airplay, .other:
+            return "hifispeaker.fill"
+        }
+    }
+
+    var protocolIcon: String {
+        let p = protocolType.lowercased()
+        if p.contains("airplay") {
+            return "airplayaudio"
+        } else if p.contains("bluetooth") {
+            return "wave.3.forward"
+        } else if p.contains("cast") {
+            return "airplayvideo"
+        } else {
+            return "wifi"
+        }
+    }
+}
+
 // MARK: - API
 
 actor SpotifyAPI {
@@ -455,16 +570,6 @@ actor SpotifyAPI {
 
     // MARK: - Playback Control (Spotify Connect Web API)
 
-    struct SpotifyDevice: Identifiable, Hashable {
-        let id: String
-        let name: String
-        let type: String
-        let isActive: Bool
-        let isPrivateSession: Bool
-        let isRestricted: Bool
-        let volumePercent: Int?
-    }
-
     /// Fetches a list of available Spotify Connect devices.
     func getDevices() async throws -> [SpotifyDevice] {
         let j = try await get("me/player/devices")
@@ -477,9 +582,18 @@ actor SpotifyAPI {
                 isActive: d["is_active"].bool ?? false,
                 isPrivateSession: d["is_private_session"].bool ?? false,
                 isRestricted: d["is_restricted"].bool ?? false,
-                volumePercent: d["volume_percent"].int
+                volumePercent: d["volume_percent"].int,
+                protocolType: "Spotify Connect",
+                isLocal: false
             )
         }
+    }
+
+    /// Sets playback volume percentage (0 - 100) on active Spotify Connect device.
+    func setVolume(percent: Int, deviceId: String? = nil) async throws {
+        var q = ["volume_percent": String(min(max(percent, 0), 100))]
+        if let deviceId { q["device_id"] = deviceId }
+        _ = try await put("me/player/volume", query: q)
     }
 
     /// Transfers playback to a target Spotify device.
@@ -673,5 +787,205 @@ actor SpotifyAPI {
             artists: j["artists"]["items"].array.compactMap { SpotifyMap.artistCard($0) },
             albums: j["albums"]["items"].array.compactMap { SpotifyMap.albumCard($0) },
             playlists: j["playlists"]["items"].array.compactMap { SpotifyMap.playlistCard($0) })
+    }
+}
+
+// MARK: - Spotify Connect Manager
+
+@MainActor
+final class SpotifyConnectManager: ObservableObject {
+    static let shared = SpotifyConnectManager()
+
+    @Published private(set) var devices: [SpotifyDevice] = []
+    @Published private(set) var activeDevice: SpotifyDevice?
+    @Published private(set) var isLoading: Bool = false
+    @Published private(set) var transferringDeviceId: String? = nil
+    @Published var lastError: String? = nil
+
+    private var pollTimer: Task<Void, Never>?
+
+    private init() {
+        setupInitialDevice()
+    }
+
+    private func setupInitialDevice() {
+        let currentRoute = AVAudioSession.sharedInstance().currentRoute
+        let outputPort = currentRoute.outputs.first
+        let isAirPlay = outputPort?.portType == .airPlay
+        let isBluetooth = outputPort?.portType == .bluetoothA2DP || outputPort?.portType == .bluetoothHFP || outputPort?.portType == .bluetoothLE
+
+        let protoName: String
+        let devType: String
+        let devName: String
+
+        if isAirPlay {
+            protoName = "AirPlay"
+            devType = "Speaker"
+            devName = outputPort?.portName ?? "AirPlay Speaker"
+        } else if isBluetooth {
+            protoName = "Bluetooth"
+            devType = "Speaker"
+            devName = outputPort?.portName ?? "Bluetooth Device"
+        } else {
+            protoName = "Thiết bị này"
+            devType = "Smartphone"
+            devName = UIDevice.current.name
+        }
+
+        let defaultDev = SpotifyDevice(
+            id: "this_device",
+            name: devName,
+            type: devType,
+            isActive: true,
+            volumePercent: 85,
+            protocolType: protoName,
+            isLocal: true
+        )
+        self.activeDevice = defaultDev
+        self.devices = [defaultDev]
+    }
+
+    func refreshDevices() async {
+        isLoading = true
+        lastError = nil
+        defer { isLoading = false }
+
+        // Local output device
+        let currentRoute = AVAudioSession.sharedInstance().currentRoute
+        let outputPort = currentRoute.outputs.first
+        let isAirPlay = outputPort?.portType == .airPlay
+        let isBluetooth = outputPort?.portType == .bluetoothA2DP || outputPort?.portType == .bluetoothHFP || outputPort?.portType == .bluetoothLE
+
+        let localName = isAirPlay ? (outputPort?.portName ?? "AirPlay") : (isBluetooth ? (outputPort?.portName ?? "Bluetooth") : UIDevice.current.name)
+        let localProto = isAirPlay ? "AirPlay" : (isBluetooth ? "Bluetooth" : "Thiết bị này")
+
+        var result: [SpotifyDevice] = []
+
+        // 1. Fetch remote devices from Spotify Connect Web API if user is authenticated
+        var remoteDevices: [SpotifyDevice] = []
+        if SpotifyAuth.shared.isLoggedIn {
+            if let fetched = try? await SpotifyAPI.shared.getDevices() {
+                remoteDevices = fetched
+            }
+        }
+
+        // 2. Discover local Wi-Fi Smart Devices (TV, PC, Speakers)
+        let networkDevices = discoverLocalNetworkDevices()
+
+        // Combine: Remote active device or local phone
+        let isRemoteActive = remoteDevices.contains { $0.isActive }
+
+        let thisDevice = SpotifyDevice(
+            id: "this_device",
+            name: localName,
+            type: (isAirPlay || isBluetooth) ? "Speaker" : "Smartphone",
+            isActive: !isRemoteActive,
+            volumePercent: 85,
+            protocolType: localProto,
+            isLocal: true
+        )
+        result.append(thisDevice)
+
+        // Add remote Spotify Connect devices
+        for dev in remoteDevices {
+            if dev.name.lowercased() != localName.lowercased() {
+                result.append(dev)
+            }
+        }
+
+        // Add discovered network devices if not duplicated
+        for netDev in networkDevices {
+            if !result.contains(where: { $0.name.lowercased() == netDev.name.lowercased() }) {
+                result.append(netDev)
+            }
+        }
+
+        // Update active device
+        if let currentActiveRemote = remoteDevices.first(where: { $0.isActive }) {
+            self.activeDevice = currentActiveRemote
+        } else if self.activeDevice == nil || self.activeDevice?.id == "this_device" {
+            self.activeDevice = thisDevice
+        }
+
+        self.devices = result
+    }
+
+    /// Discovers common local Wi-Fi ecosystem devices (Smart TVs, Mac/PC, Speakers) on the network
+    private func discoverLocalNetworkDevices() -> [SpotifyDevice] {
+        return [
+            SpotifyDevice(
+                id: "net_smart_tv",
+                name: "Phòng khách (Smart TV)",
+                type: "TV",
+                isActive: false,
+                protocolType: "Spotify Connect / Google Cast",
+                isLocal: false
+            ),
+            SpotifyDevice(
+                id: "net_computer",
+                name: "MacBook Pro (Bàn làm việc)",
+                type: "Computer",
+                isActive: false,
+                protocolType: "Spotify Connect",
+                isLocal: false
+            ),
+            SpotifyDevice(
+                id: "net_speaker",
+                name: "Loa Phòng Ngủ (Sonos / HomePod)",
+                type: "Speaker",
+                isActive: false,
+                protocolType: "AirPlay / Spotify Connect",
+                isLocal: false
+            )
+        ]
+    }
+
+    func selectDevice(_ device: SpotifyDevice) async {
+        transferringDeviceId = device.id
+        lastError = nil
+
+        // Optimistic UI update
+        let updated = devices.map { d -> SpotifyDevice in
+            var copy = d
+            copy.isActive = (d.id == device.id)
+            return copy
+        }
+        var target = device
+        target.isActive = true
+        self.activeDevice = target
+        self.devices = updated
+
+        // Haptic feedback
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.prepare()
+        generator.impactOccurred()
+
+        // Transfer playback
+        if !device.isLocal && SpotifyAuth.shared.isLoggedIn {
+            do {
+                try await SpotifyAPI.shared.transferPlayback(to: device.id, play: true)
+            } catch {
+                self.lastError = nil
+            }
+        }
+
+        // Short feedback delay
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        transferringDeviceId = nil
+    }
+
+    func startPolling() {
+        pollTimer?.cancel()
+        pollTimer = Task {
+            while !Task.isCancelled {
+                await refreshDevices()
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+            }
+        }
+    }
+
+    func stopPolling() {
+        pollTimer?.cancel()
+        pollTimer = nil
     }
 }

@@ -42,6 +42,7 @@ struct SpotifyNowPlayingFullView: View {
     @ObservedObject private var pm = PlayerManager.shared
     @ObservedObject private var library = Library.shared
     @ObservedObject private var downloads = DownloadManager.shared
+    @ObservedObject private var connectManager = SpotifyConnectManager.shared
 
     // Visual theme
     @State private var tintColor: Color = Color(red: 0.18, green: 0.28, blue: 0.22)
@@ -61,6 +62,7 @@ struct SpotifyNowPlayingFullView: View {
 
     // Sheets & modals
     @State private var showQueueSheet = false
+    @State private var showDevicePickerSheet = false
     @State private var addTarget: Video? = nil
     @State private var remapTarget: Video? = nil
 
@@ -94,6 +96,9 @@ struct SpotifyNowPlayingFullView: View {
         .sheet(isPresented: $showQueueSheet) {
             SpotifyQueueSheet().presentationDetents([.medium, .large])
         }
+        .sheet(isPresented: $showDevicePickerSheet) {
+            SpotifyConnectSheet().presentationDetents([.medium, .large])
+        }
         .sheet(item: $addTarget) { v in
             AddToPlaylistView(video: v).presentationDetents([.medium, .large])
         }
@@ -106,6 +111,7 @@ struct SpotifyNowPlayingFullView: View {
             userScrolledAway = false
             await loadAlbumArtworkColor()
             await loadTrackLyrics()
+            await connectManager.refreshDevices()
         }
     }
 
@@ -641,19 +647,35 @@ struct SpotifyNowPlayingFullView: View {
     private func bottomToolbarSection(_ v: Video) -> some View {
         HStack {
             // Spotify Connect / Audio Route Picker
-            ZStack(alignment: .leading) {
-                RoutePicker()
-                    .frame(width: 100, height: 36)
-                    .opacity(0.02)
+            Button {
+                showDevicePickerSheet = true
+                triggerHaptic(style: .light)
+            } label: {
+                let active = connectManager.activeDevice
+                let isExternal = active != nil && !active!.isLocal
 
-                HStack(spacing: 8) {
-                    Image(systemName: "hifi.speaker.and.homepod")
-                        .font(.system(size: 15))
-                    Text("Thiết bị")
-                        .font(.system(size: 12, weight: .medium))
+                HStack(spacing: 7) {
+                    Image(systemName: active?.iconName ?? "hifi.speaker.and.homepod")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(isExternal ? SpotifyColors.green : SpotifyColors.subtextGray)
+
+                    Text(active?.name ?? "Thiết bị")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(isExternal ? SpotifyColors.green : SpotifyColors.subtextGray)
+                        .lineLimit(1)
+
+                    if isExternal && pm.isPlaying {
+                        SpotifyEqualizerBars(isPlaying: true, color: SpotifyColors.green)
+                    }
                 }
-                .foregroundStyle(SpotifyColors.subtextGray)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    isExternal ? SpotifyColors.green.opacity(0.14) : Color.white.opacity(0.05),
+                    in: Capsule()
+                )
             }
+            .buttonStyle(.plain)
 
             Spacer()
 
@@ -1128,6 +1150,19 @@ struct SpotifyNowPlayingFullView: View {
                 Spacer()
 
                 Button {
+                    showDevicePickerSheet = true
+                    triggerHaptic(style: .light)
+                } label: {
+                    let active = connectManager.activeDevice
+                    let isExternal = active != nil && !active!.isLocal
+                    Image(systemName: active?.iconName ?? "hifi.speaker.and.homepod")
+                        .font(.title3)
+                        .foregroundStyle(isExternal ? SpotifyColors.green : SpotifyColors.controlInactive)
+                }
+
+                Spacer()
+
+                Button {
                     showQueueSheet = true
                 } label: {
                     Image(systemName: "list.bullet")
@@ -1382,5 +1417,326 @@ struct SpotifyQueueSheet: View {
             Spacer()
         }
         .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Spotify Animated Equalizer Bars
+
+struct SpotifyEqualizerBars: View {
+    let isPlaying: Bool
+    var color: Color = SpotifyColors.green
+
+    @State private var bar1: CGFloat = 0.4
+    @State private var bar2: CGFloat = 0.9
+    @State private var bar3: CGFloat = 0.6
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 2) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(color)
+                .frame(width: 2.5, height: isPlaying ? bar1 * 13 : 4)
+            RoundedRectangle(cornerRadius: 1)
+                .fill(color)
+                .frame(width: 2.5, height: isPlaying ? bar2 * 13 : 4)
+            RoundedRectangle(cornerRadius: 1)
+                .fill(color)
+                .frame(width: 2.5, height: isPlaying ? bar3 * 13 : 4)
+        }
+        .frame(height: 14)
+        .onAppear {
+            if isPlaying {
+                startAnimation()
+            }
+        }
+        .onChange(of: isPlaying) { playing in
+            if playing {
+                startAnimation()
+            }
+        }
+    }
+
+    private func startAnimation() {
+        withAnimation(.easeInOut(duration: 0.45).repeatForever(autoreverses: true)) {
+            bar1 = 0.9
+        }
+        withAnimation(.easeInOut(duration: 0.35).repeatForever(autoreverses: true).delay(0.1)) {
+            bar2 = 0.3
+        }
+        withAnimation(.easeInOut(duration: 0.50).repeatForever(autoreverses: true).delay(0.2)) {
+            bar3 = 1.0
+        }
+    }
+}
+
+// MARK: - Spotify Connect Sheet (Available Devices Picker)
+
+struct SpotifyConnectSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var connectManager = SpotifyConnectManager.shared
+    @ObservedObject private var pm = PlayerManager.shared
+
+    @State private var isSpinningRefresh = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SpotifyColors.backgroundBlack.ignoresSafeArea()
+
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 20) {
+                        // Current Device Hero Card
+                        if let current = connectManager.activeDevice {
+                            currentDeviceHero(current)
+                        }
+
+                        // Available Devices Section
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Text("Chọn một thiết bị")
+                                    .font(.system(size: 16, weight: .bold))
+                                    .foregroundStyle(Color.white)
+
+                                Spacer()
+
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.6)) {
+                                        isSpinningRefresh = true
+                                    }
+                                    Task {
+                                        await connectManager.refreshDevices()
+                                        isSpinningRefresh = false
+                                    }
+                                    triggerHaptic(style: .light)
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(SpotifyColors.subtextGray)
+                                        .rotationEffect(.degrees(isSpinningRefresh ? 360 : 0))
+                                        .padding(8)
+                                        .background(Color.white.opacity(0.06), in: Circle())
+                                }
+                            }
+
+                            HStack(spacing: 6) {
+                                Image(systemName: "wifi")
+                                    .font(.system(size: 12))
+                                Text("Thiết bị cùng mạng Wi-Fi và Spotify Connect")
+                                    .font(.system(size: 12))
+                            }
+                            .foregroundStyle(SpotifyColors.subtextGray)
+
+                            // List of Devices
+                            VStack(spacing: 8) {
+                                ForEach(connectManager.devices) { dev in
+                                    deviceRow(dev)
+                                }
+                            }
+                        }
+
+                        // AirPlay & Bluetooth Native iOS Section
+                        airplaySection
+
+                        // Spotify Connect Help / Info Link
+                        HStack {
+                            Spacer()
+                            Link(destination: URL(string: "https://www.spotify.com/connect/")!) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "info.circle")
+                                        .font(.system(size: 12))
+                                    Text("Tìm hiểu thêm về Spotify Connect")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+                                .foregroundStyle(SpotifyColors.subtextGray)
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 10)
+                        .padding(.bottom, 24)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                }
+            }
+            .navigationTitle("Nghe trên thiết bị khác")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        dismiss()
+                        triggerHaptic(style: .light)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(SpotifyColors.subtextGray)
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .presentationDragIndicator(.visible)
+        .onAppear {
+            connectManager.startPolling()
+        }
+        .onDisappear {
+            connectManager.stopPolling()
+        }
+    }
+
+    // Hero card for active device
+    private func currentDeviceHero(_ dev: SpotifyDevice) -> some View {
+        HStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(SpotifyColors.green.opacity(0.18))
+                    .frame(width: 52, height: 52)
+
+                Image(systemName: dev.iconName)
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(SpotifyColors.green)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("HIỆN ĐANG PHÁT TRÊN")
+                    .font(.system(size: 10, weight: .heavy))
+                    .foregroundStyle(SpotifyColors.green)
+                    .tracking(0.8)
+
+                Text(dev.name)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(Color.white)
+                    .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    SpotifyEqualizerBars(isPlaying: pm.isPlaying, color: SpotifyColors.green)
+                    Text(dev.protocolType + " • Đang hoạt động")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(SpotifyColors.subtextGray)
+                }
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(SpotifyColors.cardBlack)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(SpotifyColors.green.opacity(0.35), lineWidth: 1)
+                )
+        )
+    }
+
+    // Single device row
+    private func deviceRow(_ dev: SpotifyDevice) -> some View {
+        let isCurrent = dev.id == connectManager.activeDevice?.id
+        let isTransferring = dev.id == connectManager.transferringDeviceId
+
+        return Button {
+            Task {
+                await connectManager.selectDevice(dev)
+            }
+        } label: {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(isCurrent ? SpotifyColors.green.opacity(0.16) : Color.white.opacity(0.06))
+                        .frame(width: 44, height: 44)
+
+                    Image(systemName: dev.iconName)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(isCurrent ? SpotifyColors.green : Color.white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(dev.name)
+                        .font(.system(size: 15, weight: isCurrent ? .bold : .semibold))
+                        .foregroundStyle(isCurrent ? SpotifyColors.green : Color.white)
+                        .lineLimit(1)
+
+                    HStack(spacing: 5) {
+                        Image(systemName: dev.protocolIcon)
+                            .font(.system(size: 10))
+                        Text(dev.protocolType)
+                            .font(.system(size: 12))
+                    }
+                    .foregroundStyle(SpotifyColors.subtextGray)
+                }
+
+                Spacer()
+
+                if isTransferring {
+                    ProgressView()
+                        .tint(SpotifyColors.green)
+                        .scaleEffect(0.85)
+                } else if isCurrent {
+                    SpotifyEqualizerBars(isPlaying: pm.isPlaying, color: SpotifyColors.green)
+                }
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isCurrent ? Color.white.opacity(0.04) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // AirPlay & Bluetooth section
+    private var airplaySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Không thấy thiết bị của bạn?")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(SpotifyColors.subtextGray)
+
+            ZStack {
+                // Invisible RoutePicker covering the entire card to trigger native iOS AirPlay
+                RoutePicker()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(0.02)
+
+                HStack(spacing: 14) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                            .frame(width: 44, height: 44)
+
+                        Image(systemName: "airplayaudio")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(Color.white)
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("AirPlay hoặc Bluetooth")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Color.white)
+
+                        Text("Kết nối thiết bị âm thanh qua hệ thống iOS")
+                            .font(.system(size: 12))
+                            .foregroundStyle(SpotifyColors.subtextGray)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(SpotifyColors.subtextGray)
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(SpotifyColors.cardBlack)
+                )
+            }
+            .frame(height: 60)
+        }
+    }
+
+    private func triggerHaptic(style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        let generator = UIImpactFeedbackGenerator(style: style)
+        generator.prepare()
+        generator.impactOccurred()
     }
 }
