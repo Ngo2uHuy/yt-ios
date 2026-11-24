@@ -829,31 +829,37 @@ struct YouTubeWatchDetails: View {
 
     // MARK: - Video Metadata Loading
 
+    private func fetchVotes(for video: Video) async -> Votes? {
+        if video.source == nil || video.source == .ytMusic {
+            return await Extras.votes(video.id)
+        }
+        return nil
+    }
+
+    private func fetchTopComment(token: String?) async -> (Comment?, String?) {
+        guard let token else { return (nil, nil) }
+        if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
+            return (first, res.items.count > 0 ? "\(res.items.count)+" : nil)
+        }
+        return (nil, nil)
+    }
+
+    private func fetchChannel(id: String?, known: Channel?) async -> Channel? {
+        if let known { return known }
+        guard let id, !id.isEmpty else { return nil }
+        let page = try? await InnerTube.shared.channelVideos(id, continuation: nil)
+        return page?.channel
+    }
+
     private func loadVideoMeta(_ v: Video) {
+        let token = pm.commentsToken
+        let chId = v.channelId
+        let knownSub = chId.flatMap { id in lib.subscriptions.first(where: { $0.id == id }) }
+
         Task {
-            async let votesRes: Votes? = {
-                if v.source == nil || v.source == .ytMusic {
-                    return await Extras.votes(v.id)
-                }
-                return nil
-            }()
-
-            async let commentRes: (Comment?, String?) = {
-                guard let token = pm.commentsToken else { return (nil, nil) }
-                if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
-                    return (first, res.items.count > 0 ? "\(res.items.count)+" : nil)
-                }
-                return (nil, nil)
-            }()
-
-            async let channelRes: Channel? = {
-                guard let chId = v.channelId, !chId.isEmpty else { return nil }
-                if let known = lib.subscriptions.first(where: { $0.id == chId }) {
-                    return known
-                }
-                let page = try? await InnerTube.shared.channelVideos(chId, continuation: nil)
-                return page?.channel
-            }()
+            async let votesRes = fetchVotes(for: v)
+            async let commentRes = fetchTopComment(token: token)
+            async let channelRes = fetchChannel(id: chId, known: knownSub)
 
             let (vRes, cRes, chRes) = await (votesRes, commentRes, channelRes)
             guard pm.current?.id == v.id else { return }
