@@ -1107,7 +1107,11 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     private func loadArtwork(for v: Video) {
-        let urls: [URL] = [
+        var urls: [URL] = []
+        if let local = DownloadManager.shared.localArtwork(for: v.id) {
+            urls.append(local)
+        }
+        urls += [
             v.artwork,
             v.thumbnail,
             URL(string: "https://i.ytimg.com/vi/\(v.id)/maxresdefault.jpg"),

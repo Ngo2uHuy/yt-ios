@@ -653,15 +653,46 @@ struct DownloadsView: View {
             if !dl.active.isEmpty {
                 Section("Đang tải") {
                     ForEach(dl.active.values.sorted { $0.id < $1.id }) { a in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(a.video.title).font(.subheadline).lineLimit(1)
-                                ProgressView(value: a.progress).tint(.red)
-                            }
-                            Button { dl.cancel(a.id) } label: { Image(systemName: "xmark.circle.fill") }
-                                .buttonStyle(.plain)
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(a.video.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                                ProgressView(value: a.progress).tint(a.isPaused ? .orange : .red)
+                                HStack {
+                                    Text(a.isPaused ? "Đã tạm dừng" : "\(Int(a.progress * 100))%")
+                                    Spacer()
+                                    if a.totalBytes > 0 {
+                                        Text("\(ByteCountFormatter.string(fromByteCount: a.downloadedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: a.totalBytes, countStyle: .file))")
+                                    }
+                                }
+                                .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            }
+
+                            // Pause / Resume button
+                            Button {
+                                if a.isPaused {
+                                    dl.resume(a.id)
+                                } else {
+                                    dl.pause(a.id)
+                                }
+                            } label: {
+                                Image(systemName: a.isPaused ? "play.circle.fill" : "pause.circle.fill")
+                                    .font(.title2)
+                                    .foregroundStyle(a.isPaused ? .green : .orange)
+                            }
+                            .buttonStyle(.plain)
+
+                            // Cancel button
+                            Button {
+                                dl.cancel(a.id)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.title2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
                         }
+                        .padding(.vertical, 2)
                     }
                 }
             }
