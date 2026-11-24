@@ -20,12 +20,12 @@ struct VideoSurface: UIViewRepresentable {
         if AVPictureInPictureController.isPictureInPictureSupported(),
            let pip = AVPictureInPictureController(playerLayer: view.playerLayer) {
             pip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
+            pip.requiresLinearPlayback = false
             pip.delegate = context.coordinator
             context.coordinator.pip = pip
             PlayerManager.shared.pipController = pip
         }
         context.coordinator.view = view
-        context.coordinator.observeLifecycle()
         return view
     }
 
@@ -36,37 +36,92 @@ struct VideoSurface: UIViewRepresentable {
         if uiView.playerLayer.videoGravity != gravity {
             uiView.playerLayer.videoGravity = gravity
         }
+        if let pip = context.coordinator.pip {
+            pip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
+            pip.requiresLinearPlayback = false
+            PlayerManager.shared.pipController = pip
+        } else if AVPictureInPictureController.isPictureInPictureSupported(),
+                  let newPip = AVPictureInPictureController(playerLayer: uiView.playerLayer) {
+            newPip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
+            newPip.requiresLinearPlayback = false
+            newPip.delegate = context.coordinator
+            context.coordinator.pip = newPip
+            PlayerManager.shared.pipController = newPip
+        }
     }
 
     final class Coordinator: NSObject, AVPictureInPictureControllerDelegate {
         var pip: AVPictureInPictureController?
         weak var view: PlayerUIView?
-        private var tokens: [NSObjectProtocol] = []
 
-        func observeLifecycle() {
-            let nc = NotificationCenter.default
-            tokens.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.enteredBackground() }
-            })
-            tokens.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.view?.playerLayer.player = PlayerManager.shared.player }
-            })
+        func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
+            Task { @MainActor in
+                PlayerManager.shared.isPiPActive = true
+            }
         }
 
-        /// Detaching the layer is Apple's documented way to keep audio going in background (QA1668).
-        @MainActor private func enteredBackground() {
-            guard let view, !(pip?.isPictureInPictureActive ?? false) else { return }
-            view.playerLayer.player = nil
+        func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+            Task { @MainActor in
+                PlayerManager.shared.isPiPActive = true
+            }
+        }
+
+        func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+            Task { @MainActor in
+                PlayerManager.shared.isPiPActive = false
+            }
+        }
+
+        func pictureInPictureControllerWillStopPictureInPicture(_ controller: AVPictureInPictureController) {
+            Task { @MainActor in
+                PlayerManager.shared.isPiPActive = false
+            }
+        }
+
+        func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+            Task { @MainActor in
+                PlayerManager.shared.isPiPActive = false
+            }
         }
 
         func pictureInPictureController(_ controller: AVPictureInPictureController,
                                         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
-            Task { @MainActor in PlayerManager.shared.showWatch = true }
-            completionHandler(true)
+            Task { @MainActor in
+                PlayerManager.shared.showWatch = true
+                completionHandler(true)
+            }
         }
 
-        deinit {
-            tokens.forEach { NotificationCenter.default.removeObserver($0) }
+        // MARK: - 10-Second Skip & Play/Pause Controls
+
+        func pictureInPictureController(_ controller: AVPictureInPictureController,
+                                        skipByInterval skipInterval: CMTime,
+                                        completion completionHandler: @escaping () -> Void) {
+            let seconds = CMTimeGetSeconds(skipInterval)
+            Task { @MainActor in
+                PlayerManager.shared.seek(by: seconds)
+                completionHandler()
+            }
+        }
+
+        func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
+            Task { @MainActor in
+                if playing {
+                    PlayerManager.shared.resume()
+                } else {
+                    PlayerManager.shared.pause()
+                }
+            }
+        }
+
+        func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
+            let dur = PlayerManager.shared.duration
+            guard dur > 0 else { return CMTimeRange(start: .zero, duration: .indefinite) }
+            return CMTimeRange(start: .zero, duration: CMTime(seconds: dur, preferredTimescale: 600))
+        }
+
+        func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
+            return !PlayerManager.shared.isPlaying
         }
     }
 }
@@ -260,7 +315,11 @@ struct PlayerArea: View {
                     Button(action: onClose) { Image(systemName: "chevron.down") }
                     Spacer()
                     RoutePicker().frame(width: 28, height: 28)
-                    Button { pm.togglePiP() } label: { Image(systemName: "pip.enter") }
+                    if AVPictureInPictureController.isPictureInPictureSupported() {
+                        Button { pm.togglePiP() } label: {
+                            Image(systemName: pm.isPiPActive ? "pip.exit" : "pip.enter")
+                        }
+                    }
                     settingsMenu
                 }
                 .font(.title3)

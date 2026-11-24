@@ -34,6 +34,7 @@ final class PlayerManager: NSObject, ObservableObject {
     @Published var showWatch = false
 
     weak var pipController: AVPictureInPictureController?
+    @Published var isPiPActive = false
 
     /// Audio-only playback shows cover art instead of a (black) video layer.
     var showsArtwork: Bool {
@@ -118,17 +119,31 @@ final class PlayerManager: NSObject, ObservableObject {
         if current == nil { play(video) } else { queue.insert(video, at: 0) }
     }
 
-    func togglePlay() {
+    func resume() {
         if isUsingSpotifyRemote {
-            SpotifyRemote.shared.togglePlay()
+            SpotifyRemote.shared.resume()
             return
         }
-        if isPlaying {
-            player.pause()
-        } else if player.currentItem == nil, let v = current {
+        if player.currentItem == nil, let v = current {
             start(v)
         } else {
             player.play()
+        }
+    }
+
+    func pause() {
+        if isUsingSpotifyRemote {
+            SpotifyRemote.shared.pause()
+            return
+        }
+        player.pause()
+    }
+
+    func togglePlay() {
+        if isPlaying {
+            pause()
+        } else {
+            resume()
         }
     }
 
@@ -284,8 +299,12 @@ final class PlayerManager: NSObject, ObservableObject {
     func retry() { reload() }
 
     func togglePiP() {
-        guard let pip = pipController else { return }
-        if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
+        guard let pip = pipController, AVPictureInPictureController.isPictureInPictureSupported() else { return }
+        if pip.isPictureInPictureActive {
+            pip.stopPictureInPicture()
+        } else if pip.isPictureInPicturePossible {
+            pip.startPictureInPicture()
+        }
     }
 
     func setSleep(_ minutes: Int?) {
