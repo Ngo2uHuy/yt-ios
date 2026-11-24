@@ -76,6 +76,7 @@ struct YouTubeShortsView: View {
         .onDisappear {
             pm.loop = false
             pm.player.isMuted = false
+            pm.clearAllPreloads()
         }
     }
 
@@ -147,7 +148,7 @@ struct YouTubeShortsView: View {
         }
     }
 
-    // MARK: - Playback Control
+    // MARK: - Playback Control & Preloading Engine
 
     private func playVideo(at index: Int) {
         guard shorts.indices.contains(index) else { return }
@@ -162,7 +163,39 @@ struct YouTubeShortsView: View {
             pm.player.play()
         }
 
+        updatePreloadsAndRecycleMemory(for: index)
         fetchMoreShortsIfNeeded(forIndex: index)
+    }
+
+    /// Pre-buffer các video tiếp theo để đạt độ trễ 0s khi vuốt dọc,
+    /// đồng thời giải phóng bộ nhớ của các video đã cuộn qua để tránh tràn RAM.
+    private func updatePreloadsAndRecycleMemory(for index: Int) {
+        guard !shorts.isEmpty else { return }
+
+        // 1. Nạp trước (pre-buffer) video kế tiếp và video sau đó
+        let nextIndex = index + 1
+        if shorts.indices.contains(nextIndex) {
+            pm.preload(video: shorts[nextIndex])
+        }
+        let nextNextIndex = index + 2
+        if shorts.indices.contains(nextNextIndex) {
+            pm.preload(video: shorts[nextNextIndex])
+        }
+
+        // 2. Phạm vi hoạt động cần giữ trong bộ nhớ: [index - 1 ... index + 2]
+        let lower = max(0, index - 1)
+        let upper = min(shorts.count - 1, index + 2)
+        let keepWindowIds = Set(shorts[lower...upper].map(\.id))
+
+        // 3. Hủy bỏ bộ đệm và AVPlayerItem của các video đã cuộn qua để tránh tràn RAM
+        pm.purgePreloads(keeping: keepWindowIds)
+
+        // 4. Giải phóng bộ nhớ ảnh thumbnail của các video ở xa (> 4 vị trí)
+        for i in shorts.indices {
+            if abs(i - index) > 4, let thumb = shorts[i].thumbnail {
+                ImageCache.shared.remove(for: thumb)
+            }
+        }
     }
 
     private func togglePlayPause() {
@@ -203,9 +236,11 @@ struct YouTubeShortsView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(shorts.enumerated()), id: \.element.id) { index, video in
+                        let isWithinWindow = abs(index - currentIndex) <= 2
                         ShortsCardView(
                             video: video,
                             isActive: index == currentIndex,
+                            isWithinRetentionWindow: isWithinWindow,
                             isMuted: isMuted,
                             onTogglePlay: togglePlayPause,
                             onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
@@ -243,9 +278,11 @@ struct YouTubeShortsView: View {
     private func verticalDragPager(geometry: GeometryProxy) -> some View {
         LazyVStack(spacing: 0) {
             ForEach(Array(shorts.enumerated()), id: \.element.id) { index, video in
+                let isWithinWindow = abs(index - currentIndex) <= 2
                 ShortsCardView(
                     video: video,
                     isActive: index == currentIndex,
+                    isWithinRetentionWindow: isWithinWindow,
                     isMuted: isMuted,
                     onTogglePlay: togglePlayPause,
                     onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
@@ -462,6 +499,7 @@ struct YouTubeShortsView: View {
 struct ShortsCardView: View {
     let video: Video
     let isActive: Bool
+    var isWithinRetentionWindow: Bool = true
     let isMuted: Bool
 
     var onTogglePlay: () -> Void
@@ -507,6 +545,7 @@ struct ShortsCardView: View {
         }
         .clipped()
         .task(id: video.id) {
+            guard isWithinRetentionWindow else { return }
             await loadVideoStats()
         }
     }
@@ -910,13 +949,17 @@ struct SoundDiscView: View {
                 }
             }
         }
-        .rotationEffect(.degrees(angle))
+        .rotationEffect(.degrees(isPlaying ? angle : 0))
         .onAppear {
-            startSpinning()
+            if isPlaying {
+                startSpinning()
+            }
         }
         .onChange(of: isPlaying) { playing in
             if playing {
                 startSpinning()
+            } else {
+                angle = 0
             }
         }
     }
@@ -951,7 +994,9 @@ struct MusicWaveBars: View {
         }
         .frame(height: 12)
         .onAppear {
-            animateBars()
+            if isPlaying {
+                animateBars()
+            }
         }
         .onChange(of: isPlaying) { playing in
             if playing {

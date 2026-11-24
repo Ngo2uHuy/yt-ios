@@ -63,6 +63,8 @@ final class PlayerManager: NSObject, ObservableObject {
         let info: VideoInfo
         let sources: [PlaybackSource]
     }
+    private var preloadedMap: [String: PreloadData] = [:]
+    private var preloadTasks: [String: Task<Void, Never>] = [:]
     private var preloadedNext: PreloadData?
     private var preloadTask: Task<Void, Never>?
 
@@ -428,8 +430,12 @@ final class PlayerManager: NSObject, ObservableObject {
         let seekTarget = resume > 5 ? resume : nil
 
         let canUseSpotifyDirect = video.source == .spotify && SpotifyRemote.shared.isAvailable
-        if !canUseSpotifyDirect, let p = preloadedNext, p.video.id == video.id {
-            preloadedNext = nil
+        let p = (!canUseSpotifyDirect ? preloadedMap.removeValue(forKey: video.id) : nil)
+            ?? (!canUseSpotifyDirect && preloadedNext?.video.id == video.id ? preloadedNext : nil)
+
+        if let p {
+            if preloadedNext?.video.id == video.id { preloadedNext = nil }
+            preloadTasks.removeValue(forKey: video.id)?.cancel()
             preloadTask?.cancel()
             preloadTask = nil
             current = p.video
@@ -445,7 +451,7 @@ final class PlayerManager: NSObject, ObservableObject {
             commentsToken = nil
             segments = []
             errorText = nil
-            isLoading = true
+            isLoading = p.item.status != .readyToPlay
             currentTime = 0
             duration = 0
             lastSaved = 0
@@ -466,6 +472,7 @@ final class PlayerManager: NSObject, ObservableObject {
             return
         }
         preloadedNext = nil
+        preloadTasks.removeValue(forKey: video.id)?.cancel()
         preloadTask?.cancel()
         preloadTask = nil
 
@@ -641,6 +648,86 @@ final class PlayerManager: NSObject, ObservableObject {
             self.preloadedNext = PreloadData(video: resolved.video, item: item, info: resolved.info, sources: resolved.sources)
             self.preloadTask = nil
         }
+    }
+
+    // MARK: - Multi-Item Preload & Memory Management (Shorts & Fast Paging)
+
+    func preload(video: Video) {
+        guard video.id != current?.id else { return }
+        guard preloadedMap[video.id] == nil, preloadedNext?.video.id != video.id else { return }
+        guard preloadTasks[video.id] == nil else { return }
+
+        let wantsAudioOnly = self.audioOnly || (video.source != nil && Pref.musicAudioOnly)
+        let taskId = video.id
+
+        preloadTasks[taskId] = Task { [weak self] in
+            guard let self else { return }
+            var r: ResolvedVideo?
+            if let file = DownloadManager.shared.localFile(for: video.id) {
+                r = ResolvedVideo(video: video, info: VideoInfo(description: "", isLive: false), sources: [.file(file)])
+            } else {
+                switch video.source {
+                case .spotify?:
+                    if let yt = try? await TrackMatcher.shared.youTubeId(for: video) {
+                        r = try? await InnerTube.shared.resolve(yt, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                        r?.video = video
+                    }
+                default:
+                    r = try? await InnerTube.shared.resolve(video.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight)
+                }
+            }
+            guard !Task.isCancelled, let resolved = r, let firstSource = resolved.sources.first else {
+                self.preloadTasks.removeValue(forKey: taskId)
+                return
+            }
+
+            guard let item = try? await self.makeItem(firstSource) else {
+                self.preloadTasks.removeValue(forKey: taskId)
+                return
+            }
+
+            // Pre-buffer forward: buffer the first 6 seconds for instant 0s playback
+            item.preferredForwardBufferDuration = 6.0
+
+            guard !Task.isCancelled else {
+                item.cancelPendingSeeks()
+                item.asset.cancelLoading()
+                self.preloadTasks.removeValue(forKey: taskId)
+                return
+            }
+            self.preloadedMap[resolved.video.id] = PreloadData(video: resolved.video, item: item, info: resolved.info, sources: resolved.sources)
+            self.preloadTasks.removeValue(forKey: taskId)
+        }
+    }
+
+    func purgePreloads(keeping keepIds: Set<String>) {
+        let tasksToCancel = preloadTasks.filter { !keepIds.contains($0.key) }
+        for (id, task) in tasksToCancel {
+            task.cancel()
+            preloadTasks.removeValue(forKey: id)
+        }
+        let evicted = preloadedMap.keys.filter { !keepIds.contains($0) }
+        for id in evicted {
+            if let p = preloadedMap.removeValue(forKey: id) {
+                p.item.cancelPendingSeeks()
+                p.item.asset.cancelLoading()
+            }
+        }
+    }
+
+    func clearAllPreloads() {
+        for (_, task) in preloadTasks {
+            task.cancel()
+        }
+        preloadTasks.removeAll()
+        for (_, p) in preloadedMap {
+            p.item.cancelPendingSeeks()
+            p.item.asset.cancelLoading()
+        }
+        preloadedMap.removeAll()
+        preloadedNext = nil
+        preloadTask?.cancel()
+        preloadTask = nil
     }
 
     private func loadCurrentSource() async {
