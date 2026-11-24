@@ -340,9 +340,6 @@ struct PlayerArea: View {
 
                 Spacer()
 
-                if let s = scrub, let board = pm.storyboard {
-                    StoryboardThumb(board: board, time: s, duration: pm.duration)
-                }
                 if let chapter = Chapter.at(scrub ?? pm.currentTime, in: pm.chapters) {
                     Text(chapter.title)
                         .font(.caption.weight(.semibold))
@@ -365,6 +362,8 @@ struct PlayerArea: View {
                             scrub: $scrub,
                             currentTime: pm.currentTime,
                             duration: pm.duration,
+                            chapters: pm.chapters,
+                            storyboard: pm.storyboard,
                             onSeek: { s in pm.seek(to: s) },
                             onScrubStart: { hideTask?.cancel() },
                             onScrubEnd: { scheduleHide() }
@@ -510,11 +509,14 @@ struct YouTubeInteractiveScrubber: View {
     @Binding var scrub: Double?
     let currentTime: Double
     let duration: Double
+    var chapters: [Chapter] = []
+    var storyboard: Storyboard? = nil
     var onSeek: (Double) -> Void
     var onScrubStart: () -> Void
     var onScrubEnd: () -> Void
 
     @State private var isDragging = false
+    @State private var lastChapterIndex: Int? = nil
 
     var body: some View {
         let total = max(duration, 1)
@@ -537,6 +539,18 @@ struct YouTubeInteractiveScrubber: View {
                     .fill(Color.red)
                     .frame(width: max(0, width * CGFloat(progress)), height: trackHeight)
 
+                // Chapter tick notches along the track
+                ForEach(chapters.indices, id: \.self) { idx in
+                    let ch = chapters[idx]
+                    if ch.start > 0 && ch.start < total {
+                        let chFrac = ch.start / total
+                        Rectangle()
+                            .fill(Color.black.opacity(0.85))
+                            .frame(width: 2, height: trackHeight + 3)
+                            .offset(x: max(0, min(width - 2, width * CGFloat(chFrac) - 1)))
+                    }
+                }
+
                 // Red thumb knob with glow
                 Circle()
                     .fill(Color.red)
@@ -547,6 +561,11 @@ struct YouTubeInteractiveScrubber: View {
                     .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isDragging)
             }
             .frame(maxHeight: .infinity, alignment: .center)
+            .overlay(alignment: .top) {
+                if isDragging || scrub != nil {
+                    floatingPreview(width: width, progress: progress, effectiveTime: effectiveTime, total: total)
+                }
+            }
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
@@ -559,10 +578,23 @@ struct YouTubeInteractiveScrubber: View {
                             #endif
                         }
                         let frac = min(max(g.location.x / max(width, 1), 0), 1)
-                        scrub = frac * total
+                        let target = frac * total
+                        scrub = target
+
+                        // Haptic feedback when crossing chapter boundaries
+                        let currentIdx = chapters.lastIndex(where: { $0.start <= target })
+                        if currentIdx != lastChapterIndex {
+                            if lastChapterIndex != nil {
+                                #if canImport(UIKit)
+                                UISelectionFeedbackGenerator().selectionChanged()
+                                #endif
+                            }
+                            lastChapterIndex = currentIdx
+                        }
                     }
                     .onEnded { g in
                         isDragging = false
+                        lastChapterIndex = nil
                         let frac = min(max(g.location.x / max(width, 1), 0), 1)
                         let target = frac * total
                         scrub = nil
@@ -572,5 +604,55 @@ struct YouTubeInteractiveScrubber: View {
             )
         }
         .frame(height: 28)
+    }
+
+    @ViewBuilder
+    private func floatingPreview(width: CGFloat, progress: Double, effectiveTime: Double, total: Double) -> some View {
+        let thumbX = width * CGFloat(progress)
+        let previewWidth: CGFloat = storyboard != nil ? CGFloat(storyboard!.width) : 130
+        let clampedCenterX = min(max(previewWidth / 2 + 6, thumbX), width - previewWidth / 2 - 6)
+        let currentChapter = Chapter.at(effectiveTime, in: chapters)
+
+        VStack(spacing: 4) {
+            if let sb = storyboard {
+                StoryboardThumb(board: sb, time: effectiveTime, duration: total)
+                    .shadow(color: Color.black.opacity(0.6), radius: 6, y: 3)
+            }
+
+            VStack(spacing: 2) {
+                if let currentChapter {
+                    Text(currentChapter.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                Text(Fmt.time(effectiveTime))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.black.opacity(0.8))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            TrianglePointer()
+                .fill(Color.black.opacity(0.8))
+                .frame(width: 10, height: 5)
+        }
+        .frame(width: previewWidth)
+        .position(x: clampedCenterX, y: storyboard != nil ? - (CGFloat(storyboard!.height) / 2 + 28) : -26)
+        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+        .animation(.easeOut(duration: 0.15), value: effectiveTime)
+    }
+}
+
+private struct TrianglePointer: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        p.closeSubpath()
+        return p
     }
 }

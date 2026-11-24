@@ -861,7 +861,9 @@ struct YouTubeWatchDetails: View {
             async let commentRes = Self.fetchTopComment(token: token)
             async let channelRes = Self.fetchChannel(id: chId, known: knownSub)
 
-            let (vRes, cRes, chRes) = await (votesRes, commentRes, channelRes)
+            let vRes = await votesRes
+            let cRes = await commentRes
+            let chRes = await channelRes
             guard pm.current?.id == v.id else { return }
             self.votes = vRes
             self.topComment = cRes.0
