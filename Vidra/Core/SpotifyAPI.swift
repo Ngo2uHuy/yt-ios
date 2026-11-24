@@ -400,6 +400,18 @@ actor SpotifyAPI {
     private var albumCache: [String: J] = [:]
 
     func get(_ path: String, _ query: [String: String] = [:]) async throws -> J {
+        try await request(method: "GET", path: path, query: query, body: nil)
+    }
+
+    func put(_ path: String, query: [String: String] = [:], body: [String: Any]? = nil) async throws -> J {
+        try await request(method: "PUT", path: path, query: query, body: body)
+    }
+
+    func post(_ path: String, query: [String: String] = [:], body: [String: Any]? = nil) async throws -> J {
+        try await request(method: "POST", path: path, query: query, body: body)
+    }
+
+    private func request(method: String, path: String, query: [String: String] = [:], body: [String: Any]? = nil) async throws -> J {
         guard var comps = URLComponents(string: base + path) else { throw URLError(.badURL) }
         if !query.isEmpty {
             comps.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
@@ -411,7 +423,12 @@ actor SpotifyAPI {
         while true {
             let token = try await SpotifyAuth.shared.validToken()
             var req = URLRequest(url: url)
+            req.httpMethod = method
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            if let body {
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            }
             let (data, resp) = try await URLSession.shared.data(for: req)
             let http = resp as? HTTPURLResponse
             let code = http?.statusCode ?? 0
@@ -426,6 +443,7 @@ actor SpotifyAPI {
                 try await Task.sleep(nanoseconds: UInt64(min(max(wait, 0), 5) * 1_000_000_000))
                 continue
             }
+            if code == 204 { return J(nil) }
             let json = J(data: data)
             guard (200..<300).contains(code) else {
                 if code == 401 { throw SpotifyError.notLoggedIn }
@@ -433,6 +451,39 @@ actor SpotifyAPI {
             }
             return json
         }
+    }
+
+    // MARK: - Playback Control (Spotify Connect Web API)
+
+    /// Starts playback of a track URI directly on the user's active Spotify device or app.
+    func playTrack(uri: String) async throws {
+        let body: [String: Any] = ["uris": [uri]]
+        _ = try await put("me/player/play", body: body)
+    }
+
+    /// Pauses playback on active Spotify device.
+    func pause() async throws {
+        _ = try await put("me/player/pause")
+    }
+
+    /// Resumes playback on active Spotify device.
+    func resume() async throws {
+        _ = try await put("me/player/play")
+    }
+
+    /// Skips to next track on active Spotify device.
+    func next() async throws {
+        _ = try await post("me/player/next")
+    }
+
+    /// Skips to previous track on active Spotify device.
+    func previous() async throws {
+        _ = try await post("me/player/previous")
+    }
+
+    /// Seeks to a position in milliseconds on active Spotify device.
+    func seek(positionMs: Int) async throws {
+        _ = try await put("me/player/seek", query: ["position_ms": String(positionMs)])
     }
 
     private func paging(_ offset: Int, limit: Int = 50) -> [String: String] {

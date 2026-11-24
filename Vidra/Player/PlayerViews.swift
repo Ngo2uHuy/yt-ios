@@ -146,6 +146,16 @@ struct PlayerArea: View {
                     .padding(.bottom, 52)
                     .allowsHitTesting(false)
             }
+            if !controlsVisible && pm.duration > 0 && pm.info?.isLive != true {
+                GeometryReader { g in
+                    let prog = min(max(pm.currentTime / max(pm.duration, 1), 0), 1)
+                    Rectangle()
+                        .fill(Color.red)
+                        .frame(width: g.size.width * CGFloat(prog), height: 2)
+                }
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .allowsHitTesting(false)
+            }
         }
         .foregroundStyle(.white)
         .animation(.easeInOut(duration: 0.2), value: controlsVisible)
@@ -292,20 +302,14 @@ struct PlayerArea: View {
                         Button { toggleOrientation() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                     } else {
                         Text(Fmt.time(scrub ?? pm.currentTime))
-                        Slider(
-                            value: Binding(get: { scrub ?? pm.currentTime }, set: { scrub = $0 }),
-                            in: 0...max(pm.duration, 1),
-                            onEditingChanged: { editing in
-                                if editing {
-                                    hideTask?.cancel()
-                                } else {
-                                    if let s = scrub { pm.seek(to: s) }
-                                    scrub = nil
-                                    scheduleHide()
-                                }
-                            }
+                        YouTubeInteractiveScrubber(
+                            scrub: $scrub,
+                            currentTime: pm.currentTime,
+                            duration: pm.duration,
+                            onSeek: { s in pm.seek(to: s) },
+                            onScrubStart: { hideTask?.cancel() },
+                            onScrubEnd: { scheduleHide() }
                         )
-                        .tint(.red)
                         Text(Fmt.time(pm.duration))
                         Button { toggleOrientation() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                     }
@@ -438,5 +442,76 @@ struct SleepMenu: View {
     private var title: String {
         if let d = pm.sleepAt { return "Tắt lúc \(d.formatted(date: .omitted, time: .shortened))" }
         return pm.stopAfterCurrent ? "Dừng sau video này" : "Hẹn giờ tắt"
+    }
+}
+
+// MARK: - YouTube Interactive Scrubber
+
+struct YouTubeInteractiveScrubber: View {
+    @Binding var scrub: Double?
+    let currentTime: Double
+    let duration: Double
+    var onSeek: (Double) -> Void
+    var onScrubStart: () -> Void
+    var onScrubEnd: () -> Void
+
+    @State private var isDragging = false
+
+    var body: some View {
+        let total = max(duration, 1)
+        let effectiveTime = scrub ?? currentTime
+        let progress = min(max(effectiveTime / total, 0), 1)
+
+        GeometryReader { geo in
+            let width = geo.size.width
+            let trackHeight: CGFloat = isDragging ? 5 : 3
+            let thumbRadius: CGFloat = isDragging ? 7 : 5
+
+            ZStack(alignment: .leading) {
+                // Background track
+                Capsule()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(height: trackHeight)
+
+                // Active red track
+                Capsule()
+                    .fill(Color.red)
+                    .frame(width: max(0, width * CGFloat(progress)), height: trackHeight)
+
+                // Red thumb knob with glow
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: thumbRadius * 2, height: thumbRadius * 2)
+                    .shadow(color: Color.red.opacity(0.6), radius: isDragging ? 4 : 2)
+                    .offset(x: min(max(0, width * CGFloat(progress) - thumbRadius), width - thumbRadius * 2))
+                    .scaleEffect(isDragging ? 1.25 : 1.0)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isDragging)
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if !isDragging {
+                            isDragging = true
+                            onScrubStart()
+                            #if canImport(UIKit)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
+                        }
+                        let frac = min(max(g.location.x / max(width, 1), 0), 1)
+                        scrub = frac * total
+                    }
+                    .onEnded { g in
+                        isDragging = false
+                        let frac = min(max(g.location.x / max(width, 1), 0), 1)
+                        let target = frac * total
+                        scrub = nil
+                        onSeek(target)
+                        onScrubEnd()
+                    }
+            )
+        }
+        .frame(height: 28)
     }
 }

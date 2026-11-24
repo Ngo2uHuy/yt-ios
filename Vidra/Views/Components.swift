@@ -9,7 +9,7 @@ struct Thumbnail: View {
         Color(.secondarySystemFill)
             .aspectRatio(16 / 9, contentMode: .fit)
             .overlay {
-                CachedAsyncImage(url: url, targetSize: CGSize(width: 320, height: 180)) {
+                CachedAsyncImage(url: url) {
                     $0.resizable().scaledToFill()
                 } placeholder: {
                     Color.clear

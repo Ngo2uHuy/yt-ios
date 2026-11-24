@@ -945,7 +945,7 @@ struct SpotifyTrackRow: View {
                         Button {
                             showRemap = true
                         } label: {
-                            Label("Đổi bản YouTube Music", systemImage: "arrow.triangle.2.circlepath")
+                            Label("Đổi nguồn âm thanh", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
 

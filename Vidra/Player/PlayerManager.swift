@@ -140,14 +140,13 @@ final class PlayerManager: NSObject, ObservableObject {
 
         // If player has an active item, seek directly in AVPlayer for zero-latency response
         if player.currentItem != nil {
-            let tol = target <= 0.1 ? CMTime.zero : CMTime(seconds: 1, preferredTimescale: 600)
+            let tol = target <= 0.1 ? CMTime.zero : CMTime(seconds: 2.0, preferredTimescale: 600)
             player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
                         toleranceBefore: tol,
-                        toleranceAfter: tol) { [weak self] finished in
+                        toleranceAfter: tol) { [weak self] _ in
                 Task { @MainActor in
-                    if finished {
-                        self?.updateNowPlaying()
-                    }
+                    self?.player.play()
+                    self?.updateNowPlaying()
                 }
             }
             return
@@ -450,17 +449,34 @@ final class PlayerManager: NSObject, ObservableObject {
         let wantsAudioOnly = self.audioOnly || (video.source != nil && Pref.musicAudioOnly)
 
         loadTask = Task {
-            if video.source == .spotify && SpotifyRemote.shared.isAvailable {
-                let directSuccess = await SpotifyRemote.shared.play(trackId: video.id, video: video)
-                if directSuccess {
-                    guard !Task.isCancelled else { return }
-                    self.isLoading = false
-                    self.isPlaying = true
-                    self.currentTime = 0
-                    self.duration = Fmt.seconds(video.duration) ?? 0
-                    self.updateNowPlaying()
-                    Library.shared.addHistory(video)
-                    return
+            if video.source == .spotify {
+                if SpotifyRemote.shared.isAvailable {
+                    let directSuccess = await SpotifyRemote.shared.play(trackId: video.id, video: video)
+                    if directSuccess {
+                        guard !Task.isCancelled else { return }
+                        self.isLoading = false
+                        self.isPlaying = true
+                        self.currentTime = 0
+                        self.duration = Fmt.seconds(video.duration) ?? 0
+                        self.updateNowPlaying()
+                        Library.shared.addHistory(video)
+                        return
+                    }
+                }
+
+                let rawId = video.id.hasPrefix("sp:") ? String(video.id.dropFirst(3)) : video.id
+                let uri = "spotify:track:\(rawId)"
+                if await SpotifyAuth.shared.isLoggedIn {
+                    if (try? await SpotifyAPI.shared.playTrack(uri: uri)) != nil {
+                        guard !Task.isCancelled else { return }
+                        self.isLoading = false
+                        self.isPlaying = true
+                        self.currentTime = 0
+                        self.duration = Fmt.seconds(video.duration) ?? 0
+                        self.updateNowPlaying()
+                        Library.shared.addHistory(video)
+                        return
+                    }
                 }
             }
             if let file = DownloadManager.shared.localFile(for: video.id) {
@@ -468,15 +484,14 @@ final class PlayerManager: NSObject, ObservableObject {
                 Library.shared.addHistory(video)
             } else {
                 do {
-                    let startSec = Int(seekTarget ?? 0)
                     var r: ResolvedVideo
                     switch video.source {
                     case .spotify?:
                         let ytId = try await TrackMatcher.shared.youTubeId(for: video)
-                        r = try await InnerTube.shared.resolve(ytId, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: startSec > 0 ? startSec : nil)
+                        r = try await InnerTube.shared.resolve(ytId, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: nil)
                         r.video = video // keep Spotify id and metadata
                     default:
-                        r = try await InnerTube.shared.resolve(video.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: startSec > 0 ? startSec : nil)
+                        r = try await InnerTube.shared.resolve(video.id, audioOnly: wantsAudioOnly, maxHeight: Pref.maxHeight, startTimeSecs: nil)
                     }
                     guard !Task.isCancelled else { return }
                     var v = r.video
@@ -630,9 +645,10 @@ final class PlayerManager: NSObject, ObservableObject {
         case .readyToPlay:
             if let s = pendingSeek {
                 pendingSeek = nil
+                let tol = s <= 0.1 ? CMTime.zero : CMTime(seconds: 2.0, preferredTimescale: 600)
                 player.seek(to: CMTime(seconds: s, preferredTimescale: 600),
-                            toleranceBefore: CMTime(seconds: 2, preferredTimescale: 600),
-                            toleranceAfter: CMTime(seconds: 2, preferredTimescale: 600)) { [weak self] _ in
+                            toleranceBefore: tol,
+                            toleranceAfter: tol) { [weak self] _ in
                     Task { @MainActor in
                         self?.player.play()
                         self?.updateNowPlaying()

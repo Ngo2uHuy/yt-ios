@@ -15,7 +15,10 @@ struct Video: Identifiable, Codable, Hashable, Sendable {
 
     var thumbnail: URL? {
         if let artwork { return artwork }
-        return source == nil || source == .ytMusic ? URL(string: "https://i.ytimg.com/vi/\(id)/hqdefault.jpg") : nil
+        if source == nil || source == .ytMusic {
+            return URL(string: "https://i.ytimg.com/vi/\(id)/hq720.jpg") ?? URL(string: "https://i.ytimg.com/vi/\(id)/mqdefault.jpg")
+        }
+        return nil
     }
 
     var shareURL: URL {

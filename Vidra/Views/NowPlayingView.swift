@@ -185,7 +185,7 @@ struct NowPlayingView: View {
 
     private func sourceLabel(_ v: Video) -> String {
         switch v.source {
-        case .spotify?: return "Spotify – phát qua YouTube Music"
+        case .spotify?: return "Spotify"
         case .ytMusic?: return "YouTube Music"
         case nil: return "YouTube"
         }

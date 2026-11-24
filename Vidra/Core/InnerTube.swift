@@ -506,6 +506,7 @@ enum YTParse {
         let run = owner?["runs"][0]
         let duration = r["lengthText"].text
             ?? r["thumbnailOverlays"].first("thumbnailOverlayTimeStatusRenderer")?["text"].text
+        let art = thumb(r["thumbnail"])
         return Video(
             id: id,
             title: r["title"].text ?? "",
@@ -513,7 +514,8 @@ enum YTParse {
             channelId: run?["navigationEndpoint"]["browseEndpoint"]["browseId"].string,
             duration: duration,
             views: r["shortViewCountText"].text ?? r["viewCountText"].text,
-            published: r["publishedTimeText"].text
+            published: r["publishedTimeText"].text,
+            artwork: art
         )
     }
 
@@ -527,6 +529,7 @@ enum YTParse {
         let channelTitle = rows.count > 1 ? (rows[0].first ?? "") : ""
         let stats = rows.last ?? []
         let channelId = l.collect(["browseId"]).compactMap { $0.value.string }.first { $0.hasPrefix("UC") }
+        let art = thumb(l["contentImage"])
         return Video(
             id: id,
             title: meta["title"]["content"].string ?? "",
@@ -534,7 +537,8 @@ enum YTParse {
             channelId: channelId,
             duration: l["contentImage"].first("thumbnailBadgeViewModel")?["text"].string,
             views: stats.first,
-            published: stats.count > 1 ? stats[1] : nil
+            published: stats.count > 1 ? stats[1] : nil,
+            artwork: art
         )
     }
 
