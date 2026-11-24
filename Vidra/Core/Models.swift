@@ -252,6 +252,7 @@ enum Pref {
     static let saveHistoryKey = "saveHistory"
     static let hideShortsKey = "hideShorts"
     static let musicAudioOnlyKey = "musicAudioOnly"
+    static let endlessRadioKey = "endlessRadio"
 
     private static func bool(_ key: String, _ fallback: Bool) -> Bool {
         UserDefaults.standard.object(forKey: key) as? Bool ?? fallback
@@ -262,6 +263,7 @@ enum Pref {
         UserDefaults.standard.object(forKey: maxHeightKey) as? Int ?? 2160
     }
     static var autoplay: Bool { bool(autoplayKey, true) }
+    static var endlessRadio: Bool { bool(endlessRadioKey, true) }
     static var sponsorBlock: Bool { bool(sponsorBlockKey, true) }
     static var autoPiP: Bool { bool(autoPiPKey, true) }
     static var saveHistory: Bool { bool(saveHistoryKey, true) }

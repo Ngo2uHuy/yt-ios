@@ -257,14 +257,68 @@ final class PlayerManager: NSObject, ObservableObject {
         var candidate: Video?
         if !queue.isEmpty {
             candidate = queue.removeFirst()
-        } else if !auto || Pref.autoplay {
+        } else if !auto || Pref.autoplay || Pref.endlessRadio {
             let seen = Set(backStack.map(\.id) + [c.id])
             candidate = related.first { !seen.contains($0.id) }
         }
-        guard let v = candidate else { return }
-        savePosition()
-        pushBack(c)
-        start(v)
+        if let v = candidate {
+            savePosition()
+            pushBack(c)
+            start(v)
+            return
+        }
+
+        // Endless Radio: Automatically fetch similar songs when the playlist/queue finishes
+        if Pref.endlessRadio || Pref.autoplay {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let nextSong = await self.fetchEndlessRadioCandidate(for: c) {
+                    guard self.current?.id == c.id else { return }
+                    self.savePosition()
+                    self.pushBack(c)
+                    self.start(nextSong)
+                }
+            }
+        }
+    }
+
+    private func fetchEndlessRadioCandidate(for video: Video) async -> Video? {
+        var seedId = video.id
+        if video.id.hasPrefix("sp:") {
+            if let yt = try? await TrackMatcher.shared.youTubeId(for: video) {
+                seedId = yt
+            }
+        }
+        let seen = Set(backStack.map(\.id) + [video.id])
+
+        // 1. YouTube Music Automix / Radio queue
+        if let radioTracks = try? await InnerTube.shared.musicRadio(seedId) {
+            let available = radioTracks.filter { !seen.contains($0.id) }
+            if let first = available.first {
+                self.related = available
+                return first
+            }
+        }
+
+        // 2. YouTube Next related recommendations
+        if let nextTracks = try? await InnerTube.shared.next(seedId).related {
+            let available = nextTracks.filter { !seen.contains($0.id) }
+            if let first = available.first {
+                self.related = available
+                return first
+            }
+        }
+
+        // 3. Fallback to similar artist music search
+        if let searchTracks = try? await InnerTube.shared.musicSearch("\(video.channelTitle) songs", continuation: nil).videos {
+            let available = searchTracks.filter { !seen.contains($0.id) }
+            if let first = available.first {
+                self.related = available
+                return first
+            }
+        }
+
+        return nil
     }
 
     func previous() {
@@ -619,7 +673,7 @@ final class PlayerManager: NSObject, ObservableObject {
         guard preloadTask == nil else { return }
         let nextCandidate: Video? = {
             if !queue.isEmpty { return queue.first }
-            if Pref.autoplay {
+            if Pref.autoplay || Pref.endlessRadio {
                 let seen = Set(backStack.map(\.id) + [current?.id].compactMap { $0 })
                 return related.first { !seen.contains($0.id) }
             }

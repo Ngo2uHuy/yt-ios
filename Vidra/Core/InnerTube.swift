@@ -325,6 +325,61 @@ actor InnerTube {
         return out
     }
 
+    /// Recommends similar songs based on playlist seed tracks and query hint.
+    func recommendedSongs(for seeds: [Video], queryHint: String? = nil, limit: Int = 15) async -> [Video] {
+        var results: [Video] = []
+        var seenIds = Set<String>(seeds.map(\.id))
+        var seenTitles = Set<String>(seeds.map { $0.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+
+        // 1. Fetch from musicRadio on seed tracks
+        for seed in seeds.prefix(3) {
+            var seedId = seed.id
+            if seed.id.hasPrefix("sp:") {
+                if let yt = try? await TrackMatcher.shared.youTubeId(for: seed) {
+                    seedId = yt
+                } else {
+                    continue
+                }
+            }
+            if let radio = try? await musicRadio(seedId) {
+                for track in radio {
+                    let cleanTitle = track.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !seenIds.contains(track.id) && !seenTitles.contains(cleanTitle) {
+                        seenIds.insert(track.id)
+                        seenTitles.insert(cleanTitle)
+                        results.append(track)
+                        if results.count >= limit { return results }
+                    }
+                }
+            }
+        }
+
+        // 2. Supplement with musicSearch if more recommendations are needed
+        if results.count < limit {
+            let query: String
+            if let hint = queryHint, !hint.isEmpty {
+                query = hint
+            } else if let first = seeds.first {
+                query = "\(first.channelTitle) songs"
+            } else {
+                query = "top hits"
+            }
+            if let page = try? await musicSearch(query, continuation: nil) {
+                for track in page.videos {
+                    let cleanTitle = track.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !seenIds.contains(track.id) && !seenTitles.contains(cleanTitle) {
+                        seenIds.insert(track.id)
+                        seenTitles.insert(cleanTitle)
+                        results.append(track)
+                        if results.count >= limit { return results }
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+
     // MARK: - Streams
 
     private func player(_ id: String, client: YTClient, startTimeSecs: Int? = nil) async throws -> J {

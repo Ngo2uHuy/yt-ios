@@ -138,6 +138,11 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
     @Published var loaded = false
     @Published var error: String?
 
+    // Recommended songs
+    @Published var recommendedTracks: [Video] = []
+    @Published var loadingRecommendations = false
+    @Published var addedRecommendedTrackIds: Set<String> = []
+
     private var nextOffset: String?
     private let loader: ((Int) async throws -> Page)?
     private let playlistId: String?
@@ -201,6 +206,13 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
 
             nextOffset = page.continuation
             loaded = true
+
+            // Automatically load recommended songs if not yet loaded
+            if recommendedTracks.isEmpty && !tracks.isEmpty {
+                Task {
+                    await self.loadRecommendations()
+                }
+            }
         } catch {
             if !Task.isCancelled {
                 self.error = error.localizedDescription
@@ -208,6 +220,37 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
             loaded = true
         }
         loading = false
+    }
+
+    func loadRecommendations(refresh: Bool = false) async {
+        guard !loadingRecommendations else { return }
+        loadingRecommendations = true
+        if refresh {
+            recommendedTracks = []
+        }
+
+        let seeds = Array(tracks.shuffled().prefix(4))
+        let hint = "\(metadata.title) \(metadata.creatorName)"
+        let recs = await InnerTube.shared.recommendedSongs(for: seeds.isEmpty ? tracks : seeds, queryHint: hint, limit: 8)
+
+        // Exclude tracks already in playlist
+        let existingIds = Set(tracks.map(\.id))
+        let filtered = recs.filter { !existingIds.contains($0.id) }
+
+        withAnimation(.easeInOut(duration: 0.35)) {
+            self.recommendedTracks = filtered
+            self.loadingRecommendations = false
+        }
+    }
+
+    func addRecommendedTrack(_ track: Video) {
+        guard !tracks.contains(where: { $0.id == track.id }) else { return }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            tracks.append(track)
+            addedRecommendedTrackIds.insert(track.id)
+        }
+        let gen = UIImpactFeedbackGenerator(style: .medium)
+        gen.impactOccurred()
     }
 
     func loadMoreIfNeeded(current: Video) {
@@ -271,6 +314,7 @@ struct SpotifyPlaylistDetailView: View {
     @State private var isDownloadingAll = false
     @State private var showOptionsActionSheet = false
     @State private var showShareSheet = false
+    @AppStorage(Pref.endlessRadioKey) private var isEndlessRadio = true
 
     // Initializer with playlist ID
     init(playlistId: String, name: String, cover: URL? = nil, subtitle: String = "") {
@@ -352,6 +396,11 @@ struct SpotifyPlaylistDetailView: View {
 
                     // Track List
                     trackListSection
+
+                    // Recommended Songs Section
+                    if !model.tracks.isEmpty {
+                        recommendedSongsSection
+                    }
 
                     // Extra bottom padding for floating mini player bar
                     Spacer().frame(height: 110)
@@ -587,6 +636,16 @@ struct SpotifyPlaylistDetailView: View {
                         Label("Chia sẻ playlist", systemImage: "square.and.arrow.up")
                     }
                 }
+
+                Button {
+                    isEndlessRadio.toggle()
+                    UserDefaults.standard.set(isEndlessRadio, forKey: Pref.endlessRadioKey)
+                } label: {
+                    Label(
+                        isEndlessRadio ? "Tắt Endless Radio" : "Bật Endless Radio",
+                        systemImage: "dot.radiowaves.left.and.right"
+                    )
+                }
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 22, weight: .semibold))
@@ -609,6 +668,27 @@ struct SpotifyPlaylistDetailView: View {
 
                     Circle()
                         .fill(isShuffle ? SpotifyTheme.green : Color.clear)
+                        .frame(width: 4, height: 4)
+                }
+            }
+            .buttonStyle(.plain)
+
+            // 5. Endless Radio Quick Toggle Button
+            Button {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
+                    isEndlessRadio.toggle()
+                    UserDefaults.standard.set(isEndlessRadio, forKey: Pref.endlessRadioKey)
+                }
+                let gen = UIImpactFeedbackGenerator(style: .light)
+                gen.impactOccurred()
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(isEndlessRadio ? SpotifyTheme.green : SpotifyTheme.secondaryText)
+
+                    Circle()
+                        .fill(isEndlessRadio ? SpotifyTheme.green : Color.clear)
                         .frame(width: 4, height: 4)
                 }
             }
@@ -717,6 +797,190 @@ struct SpotifyPlaylistDetailView: View {
                 .padding(.top, 50)
             }
         }
+    }
+
+    // MARK: - Recommended Songs Section
+
+    private var recommendedSongsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Subtle Section Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 0.5)
+                .padding(.vertical, 8)
+
+            // Header
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bài hát đề xuất")
+                    .font(.title3.bold())
+                    .foregroundStyle(.white)
+
+                Text("Dựa trên các bài hát trong danh sách phát này")
+                    .font(.subheadline)
+                    .foregroundStyle(SpotifyTheme.secondaryText)
+            }
+
+            // Recommendations List or Loader
+            if model.loadingRecommendations && model.recommendedTracks.isEmpty {
+                HStack(spacing: 12) {
+                    ProgressView().tint(SpotifyTheme.green)
+                    Text("Đang tìm bài hát phù hợp...")
+                        .font(.footnote)
+                        .foregroundStyle(SpotifyTheme.secondaryText)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 16)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(model.recommendedTracks) { track in
+                        recommendedTrackRow(track)
+                    }
+                }
+
+                // Refresh Recommendations Button
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await model.loadRecommendations(refresh: true) }
+                        let gen = UIImpactFeedbackGenerator(style: .light)
+                        gen.impactOccurred()
+                    } label: {
+                        HStack(spacing: 6) {
+                            if model.loadingRecommendations {
+                                ProgressView().tint(.white).scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 12, weight: .bold))
+                            }
+                            Text("LÀM MỚI")
+                                .font(.system(size: 11, weight: .heavy))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 9)
+                        .background(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.35), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
+                .padding(.top, 10)
+            }
+
+            // Endless Radio Feature Banner
+            endlessRadioBanner
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+    }
+
+    private func recommendedTrackRow(_ track: Video) -> some View {
+        let isAdded = model.addedRecommendedTrackIds.contains(track.id)
+        let isCurrent = player.current?.id == track.id
+
+        return HStack(spacing: 12) {
+            // Artwork
+            CachedAsyncImage(url: track.thumbnail, targetSize: CGSize(width: 48, height: 48)) { img in
+                img.resizable().scaledToFill()
+            } placeholder: {
+                Color.gray.opacity(0.2)
+            }
+            .frame(width: 48, height: 48)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+            // Title & Channel
+            VStack(alignment: .leading, spacing: 3) {
+                Text(track.title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(isCurrent ? SpotifyTheme.green : .white)
+                    .lineLimit(1)
+
+                Text(track.channelTitle)
+                    .font(.system(size: 13))
+                    .foregroundStyle(SpotifyTheme.secondaryText)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                player.start(track)
+            }
+
+            Spacer()
+
+            // Add (+) Button
+            Button {
+                if !isAdded {
+                    model.addRecommendedTrack(track)
+                }
+            } label: {
+                if isAdded {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundStyle(SpotifyTheme.green)
+                } else {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 24))
+                        .foregroundStyle(Color.white.opacity(0.75))
+                }
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var endlessRadioBanner: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(SpotifyTheme.green.opacity(0.18))
+                    .frame(width: 40, height: 40)
+
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(SpotifyTheme.green)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Chế độ Endless Radio")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    Text(isEndlessRadio ? "BẬT" : "TẮT")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(isEndlessRadio ? .black : .white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(isEndlessRadio ? SpotifyTheme.green : Color.white.opacity(0.2), in: Capsule())
+                }
+
+                Text("Tự động phát tiếp các bài hát tương tự khi hết playlist")
+                    .font(.system(size: 12))
+                    .foregroundStyle(SpotifyTheme.secondaryText)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: $isEndlessRadio)
+                .labelsHidden()
+                .tint(SpotifyTheme.green)
+                .onChange(of: isEndlessRadio) { val in
+                    UserDefaults.standard.set(val, forKey: Pref.endlessRadioKey)
+                }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(isEndlessRadio ? SpotifyTheme.green.opacity(0.25) : Color.white.opacity(0.08), lineWidth: 0.8)
+                )
+        )
+        .padding(.top, 12)
     }
 
     // MARK: - Sticky Top Navigation Bar
