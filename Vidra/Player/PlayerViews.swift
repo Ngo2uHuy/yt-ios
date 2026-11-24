@@ -152,10 +152,15 @@ struct PlayerArea: View {
     @State private var dragStart: Float?
     @State private var flash: String?
 
+    // Gestures state: Pinch-to-zoom, interactive swipe-down to minimize, and horizontal swipe-seek
+    @State private var videoGravity: AVLayerVideoGravity = .resizeAspect
+    @State private var dragOffsetY: CGFloat = 0
+    @State private var hasTriggeredHorizontalSwipe = false
+
     var body: some View {
         ZStack {
             Color.black
-            VideoSurface(player: pm.player)
+            VideoSurface(player: pm.player, gravity: videoGravity)
             if pm.showsArtwork, let v = pm.current {
                 AsyncImage(url: v.thumbnail) { $0.resizable().scaledToFit() } placeholder: { Color.black }
                     .overlay(alignment: .topLeading) {
@@ -212,6 +217,31 @@ struct PlayerArea: View {
                 .allowsHitTesting(false)
             }
         }
+        .offset(y: vsc != .compact ? dragOffsetY : 0)
+        .scaleEffect(vsc != .compact ? max(0.85, 1.0 - dragOffsetY / 1200) : 1.0)
+        .simultaneousGesture(
+            // Cử chỉ chụm 2 ngón tay phóng to/thu nhỏ (Pinch to Zoom to Fill / Original 16:9)
+            MagnificationGesture()
+                .onEnded { scale in
+                    if scale > 1.12 && videoGravity != .resizeAspectFill {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            videoGravity = .resizeAspectFill
+                        }
+                        #if canImport(UIKit)
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        #endif
+                        showFlash("Thu phóng vừa màn hình (Fill)")
+                    } else if scale < 0.90 && videoGravity != .resizeAspect {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            videoGravity = .resizeAspect
+                        }
+                        #if canImport(UIKit)
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        #endif
+                        showFlash("Tỷ lệ chuẩn 16:9 (Fit)")
+                    }
+                }
+        )
         .foregroundStyle(.white)
         .animation(.easeInOut(duration: 0.2), value: controlsVisible)
         .onAppear { scheduleHide() }
@@ -237,12 +267,61 @@ struct PlayerArea: View {
                 })
                 .simultaneousGesture(
                     DragGesture(minimumDistance: 12)
-                        .onChanged { v in adjust(v, isLeft: isLeft, height: g.size.height) }
-                        .onEnded { _ in
-                            dragStart = nil
-                            hideHUD()
-                        }
+                        .onChanged { v in handleDrag(v, isLeft: isLeft, height: g.size.height) }
+                        .onEnded { v in handleDragEnd(v, isLeft: isLeft, height: g.size.height) }
                 )
+        }
+    }
+
+    /// Xử lý cử chỉ vuốt đa hướng:
+    /// - Vuốt xuống ở chế độ dọc: Thu nhỏ video thành Mini-player
+    /// - Vuốt ngang: Tua nhanh 10 giây (+10s / -10s)
+    /// - Vuốt dọc ở chế độ xoay ngang: Điều chỉnh độ sáng (nửa trái) / Âm lượng (nửa phải)
+    private func handleDrag(_ v: DragGesture.Value, isLeft: Bool, height: CGFloat) {
+        let dx = v.translation.width
+        let dy = v.translation.height
+
+        // 1. Chế độ xoay ngang (Landscape compact): Vuốt dọc chỉnh độ sáng / âm lượng
+        if vsc == .compact && abs(dy) > abs(dx) {
+            adjust(v, isLeft: isLeft, height: height)
+            return
+        }
+
+        // 2. Chế độ dọc: Vuốt dọc xuống để thu nhỏ thành mini-player
+        if vsc != .compact && dy > 0 && dy > abs(dx) * 1.2 {
+            dragOffsetY = dy
+            return
+        }
+
+        // 3. Vuốt ngang để tua nhanh 10s (+10s hoặc -10s)
+        if abs(dx) > 50 && abs(dx) > abs(dy) * 1.4 && !hasTriggeredHorizontalSwipe {
+            hasTriggeredHorizontalSwipe = true
+            let seekDelta: Double = dx > 0 ? 10 : -10
+            pm.seek(by: seekDelta)
+            #if canImport(UIKit)
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            #endif
+            showFlash(dx > 0 ? "+10s ⏩" : "-10s ⏪")
+        }
+    }
+
+    private func handleDragEnd(_ v: DragGesture.Value, isLeft: Bool, height: CGFloat) {
+        dragStart = nil
+        hideHUD()
+        hasTriggeredHorizontalSwipe = false
+
+        // Kiểm tra ngưỡng vuốt xuống để thu nhỏ player
+        if vsc != .compact {
+            if dragOffsetY > 70 || v.predictedEndTranslation.height > 200 {
+                #if canImport(UIKit)
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                #endif
+                onClose()
+            } else {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    dragOffsetY = 0
+                }
+            }
         }
     }
 

@@ -18,7 +18,7 @@ struct YouTubeWatchView: View {
             Group {
                 if vsc == .compact {
                     // Chế độ xoay ngang: Toàn màn hình tràn viền
-                    PlayerArea(onClose: { dismiss() })
+                    PlayerArea(onClose: { minimizeToMiniPlayer() })
                         .ignoresSafeArea()
                 } else {
                     // Chế độ dọc: Trình phát ở trên cùng với hiệu ứng Ambient Mode
@@ -33,7 +33,7 @@ struct YouTubeWatchView: View {
 
                         VStack(spacing: 0) {
                             // Video Player Area tương thích PlayerManager.shared
-                            PlayerArea(onClose: { dismiss() })
+                            PlayerArea(onClose: { minimizeToMiniPlayer() })
                                 .aspectRatio(16 / 9, contentMode: .fit)
 
                             // Nội dung chi tiết video có thể cuộn
@@ -57,6 +57,15 @@ struct YouTubeWatchView: View {
                 }
             }
         }
+    }
+
+    /// Thu nhỏ trình phát thành floating mini-player ở góc dưới màn hình
+    private func minimizeToMiniPlayer() {
+        #if canImport(UIKit)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        #endif
+        PlayerManager.shared.showWatch = false
+        dismiss()
     }
 
     /// Trích xuất màu sắc chủ đạo từ thumbnail video để làm ánh sáng Ambient Mode
