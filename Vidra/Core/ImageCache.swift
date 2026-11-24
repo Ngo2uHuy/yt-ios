@@ -120,6 +120,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
                 }
                 return
             }
+            uiImage = nil
 
             // 2. Background asynchronous fetch & decode
             do {

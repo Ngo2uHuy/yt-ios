@@ -81,6 +81,7 @@ final class PlayerManager: NSObject, ObservableObject {
     // MARK: - Public controls
 
     func play(_ video: Video, queue newQueue: [Video]? = nil, showWatchSheet: Bool = true) {
+        player.isMuted = false
         if let newQueue { queue = newQueue }
         if showWatchSheet {
             showWatch = true
@@ -114,50 +115,15 @@ final class PlayerManager: NSObject, ObservableObject {
 
     func seek(to seconds: Double) {
         let target = max(0, duration > 0 ? min(seconds, duration - 0.5) : seconds)
-        let oldTime = currentTime
         currentTime = target
 
-        // If live stream, seek directly in AVPlayer
-        if info?.isLive == true {
-            player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
-                Task { @MainActor in self?.updateNowPlaying() }
-            }
-            return
-        }
-
-        // If local downloaded file, seek directly in AVPlayer
-        if case .file? = (sources.indices.contains(sourceIndex) ? sources[sourceIndex] : nil) {
-            player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
-                Task { @MainActor in self?.updateNowPlaying() }
-            }
-            return
-        }
-
-        // Check if target is already inside the loaded time ranges of AVPlayer
-        if let ranges = player.currentItem?.loadedTimeRanges {
-            let targetCM = CMTime(seconds: target, preferredTimescale: 600)
-            for value in ranges {
-                let range = value.timeRangeValue
-                if CMTimeRangeContainsTime(range, time: targetCM) {
-                    player.seek(to: targetCM,
-                                toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
-                                toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)) { [weak self] _ in
-                        Task { @MainActor in self?.updateNowPlaying() }
-                    }
-                    return
-                }
-            }
-        }
-
-        // For nearby seeks (-60s backward to +45s forward), seek directly in AVPlayer for zero-latency response
-        let delta = target - oldTime
-        if (delta >= -60 && delta <= 45) && target >= 0 {
+        // If player has an active item, seek directly in AVPlayer for zero-latency response
+        if player.currentItem != nil {
             player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
                         toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
                         toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)) { [weak self] finished in
                 Task { @MainActor in
                     if finished {
-                        self?.player.play()
                         self?.updateNowPlaying()
                     }
                 }
@@ -165,7 +131,7 @@ final class PlayerManager: NSObject, ObservableObject {
             return
         }
 
-        // For major seeks (to the middle/end) in YouTube HLS streams:
+        // Fallback: reload stream if player item is absent
         seekWithReload(target: target)
     }
 

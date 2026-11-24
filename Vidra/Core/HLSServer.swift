@@ -15,7 +15,6 @@ final class HLSServer: @unchecked Sendable {
     private var routeKeys: [String] = [] // LRU tracking
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "vidra.hls.server", qos: .userInitiated)
-    private var readyContinuations: [CheckedContinuation<UInt16, Never>] = []
 
     init() {
         start()
@@ -34,17 +33,8 @@ final class HLSServer: @unchecked Sendable {
                     if let assignedPort = l.port?.rawValue {
                         self.lock.lock()
                         self.port = assignedPort
-                        let continuations = self.readyContinuations
-                        self.readyContinuations.removeAll()
                         self.lock.unlock()
-                        for c in continuations { c.resume(returning: assignedPort) }
                     }
-                case .failed, .cancelled:
-                    self.lock.lock()
-                    let continuations = self.readyContinuations
-                    self.readyContinuations.removeAll()
-                    self.lock.unlock()
-                    for c in continuations { c.resume(returning: 0) }
                 default:
                     break
                 }
@@ -61,36 +51,17 @@ final class HLSServer: @unchecked Sendable {
 
     /// Waits until the loopback server has bound an ephemeral port (with a 1.0s safety timeout to prevent deadlocks).
     func ensurePort() async -> UInt16 {
-        lock.lock()
-        if port > 0 {
+        for _ in 0..<20 {
+            lock.lock()
             let p = port
             lock.unlock()
-            return p
+            if p > 0 { return p }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
+        lock.lock()
+        let p = port
         lock.unlock()
-
-        return await withTaskGroup(of: UInt16.self) { group in
-            group.addTask {
-                await withCheckedContinuation { continuation in
-                    self.lock.lock()
-                    if self.port > 0 {
-                        let p = self.port
-                        self.lock.unlock()
-                        continuation.resume(returning: p)
-                    } else {
-                        self.readyContinuations.append(continuation)
-                        self.lock.unlock()
-                    }
-                }
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                return 0
-            }
-            let res = await group.next() ?? 0
-            group.cancelAll()
-            return res > 0 ? res : self.port
-        }
+        return p
     }
 
     /// Registers an in-memory route (e.g. `/hls/abc/master.m3u8`) and returns its local loopback URL.
@@ -192,17 +163,19 @@ enum SIDXParser {
         func readU16() -> UInt16? {
             guard pos + 2 <= data.count else { return nil }
             defer { pos += 2 }
-            return data.subdata(in: pos..<pos+2).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+            return (UInt16(data[pos]) << 8) | UInt16(data[pos + 1])
         }
         func readU32() -> UInt32? {
             guard pos + 4 <= data.count else { return nil }
             defer { pos += 4 }
-            return data.subdata(in: pos..<pos+4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            return (UInt32(data[pos]) << 24) |
+                   (UInt32(data[pos + 1]) << 16) |
+                   (UInt32(data[pos + 2]) << 8) |
+                   UInt32(data[pos + 3])
         }
         func readU64() -> UInt64? {
-            guard pos + 8 <= data.count else { return nil }
-            defer { pos += 8 }
-            return data.subdata(in: pos..<pos+8).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+            guard let high = readU32(), let low = readU32() else { return nil }
+            return (UInt64(high) << 32) | UInt64(low)
         }
 
         _ = readU32() // reference_id

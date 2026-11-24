@@ -75,6 +75,7 @@ struct YouTubeShortsView: View {
         }
         .onDisappear {
             pm.loop = false
+            pm.player.isMuted = false
         }
     }
 

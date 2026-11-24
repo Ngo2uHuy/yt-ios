@@ -98,7 +98,7 @@ actor InnerTube {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else { throw YTError.http(code) }
         let j = J(data: data)
-        if visitorData == nil, let v = j["responseContext"]["visitorData"].string { visitorData = v }
+        if let v = j["responseContext"]["visitorData"].string { visitorData = v }
         return j
     }
 
