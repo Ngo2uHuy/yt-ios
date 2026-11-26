@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 
 @main
 struct VidraApp: App {
@@ -8,7 +9,7 @@ struct VidraApp: App {
     init() {
         // .playback keeps sound going with the silent switch on, screen locked or app in background.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 512 << 20)
+        URLCache.shared = URLCache(memoryCapacity: 16 << 20, diskCapacity: 256 << 20)
     }
 
     var body: some Scene {
@@ -19,9 +20,29 @@ struct VidraApp: App {
                 }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .background {
-                PlayerManager.shared.savePosition()
+            if phase == .active {
+                HLSServer.shared.ensureRunning()
+                if PlayerManager.shared.current != nil && !PlayerManager.shared.isUsingSpotifyRemote {
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                }
+            } else if phase == .background {
+                var bgId: UIBackgroundTaskIdentifier = .invalid
+                bgId = UIApplication.shared.beginBackgroundTask(withName: "vidra.flush") {
+                    if bgId != .invalid {
+                        UIApplication.shared.endBackgroundTask(bgId)
+                        bgId = .invalid
+                    }
+                }
+                PlayerManager.shared.savePosition(persist: true)
                 Library.shared.flush()
+                DownloadManager.shared.flushIndex()
+                Task { @MainActor in
+                    await TrackMatcher.shared.flush()
+                    if bgId != .invalid {
+                        UIApplication.shared.endBackgroundTask(bgId)
+                        bgId = .invalid
+                    }
+                }
             }
         }
     }
@@ -29,7 +50,6 @@ struct VidraApp: App {
 
 struct ContentView: View {
     @ObservedObject private var modeManager = AppModeManager.shared
-    @ObservedObject private var downloads = DownloadManager.shared
 
     var body: some View {
         Group {
@@ -40,15 +60,27 @@ struct ContentView: View {
                 SpotifyRootView()
             }
         }
-        .animation(.easeInOut(duration: 0.25), value: modeManager.currentMode)
-        .alert(
-            "Tải xuống thất bại",
-            isPresented: Binding(get: { downloads.lastError != nil }, set: { if !$0 { downloads.lastError = nil } })
-        ) {
-            Button("OK") {}
-        } message: {
-            Text(downloads.lastError ?? "")
+        .overlay {
+            DownloadErrorAlertObserver()
         }
+    }
+}
+
+private struct DownloadErrorAlertObserver: View {
+    @ObservedObject private var downloads = DownloadManager.shared
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .alert(
+                "Tải xuống thất bại",
+                isPresented: Binding(get: { downloads.lastError != nil }, set: { if !$0 { downloads.lastError = nil } })
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(downloads.lastError ?? "")
+            }
     }
 }
 
@@ -71,9 +103,12 @@ struct MiniPlayerBar: View {
             }()
             VStack(spacing: 0) {
                 GeometryReader { g in
+                    let frac = (pm.duration > 0 && pm.currentTime.isFinite)
+                        ? min(max(pm.currentTime / pm.duration, 0), 1)
+                        : 0
                     Rectangle()
                         .fill(accentColor)
-                        .frame(width: pm.duration > 0 ? g.size.width * min(pm.currentTime / pm.duration, 1) : 0)
+                        .frame(width: max(0, g.size.width * frac))
                 }
                 .frame(height: 2.5)
                 HStack(spacing: 12) {

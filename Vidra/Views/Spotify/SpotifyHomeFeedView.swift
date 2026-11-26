@@ -101,10 +101,12 @@ final class SpotifyHomeFeedModel: ObservableObject {
     @Published var recentlyPlayed: [SpotifyFeedCard] = []
     @Published var topCharts: [SpotifyFeedCard] = []
     @Published var popularArtists: [SpotifyFeedCard] = []
+    @Published var userArtists: [SpotifyCard] = []
     @Published var isLoading = false
     @Published var selectedQuickItemId: String? = nil
 
     private var hasLoadedOnce = false
+    private var playbackTask: Task<Void, Never>?
 
     init() {
         buildCuratedQuickItems()
@@ -116,12 +118,15 @@ final class SpotifyHomeFeedModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        // 1. Build Quick Access items (Liked Songs + Dynamic/Curated Playlists)
+        // 1. Rebuild clean baseline before merging user data
         buildQuickItemsFromState()
+        buildCuratedCarousels()
 
         // 2. Fetch live data if Spotify account is authenticated
         if SpotifyAuth.shared.isLoggedIn {
             await loadSpotifyUserFeed()
+        } else {
+            userArtists = []
         }
 
         // 3. Populate Recent from Library history if available
@@ -468,11 +473,13 @@ final class SpotifyHomeFeedModel: ObservableObject {
                         playlistId: c.id
                     )
                 }
-                madeForYou = cards + madeForYou
+                let cardIds = Set(cards.map(\.id))
+                madeForYou = cards + madeForYou.filter { !cardIds.contains($0.id) }
             }
 
             if !followed.cards.isEmpty {
-                let userArtists = followed.cards.map { c in
+                self.userArtists = followed.cards
+                let followedFeedCards = followed.cards.map { c in
                     SpotifyFeedCard(
                         id: c.id,
                         title: c.title,
@@ -482,7 +489,8 @@ final class SpotifyHomeFeedModel: ObservableObject {
                         artistId: c.id
                     )
                 }
-                popularArtists = userArtists + popularArtists
+                let artistIds = Set(followedFeedCards.map(\.id))
+                popularArtists = followedFeedCards + popularArtists.filter { !artistIds.contains($0.id) }
             }
 
             _ = topPage
@@ -510,6 +518,7 @@ final class SpotifyHomeFeedModel: ObservableObject {
 
     func playQuickItem(_ item: SpotifyQuickItem) {
         selectedQuickItemId = item.id
+        playbackTask?.cancel()
 
         if let track = item.track {
             PlayerManager.shared.play(track)
@@ -522,52 +531,56 @@ final class SpotifyHomeFeedModel: ObservableObject {
                 if let first = tracks.first {
                     PlayerManager.shared.play(first, queue: Array(tracks.dropFirst()))
                 }
-            } else {
-                Task {
-                    if let liked = try? await SpotifyAPI.shared.likedSongs(), !liked.videos.isEmpty {
+            } else if SpotifyAuth.shared.isLoggedIn {
+                playbackTask = Task {
+                    if let liked = try? await SpotifyAPI.shared.likedSongs(), !Task.isCancelled, !liked.videos.isEmpty {
                         PlayerManager.shared.play(liked.videos[0], queue: Array(liked.videos.dropFirst()))
-                    } else {
-                        // Play a fallback top hit
-                        playFallbackSong(title: "Bài hát đã thích")
+                    } else if !Task.isCancelled {
+                        playFallbackSong(title: "V-Pop Top Hits")
                     }
                 }
+            } else {
+                playFallbackSong(title: "V-Pop Top Hits")
             }
             return
         }
 
-        if let playlistId = item.playlistId {
-            Task {
-                if let page = try? await SpotifyAPI.shared.playlistTracks(id: playlistId), !page.videos.isEmpty {
+        if let playlistId = item.playlistId, SpotifyAuth.shared.isLoggedIn {
+            playbackTask = Task {
+                if let page = try? await SpotifyAPI.shared.playlistTracks(id: playlistId), !Task.isCancelled, !page.videos.isEmpty {
                     PlayerManager.shared.play(page.videos[0], queue: Array(page.videos.dropFirst()))
-                } else {
+                } else if !Task.isCancelled {
                     playFallbackSong(title: item.title)
                 }
             }
+        } else {
+            playFallbackSong(title: item.title)
         }
     }
 
     func playFeedCard(_ card: SpotifyFeedCard) {
+        playbackTask?.cancel()
         if let track = card.track {
             PlayerManager.shared.play(track)
             return
         }
 
-        if let playlistId = card.playlistId {
-            Task {
-                if let page = try? await SpotifyAPI.shared.playlistTracks(id: playlistId), !page.videos.isEmpty {
+        if let playlistId = card.playlistId, SpotifyAuth.shared.isLoggedIn {
+            playbackTask = Task {
+                if let page = try? await SpotifyAPI.shared.playlistTracks(id: playlistId), !Task.isCancelled, !page.videos.isEmpty {
                     PlayerManager.shared.play(page.videos[0], queue: Array(page.videos.dropFirst()))
-                } else {
+                } else if !Task.isCancelled {
                     playFallbackSong(title: card.title)
                 }
             }
             return
         }
 
-        if let artistId = card.artistId {
-            Task {
-                if let top = try? await SpotifyAPI.shared.artistTopTracks(id: artistId), !top.isEmpty {
+        if let artistId = card.artistId, SpotifyAuth.shared.isLoggedIn {
+            playbackTask = Task {
+                if let top = try? await SpotifyAPI.shared.artistTopTracks(id: artistId), !Task.isCancelled, !top.isEmpty {
                     PlayerManager.shared.play(top[0], queue: Array(top.dropFirst()))
-                } else {
+                } else if !Task.isCancelled {
                     playFallbackSong(title: card.title)
                 }
             }
@@ -578,8 +591,10 @@ final class SpotifyHomeFeedModel: ObservableObject {
     }
 
     private func playFallbackSong(title: String) {
-        Task {
+        playbackTask?.cancel()
+        playbackTask = Task {
             if let search = try? await InnerTube.shared.musicSearch(title, continuation: nil),
+               !Task.isCancelled,
                let first = search.videos.first {
                 PlayerManager.shared.play(first, queue: Array(search.videos.dropFirst()))
             }
@@ -592,9 +607,13 @@ final class SpotifyHomeFeedModel: ObservableObject {
 struct SpotifyHomeFeedView: View {
     @StateObject private var model = SpotifyHomeFeedModel()
     @ObservedObject private var auth = SpotifyAuth.shared
+    @ObservedObject private var lib = Library.shared
+    @ObservedObject private var dl = DownloadManager.shared
     @State private var libraryFilter: SpotifyLibraryFilter? = nil
     @State private var librarySort: SpotifyLibrarySort = .recentPlayed
     @State private var showLoginSheet = false
+    @State private var showNotificationsAlert = false
+    @State private var showHistoryView = false
 
     private var greetingText: String {
         let hour = Calendar.current.component(.hour, from: Date())
@@ -660,6 +679,14 @@ struct SpotifyHomeFeedView: View {
             }
         }
         .navigationBarHidden(true)
+        .navigationDestination(isPresented: $showHistoryView) {
+            HistoryView()
+        }
+        .alert("Thông báo", isPresented: $showNotificationsAlert) {
+            Button("Đóng", role: .cancel) {}
+        } message: {
+            Text("Chưa có thông báo mới.")
+        }
         .sheet(isPresented: $showLoginSheet) {
             NavigationStack {
                 SpotifySetupView()
@@ -679,11 +706,11 @@ struct SpotifyHomeFeedView: View {
             await model.load()
         }
         .onChange(of: auth.isLoggedIn) { loggedIn in
-            if loggedIn {
-                Task {
+            Task {
+                if loggedIn {
                     await auth.loadProfile()
-                    await model.load()
                 }
+                await model.load()
             }
         }
     }
@@ -878,7 +905,7 @@ struct SpotifyHomeFeedView: View {
 
             HStack(spacing: 16) {
                 Button {
-                    // Notification center action
+                    showNotificationsAlert = true
                 } label: {
                     Image(systemName: "bell")
                         .font(.system(size: 19, weight: .medium))
@@ -886,7 +913,7 @@ struct SpotifyHomeFeedView: View {
                 }
 
                 Button {
-                    // History quick shortcut
+                    showHistoryView = true
                 } label: {
                     Image(systemName: "clock.arrow.circlepath")
                         .font(.system(size: 19, weight: .medium))
@@ -1180,24 +1207,28 @@ struct SpotifyHomeFeedView: View {
 
                     // Artists
                     if libraryFilter == nil || libraryFilter == .artists {
-                        ForEach(homeSortedArtists) { channel in
+                        ForEach(homeSortedArtists) { artist in
                             NavigationLink {
-                                SpotifyPlaylistDetailView(
-                                    title: channel.title,
-                                    cover: channel.avatar,
-                                    subtitle: "Nghệ sĩ",
-                                    creator: channel.title,
-                                    loader: { offset in
-                                        try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
-                                    }
-                                )
+                                if artist.id.hasPrefix("local_artist_") {
+                                    SpotifyPlaylistDetailView(
+                                        title: artist.title,
+                                        cover: artist.image,
+                                        subtitle: "Nghệ sĩ",
+                                        creator: artist.title,
+                                        continuationLoader: { token in
+                                            try await InnerTube.shared.search(artist.title, params: nil, continuation: token)
+                                        }
+                                    )
+                                } else {
+                                    SpotifyArtistView(artistId: artist.id, name: artist.title)
+                                }
                             } label: {
                                 VStack(alignment: .center, spacing: 8) {
-                                    Avatar(url: channel.avatar, name: channel.title, size: 130)
+                                    Avatar(url: artist.image, name: artist.title, size: 130)
                                         .clipShape(Circle())
 
                                     VStack(alignment: .center, spacing: 2) {
-                                        Text(channel.title)
+                                        Text(artist.title)
                                             .font(.system(size: 13, weight: .bold))
                                             .foregroundStyle(.white)
                                             .lineLimit(1)
@@ -1216,11 +1247,18 @@ struct SpotifyHomeFeedView: View {
                     if libraryFilter == nil || libraryFilter == .albums {
                         ForEach(homeSortedAlbums) { album in
                             NavigationLink {
+                                let albumName = String(album.id.dropFirst("local_album_".count))
+                                let tracks = lib.likedTracks.filter { ($0.published ?? "") == albumName }
                                 SpotifyPlaylistDetailView(
-                                    albumId: album.id,
-                                    name: album.title,
+                                    title: album.title,
                                     cover: album.image,
-                                    subtitle: album.subtitle
+                                    subtitle: album.subtitle,
+                                    creator: album.subtitle.isEmpty ? "Nghệ sĩ" : album.subtitle,
+                                    isAlbum: true,
+                                    loader: { offset in
+                                        let slice = Array(tracks.dropFirst(offset).prefix(50))
+                                        return Page(videos: slice, continuation: offset + 50 < tracks.count ? "\(offset + 50)" : nil)
+                                    }
                                 )
                             } label: {
                                 VStack(alignment: .leading, spacing: 8) {
@@ -1260,9 +1298,10 @@ struct SpotifyHomeFeedView: View {
 
                     // Downloaded Tracks (if filtered to downloaded)
                     if libraryFilter == .downloaded {
-                        ForEach(homeSortedDownloads) { item in
+                        let dlVideos = homeSortedDownloads.map(\.video)
+                        ForEach(Array(homeSortedDownloads.enumerated()), id: \.element.id) { idx, item in
                             Button {
-                                PlayerManager.shared.play(item.video, queue: homeSortedDownloads.map(\.video))
+                                PlayerManager.shared.play(item.video, queue: Array(dlVideos.dropFirst(idx + 1)))
                             } label: {
                                 VStack(alignment: .leading, spacing: 8) {
                                     ZStack {
@@ -1343,15 +1382,35 @@ struct SpotifyHomeFeedView: View {
         }
     }
 
-    private var homeSortedArtists: [Channel] {
-        let list = Library.shared.subscriptions
+    private var homeSortedArtists: [SpotifyCard] {
+        let list: [SpotifyCard]
+        if auth.isLoggedIn && !model.userArtists.isEmpty {
+            list = model.userArtists
+        } else {
+            var seen = Set<String>()
+            var derived: [SpotifyCard] = []
+            for track in lib.likedTracks {
+                let artist = track.channelTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !artist.isEmpty else { continue }
+                let key = artist.lowercased()
+                if seen.insert(key).inserted {
+                    derived.append(SpotifyCard(
+                        id: "local_artist_\(artist)",
+                        kind: .artist,
+                        title: artist,
+                        subtitle: "Nghệ sĩ",
+                        image: track.thumbnail
+                    ))
+                }
+            }
+            list = derived
+        }
         switch librarySort {
         case .recentPlayed:
-            let historyChannelIds = Library.shared.history.compactMap(\.video.channelId)
-            let historyChannelTitles = Library.shared.history.map(\.video.channelTitle)
+            let historyChannelTitles = lib.history.map { $0.video.channelTitle.lowercased() }
             return list.sorted { c1, c2 in
-                let idx1 = historyChannelIds.firstIndex(of: c1.id) ?? historyChannelTitles.firstIndex(of: c1.title) ?? Int.max
-                let idx2 = historyChannelIds.firstIndex(of: c2.id) ?? historyChannelTitles.firstIndex(of: c2.title) ?? Int.max
+                let idx1 = historyChannelTitles.firstIndex(of: c1.title.lowercased()) ?? Int.max
+                let idx2 = historyChannelTitles.firstIndex(of: c2.title.lowercased()) ?? Int.max
                 if idx1 != idx2 { return idx1 < idx2 }
                 return c1.title.localizedCompare(c2.title) == .orderedAscending
             }
@@ -1363,7 +1422,7 @@ struct SpotifyHomeFeedView: View {
     }
 
     private var homeSortedAlbums: [SpotifyCard] {
-        let grouped = Dictionary(grouping: Library.shared.likedTracks.filter { !($0.published ?? "").isEmpty }) { $0.published ?? "" }
+        let grouped = Dictionary(grouping: lib.likedTracks.filter { !($0.published ?? "").isEmpty }) { $0.published ?? "" }
         let list = grouped.compactMap { (albumName, tracks) -> SpotifyCard? in
             guard !albumName.isEmpty, let first = tracks.first else { return nil }
             return SpotifyCard(
@@ -1376,10 +1435,10 @@ struct SpotifyHomeFeedView: View {
         }
         switch librarySort {
         case .recentPlayed:
-            let historyTitles = Library.shared.history.map(\.video.title)
+            let historyAlbums = lib.history.compactMap { $0.video.published?.lowercased() }
             return list.sorted { a1, a2 in
-                let idx1 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a1.title) }) ?? Int.max
-                let idx2 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a2.title) }) ?? Int.max
+                let idx1 = historyAlbums.firstIndex(of: a1.title.lowercased()) ?? Int.max
+                let idx2 = historyAlbums.firstIndex(of: a2.title.lowercased()) ?? Int.max
                 if idx1 != idx2 { return idx1 < idx2 }
                 return a1.title.localizedCompare(a2.title) == .orderedAscending
             }
@@ -1391,10 +1450,10 @@ struct SpotifyHomeFeedView: View {
     }
 
     private var homeSortedDownloads: [DownloadItem] {
-        let list = DownloadManager.shared.items
+        let list = dl.items
         switch librarySort {
         case .recentPlayed:
-            let historyIds = Library.shared.history.map(\.video.id)
+            let historyIds = lib.history.map(\.video.id)
             return list.sorted { d1, d2 in
                 let idx1 = historyIds.firstIndex(of: d1.video.id) ?? Int.max
                 let idx2 = historyIds.firstIndex(of: d2.video.id) ?? Int.max
@@ -1402,7 +1461,7 @@ struct SpotifyHomeFeedView: View {
                 return d1.video.title.localizedCompare(d2.video.title) == .orderedAscending
             }
         case .recentlyAdded:
-            return Array(list.reversed())
+            return list
         case .alphabetical:
             return list.sorted { $0.video.title.localizedCompare($1.video.title) == .orderedAscending }
         }
@@ -1420,15 +1479,20 @@ struct SpotifyHomeFeedView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(model.madeForYou) { card in
-                        NavigationLink {
-                            destinationForCard(card)
-                        } label: {
-                            SpotifySquareCardView(
-                                card: card,
-                                onPlayTap: { model.playFeedCard(card) }
-                            )
+                        ZStack(alignment: .topTrailing) {
+                            NavigationLink {
+                                destinationForCard(card)
+                            } label: {
+                                SpotifySquareCardView(card: card)
+                            }
+                            .buttonStyle(.plain)
+
+                            SpotifySquareCardPlayButton {
+                                model.playFeedCard(card)
+                            }
+                            .padding(.top, 102)
+                            .padding(.trailing, 8)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1446,15 +1510,20 @@ struct SpotifyHomeFeedView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(model.recentlyPlayed) { card in
-                        NavigationLink {
-                            destinationForCard(card)
-                        } label: {
-                            SpotifySquareCardView(
-                                card: card,
-                                onPlayTap: { model.playFeedCard(card) }
-                            )
+                        ZStack(alignment: .topTrailing) {
+                            NavigationLink {
+                                destinationForCard(card)
+                            } label: {
+                                SpotifySquareCardView(card: card)
+                            }
+                            .buttonStyle(.plain)
+
+                            SpotifySquareCardPlayButton {
+                                model.playFeedCard(card)
+                            }
+                            .padding(.top, 102)
+                            .padding(.trailing, 8)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1472,15 +1541,20 @@ struct SpotifyHomeFeedView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(model.topCharts) { card in
-                        NavigationLink {
-                            destinationForCard(card)
-                        } label: {
-                            SpotifySquareCardView(
-                                card: card,
-                                onPlayTap: { model.playFeedCard(card) }
-                            )
+                        ZStack(alignment: .topTrailing) {
+                            NavigationLink {
+                                destinationForCard(card)
+                            } label: {
+                                SpotifySquareCardView(card: card)
+                            }
+                            .buttonStyle(.plain)
+
+                            SpotifySquareCardPlayButton {
+                                model.playFeedCard(card)
+                            }
+                            .padding(.top, 102)
+                            .padding(.trailing, 8)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1498,15 +1572,20 @@ struct SpotifyHomeFeedView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(model.popularArtists) { card in
-                        NavigationLink {
-                            destinationForCard(card)
-                        } label: {
-                            SpotifyArtistCircleCardView(
-                                card: card,
-                                onPlayTap: { model.playFeedCard(card) }
-                            )
+                        ZStack(alignment: .topTrailing) {
+                            NavigationLink {
+                                destinationForCard(card)
+                            } label: {
+                                SpotifyArtistCircleCardView(card: card)
+                            }
+                            .buttonStyle(.plain)
+
+                            SpotifySquareCardPlayButton(size: 32, iconSize: 13) {
+                                model.playFeedCard(card)
+                            }
+                            .padding(.top, 98)
+                            .padding(.trailing, 4)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1562,54 +1641,66 @@ struct SpotifyQuickAccessCard: View {
     let onTap: () -> Void
 
     var body: some View {
-        NavigationLink {
-            destination
-        } label: {
-            HStack(spacing: 0) {
-                // Artwork 56x56
-                ZStack {
-                    if let gradient = item.gradient {
-                        Rectangle()
-                            .fill(gradient)
-                        if let icon = item.systemIcon {
-                            Image(systemName: icon)
-                                .font(.system(size: 22, weight: .bold))
-                                .foregroundStyle(.white)
-                        }
-                    } else if let url = item.image {
-                        CachedAsyncImage(url: url, targetSize: CGSize(width: 112, height: 112)) { img in
-                            img.resizable().scaledToFill()
-                        } placeholder: {
+        ZStack(alignment: .trailing) {
+            NavigationLink {
+                destination
+            } label: {
+                HStack(spacing: 0) {
+                    // Artwork 56x56
+                    ZStack {
+                        if let gradient = item.gradient {
+                            Rectangle()
+                                .fill(gradient)
+                            if let icon = item.systemIcon {
+                                Image(systemName: icon)
+                                    .font(.system(size: 22, weight: .bold))
+                                    .foregroundStyle(.white)
+                            }
+                        } else if let url = item.image {
+                            CachedAsyncImage(url: url, targetSize: CGSize(width: 112, height: 112)) { img in
+                                img.resizable().scaledToFill()
+                            } placeholder: {
+                                Color.spotifyDarkGray
+                                    .overlay(
+                                        Image(systemName: "music.note")
+                                            .font(.title3)
+                                            .foregroundStyle(Color.spotifySubtext)
+                                    )
+                            }
+                        } else {
                             Color.spotifyDarkGray
                                 .overlay(
-                                    Image(systemName: "music.note")
+                                    Image(systemName: "music.note.list")
                                         .font(.title3)
                                         .foregroundStyle(Color.spotifySubtext)
                                 )
                         }
-                    } else {
-                        Color.spotifyDarkGray
-                            .overlay(
-                                Image(systemName: "music.note.list")
-                                    .font(.title3)
-                                    .foregroundStyle(Color.spotifySubtext)
-                            )
                     }
+                    .frame(width: 56, height: 56)
+                    .clipped()
+
+                    // Title
+                    Text(item.title)
+                        .font(.footnote.bold())
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .padding(.leading, 10)
+                        .padding(.trailing, isSelected ? 44 : 10)
+
+                    Spacer(minLength: 0)
                 }
-                .frame(width: 56, height: 56)
-                .clipped()
+                .frame(height: 56)
+                .background(Color.spotifyCard)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .simultaneousGesture(TapGesture().onEnded {
+                onTap()
+            })
 
-                // Title
-                Text(item.title)
-                    .font(.footnote.bold())
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .padding(.horizontal, 10)
-
-                Spacer(minLength: 0)
-
-                // Play Button (Always visible on selection or tap)
+            if isSelected {
                 Button {
                     onPlay()
                 } label: {
@@ -1624,19 +1715,12 @@ struct SpotifyQuickAccessCard: View {
                             .offset(x: 1)
                     }
                 }
+                .buttonStyle(.plain)
                 .padding(.trailing, 8)
-                .opacity(isSelected ? 1.0 : 0.0)
-                .animation(.easeInOut(duration: 0.18), value: isSelected)
+                .transition(.scale.combined(with: .opacity))
             }
-            .frame(height: 56)
-            .background(Color.spotifyCard)
-            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-            .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         }
-        .buttonStyle(.plain)
-        .simultaneousGesture(TapGesture().onEnded {
-            onTap()
-        })
+        .animation(.easeInOut(duration: 0.18), value: isSelected)
     }
 
     @ViewBuilder
@@ -1672,51 +1756,55 @@ struct SpotifyQuickAccessCard: View {
 
 // MARK: - Square Carousel Card View (148x148, 4pt corners)
 
+struct SpotifySquareCardPlayButton: View {
+    var size: CGFloat = 38
+    var iconSize: CGFloat = 15
+    let onTap: () -> Void
+
+    var body: some View {
+        Button {
+            onTap()
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(Color.spotifyGreen)
+                    .frame(width: size, height: size)
+                    .shadow(color: .black.opacity(0.4), radius: 4, x: 0, y: 2)
+                Image(systemName: "play.fill")
+                    .font(.system(size: iconSize, weight: .bold))
+                    .foregroundStyle(.black)
+                    .offset(x: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct SpotifySquareCardView: View {
     let card: SpotifyFeedCard
-    let onPlayTap: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Square Cover Art
-            ZStack(alignment: .bottomTrailing) {
-                Color.spotifyDarkGray
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                        if let url = card.image {
-                            CachedAsyncImage(url: url, targetSize: CGSize(width: 200, height: 200)) { image in
-                                image.resizable().scaledToFill()
-                            } placeholder: {
-                                Image(systemName: "music.note")
-                                    .font(.largeTitle)
-                                    .foregroundStyle(Color.spotifySubtext)
-                            }
-                        } else {
+            Color.spotifyDarkGray
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    if let url = card.image {
+                        CachedAsyncImage(url: url, targetSize: CGSize(width: 200, height: 200)) { image in
+                            image.resizable().scaledToFill()
+                        } placeholder: {
                             Image(systemName: "music.note")
                                 .font(.largeTitle)
                                 .foregroundStyle(Color.spotifySubtext)
                         }
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-
-                // Green Play Button Overlay
-                Button {
-                    onPlayTap()
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Color.spotifyGreen)
-                            .frame(width: 38, height: 38)
-                            .shadow(color: .black.opacity(0.4), radius: 4, x: 0, y: 2)
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(.black)
-                            .offset(x: 1)
+                    } else {
+                        Image(systemName: "music.note")
+                            .font(.largeTitle)
+                            .foregroundStyle(Color.spotifySubtext)
                     }
                 }
-                .padding(8)
-            }
-            .frame(width: 148, height: 148)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .frame(width: 148, height: 148)
 
             // Title
             Text(card.title)
@@ -1745,32 +1833,29 @@ struct SpotifySquareCardView: View {
 
 struct SpotifyArtistCircleCardView: View {
     let card: SpotifyFeedCard
-    let onPlayTap: () -> Void
 
     var body: some View {
         VStack(alignment: .center, spacing: 8) {
             // Circular Avatar
-            ZStack(alignment: .bottomTrailing) {
-                Color.spotifyDarkGray
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                        if let url = card.image {
-                            CachedAsyncImage(url: url, targetSize: CGSize(width: 140, height: 140)) { img in
-                                img.resizable().scaledToFill()
-                            } placeholder: {
-                                Image(systemName: "person.fill")
-                                    .font(.system(size: 44))
-                                    .foregroundStyle(Color.spotifySubtext)
-                            }
-                        } else {
+            Color.spotifyDarkGray
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    if let url = card.image {
+                        CachedAsyncImage(url: url, targetSize: CGSize(width: 140, height: 140)) { img in
+                            img.resizable().scaledToFill()
+                        } placeholder: {
                             Image(systemName: "person.fill")
                                 .font(.system(size: 44))
                                 .foregroundStyle(Color.spotifySubtext)
                         }
+                    } else {
+                        Image(systemName: "person.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(Color.spotifySubtext)
                     }
-                    .clipShape(Circle())
-            }
-            .frame(width: 136, height: 136)
+                }
+                .clipShape(Circle())
+                .frame(width: 136, height: 136)
 
             // Artist Name
             Text(card.title)

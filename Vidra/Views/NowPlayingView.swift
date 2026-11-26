@@ -13,6 +13,13 @@ final class ArtworkColorCache {
     private var keys: [URL] = []
     private var inFlight: [URL: Task<Color?, Never>] = [:]
 
+    func clear() {
+        for (_, t) in inFlight { t.cancel() }
+        inFlight.removeAll()
+        cache.removeAll()
+        keys.removeAll()
+    }
+
     func color(for url: URL) async -> Color? {
         if let hit = cache[url] { return hit }
         if let existingTask = inFlight[url] {
@@ -67,7 +74,6 @@ final class ArtworkColorCache {
 struct NowPlayingView: View {
     @ObservedObject private var pm = PlayerManager.shared
     @ObservedObject private var library = Library.shared
-    @ObservedObject private var downloads = DownloadManager.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var tint: Color = Color(white: 0.25)
@@ -102,10 +108,21 @@ struct NowPlayingView: View {
             SpotifyRemapSheet(video: v).presentationDetents([.medium, .large])
         }
         .task(id: pm.current?.id) {
-            showLyrics = false
             scrub = nil
-            await loadTrackData()
-            await loadLyrics()
+            artDrag = 0
+            lyrics = nil
+            async let trackTask: Void = loadTrackData()
+            async let lyricsTask: Void = loadLyrics()
+            _ = await (trackTask, lyricsTask)
+        }
+        .onChange(of: pm.duration) { newDur in
+            if newDur > 0 && lyrics == nil && !lyricsLoading && pm.current != nil {
+                Task { await loadLyrics() }
+            }
+        }
+        .onDisappear {
+            scrub = nil
+            artDrag = 0
         }
     }
 
@@ -169,10 +186,7 @@ struct NowPlayingView: View {
                 Button { addTarget = v } label: {
                     Label("Thêm vào danh sách phát", systemImage: "text.badge.plus")
                 }
-                Button { DownloadManager.shared.start(v, audioOnly: true) } label: {
-                    Label(downloadTitle(v), systemImage: "arrow.down.circle")
-                }
-                .disabled(downloads.isDownloaded(v.id) || downloads.active[v.id] != nil)
+                NowPlayingDownloadMenuItem(video: v)
                 ShareLink(item: v.shareURL) {
                     Label("Chia sẻ", systemImage: "square.and.arrow.up")
                 }
@@ -189,11 +203,6 @@ struct NowPlayingView: View {
         case .ytMusic?: return "YouTube Music"
         case nil: return "YouTube"
         }
-    }
-
-    private func downloadTitle(_ v: Video) -> String {
-        if downloads.isDownloaded(v.id) { return "Đã tải xuống" }
-        return downloads.active[v.id] != nil ? "Đang tải xuống…" : "Tải xuống"
     }
 
     private func artwork(_ v: Video) -> some View {
@@ -284,9 +293,10 @@ struct NowPlayingView: View {
     // MARK: Scrubber
 
     private func scrubber(_ v: Video) -> some View {
-        let total = max(pm.duration, 0)
-        let fraction = scrub ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
-        let shownTime = scrub.map { $0 * total } ?? pm.currentTime
+        let canSeek = pm.info?.isLive != true && pm.duration.isFinite && pm.duration > 0
+        let total = canSeek ? pm.duration : 0
+        let fraction = canSeek ? (scrub ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)) : 0
+        let shownTime = canSeek ? (scrub.map { $0 * total } ?? pm.currentTime) : pm.currentTime
         return VStack(spacing: 4) {
             GeometryReader { geo in
                 SlimTrack(progress: fraction)
@@ -294,12 +304,14 @@ struct NowPlayingView: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { g in
+                            guard canSeek, geo.size.width > 0 else { return }
                             scrub = min(max(g.location.x / max(geo.size.width, 1), 0), 1)
                         }
                         .onEnded { g in
+                            defer { scrub = nil }
+                            guard canSeek, geo.size.width > 0 else { return }
                             let f = min(max(g.location.x / max(geo.size.width, 1), 0), 1)
-                            scrub = nil
-                            if total > 0 { pm.seek(to: f * total) }
+                            pm.seek(to: f * total)
                         }
                 )
             }
@@ -307,12 +319,15 @@ struct NowPlayingView: View {
             HStack {
                 Text(Fmt.time(shownTime))
                 Spacer()
-                Text("-" + Fmt.time(max(total - shownTime, 0)))
+                Text(total > 0 ? "-" + Fmt.time(max(total - shownTime, 0)) : "0:00")
             }
             .font(.caption.monospacedDigit())
             .foregroundStyle(Color.white.opacity(0.6))
         }
         .padding(.vertical, 8)
+        .onChange(of: canSeek) { valid in
+            if !valid { scrub = nil }
+        }
     }
 
     // MARK: Controls
@@ -383,12 +398,16 @@ struct NowPlayingView: View {
 
     private func loadLyrics() async {
         lyrics = nil
-        guard let v = pm.current else { return }
+        guard let v = pm.current else {
+            lyricsLoading = false
+            return
+        }
         lyricsLoading = true
-        let result = await LyricsService.shared.lyrics(for: v, duration: pm.duration)
-        guard !Task.isCancelled else { return }
+        defer { lyricsLoading = false }
+        let dur = pm.duration > 0 ? pm.duration : (Fmt.seconds(v.duration) ?? 0)
+        let result = await LyricsService.shared.lyrics(for: v, duration: dur)
+        guard !Task.isCancelled, pm.current?.id == v.id else { return }
         lyrics = result
-        lyricsLoading = false
     }
 }
 
@@ -399,11 +418,12 @@ private struct SlimTrack: View {
 
     var body: some View {
         GeometryReader { geo in
+            let w = max(0, geo.size.width)
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.25)).frame(height: 4)
-                Capsule().fill(Color.white).frame(width: geo.size.width * progress, height: 4)
+                Capsule().fill(Color.white).frame(width: w * min(max(progress, 0), 1), height: 4)
                 Circle().fill(Color.white).frame(width: 12, height: 12)
-                    .offset(x: min(max(geo.size.width * progress - 6, 0), geo.size.width - 12))
+                    .offset(x: min(max(w * min(max(progress, 0), 1) - 6, 0), max(0, w - 12)))
             }
             .frame(maxHeight: .infinity)
         }
@@ -474,6 +494,11 @@ struct LyricsView: View {
                     endPoint: .bottom
                 )
             )
+            .onAppear {
+                if idx >= 0 {
+                    proxy.scrollTo(idx, anchor: .center)
+                }
+            }
             .onChange(of: idx) { newValue in
                 guard newValue >= 0 else { return }
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
@@ -500,14 +525,23 @@ private struct QueueSheet: View {
                     if pm.queue.isEmpty {
                         Text("Hàng đợi trống").foregroundStyle(.secondary)
                     }
-                    ForEach(pm.queue) { v in row(v) }
-                        .onMove { pm.queue.move(fromOffsets: $0, toOffset: $1) }
-                        .onDelete { pm.queue.remove(atOffsets: $0) }
+                    ForEach(pm.queue) { v in
+                        Button {
+                            if let i = pm.queue.firstIndex(where: { $0.id == v.id }) {
+                                pm.play(v, queue: Array(pm.queue.dropFirst(i + 1)), showWatchSheet: false)
+                            }
+                        } label: {
+                            row(v)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .onMove { pm.queue.move(fromOffsets: $0, toOffset: $1) }
+                    .onDelete { pm.queue.remove(atOffsets: $0) }
                 }
                 if !pm.related.isEmpty {
                     Section("Radio – phát tiếp") {
-                        ForEach(pm.related) { v in
-                            Button { pm.play(v) } label: { row(v) }
+                        ForEach(Array(pm.related.enumerated()), id: \.element.id) { idx, v in
+                            Button { pm.play(v, queue: Array(pm.related.dropFirst(idx + 1)), showWatchSheet: false) } label: { row(v) }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -539,5 +573,24 @@ private struct QueueSheet: View {
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
+    }
+}
+
+private struct NowPlayingDownloadMenuItem: View {
+    let video: Video
+    @ObservedObject private var downloads = DownloadManager.shared
+
+    var body: some View {
+        Button {
+            DownloadManager.shared.start(video, audioOnly: true)
+        } label: {
+            Label(title, systemImage: "arrow.down.circle")
+        }
+        .disabled(downloads.isDownloaded(video.id) || downloads.active[video.id] != nil)
+    }
+
+    private var title: String {
+        if downloads.isDownloaded(video.id) { return "Đã tải xuống" }
+        return downloads.active[video.id] != nil ? "Đang tải xuống…" : "Tải xuống"
     }
 }

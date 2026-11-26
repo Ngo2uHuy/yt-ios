@@ -89,7 +89,7 @@ struct SpotifyHeader: View {
         self.onFilterChange = onFilterChange
     }
 
-    /// Convenience initializer with internal static filter state
+    /// Convenience initializer with internal filter state (interactive even without parent binding)
     init(
         avatarURL: URL? = nil,
         onAvatarTap: (() -> Void)? = nil

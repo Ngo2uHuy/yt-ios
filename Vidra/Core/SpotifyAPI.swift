@@ -104,6 +104,7 @@ final class SpotifyAuth: ObservableObject {
     private var accessToken: String?
     private var expiry = Date.distantPast
     private var refreshTask: Task<String, Error>?
+    private var authGeneration: UInt64 = 0
     private var session: ASWebAuthenticationSession?
     private let anchor = SpotifyAnchor()
 
@@ -125,6 +126,7 @@ final class SpotifyAuth: ObservableObject {
         guard !isWorking else { return }
         isWorking = true
         error = nil
+        let loginGen = authGeneration
         defer { isWorking = false }
 
         let verifier = Self.makeVerifier()
@@ -142,22 +144,30 @@ final class SpotifyAuth: ObservableObject {
         guard let authURL = comps.url else { return }
 
         do {
-            let callback: URL = try await withCheckedThrowingContinuation { cont in
-                let s = ASWebAuthenticationSession(url: authURL, callbackURLScheme: "vidra") { url, err in
-                    if let url {
-                        cont.resume(returning: url)
-                    } else {
-                        cont.resume(throwing: err ?? SpotifyError.message("Đăng nhập không thành công"))
+            let callback: URL = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { cont in
+                    let s = ASWebAuthenticationSession(url: authURL, callbackURLScheme: "vidra") { url, err in
+                        if let url {
+                            cont.resume(returning: url)
+                        } else {
+                            cont.resume(throwing: err ?? SpotifyError.message("Đăng nhập không thành công"))
+                        }
+                    }
+                    s.presentationContextProvider = anchor
+                    session = s
+                    if !s.start() {
+                        session = nil
+                        cont.resume(throwing: SpotifyError.message("Không mở được trang đăng nhập Spotify"))
                     }
                 }
-                s.presentationContextProvider = anchor
-                session = s
-                if !s.start() {
-                    session = nil
-                    cont.resume(throwing: SpotifyError.message("Không mở được trang đăng nhập Spotify"))
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.session?.cancel()
+                    self?.session = nil
                 }
             }
             session = nil
+            guard authGeneration == loginGen else { return }
 
             let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems ?? []
             func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
@@ -174,24 +184,30 @@ final class SpotifyAuth: ObservableObject {
                 "client_id": id,
                 "code_verifier": verifier,
             ])
+            guard authGeneration == loginGen, !Task.isCancelled else { return }
             store(token)
             isLoggedIn = true
             profile = nil
         } catch {
             session = nil
             if let e = error as? ASWebAuthenticationSessionError, e.code == .canceledLogin { return }
+            if error is CancellationError { return }
             self.error = error.localizedDescription
         }
     }
 
     func logout() {
+        authGeneration &+= 1
         SpotifyKeychain.delete()
         accessToken = nil
         expiry = .distantPast
         refreshTask?.cancel()
         refreshTask = nil
+        session?.cancel()
+        session = nil
         profile = nil
         isLoggedIn = false
+        Task { await SpotifyAPI.shared.clearCaches() }
     }
 
     // MARK: Tokens
@@ -201,21 +217,29 @@ final class SpotifyAuth: ObservableObject {
         return try await refresh()
     }
 
-    /// Drops the cached access token so the next `validToken()` refreshes (used after a 401).
-    func invalidateToken() {
+    /// Drops the cached access token ONLY if it still matches `failedToken`, preventing stampedes on concurrent 401s.
+    func invalidateToken(ifMatching failedToken: String? = nil) {
+        if let failedToken, accessToken != failedToken { return }
         accessToken = nil
         expiry = .distantPast
     }
 
     private func refresh() async throws -> String {
         if let task = refreshTask { return try await task.value }
-        let task = Task { try await self.doRefresh() }
+        let gen = authGeneration
+        var createdTask: Task<String, Error>?
+        let task = Task {
+            try await self.doRefresh(generation: gen)
+        }
+        createdTask = task
         refreshTask = task
-        defer { refreshTask = nil }
+        defer {
+            if refreshTask == createdTask { refreshTask = nil }
+        }
         return try await task.value
     }
 
-    private func doRefresh() async throws -> String {
+    private func doRefresh(generation: UInt64) async throws -> String {
         guard let refreshToken = SpotifyKeychain.read(), !trimmedClientId.isEmpty else {
             logout()
             throw SpotifyError.notLoggedIn
@@ -226,10 +250,11 @@ final class SpotifyAuth: ObservableObject {
                 "refresh_token": refreshToken,
                 "client_id": trimmedClientId,
             ])
+            guard generation == authGeneration else { throw SpotifyError.notLoggedIn }
             store(token)
             return token.access
         } catch SpotifyError.notLoggedIn {
-            logout()
+            if generation == authGeneration { logout() }
             throw SpotifyError.notLoggedIn
         }
     }
@@ -251,22 +276,34 @@ final class SpotifyAuth: ObservableObject {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = Data(Self.formEncode(params).utf8)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        let j = J(data: data)
-        guard (200..<300).contains(code), let access = j["access_token"].string else {
-            if j["error"].string == "invalid_grant" { throw SpotifyError.notLoggedIn }
-            let detail = j["error_description"].string ?? j["error"].string ?? "HTTP \(code)"
-            throw SpotifyError.message("Không lấy được token Spotify: \(detail)")
+
+        for attempt in 0..<2 {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let http = resp as? HTTPURLResponse
+            let code = http?.statusCode ?? 0
+            if code == 429 && attempt == 0 {
+                let wait = min(max(Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 1, 1), 15)
+                try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                continue
+            }
+            let j = J(data: data)
+            guard (200..<300).contains(code), let access = j["access_token"].string else {
+                if j["error"].string == "invalid_grant" { throw SpotifyError.notLoggedIn }
+                let detail = j["error_description"].string ?? j["error"].string ?? "HTTP \(code)"
+                throw SpotifyError.message("Không lấy được token Spotify: \(detail)")
+            }
+            return TokenResponse(access: access,
+                                 refresh: j["refresh_token"].string,
+                                 expiresIn: Double(j["expires_in"].int ?? 3600))
         }
-        return TokenResponse(access: access,
-                             refresh: j["refresh_token"].string,
-                             expiresIn: Double(j["expires_in"].int ?? 3600))
+        throw SpotifyError.http(429, nil)
     }
 
     func loadProfile() async {
         guard isLoggedIn, profile == nil else { return }
-        guard let j = try? await SpotifyAPI.shared.me() else { return }
+        let gen = authGeneration
+        guard let j = try? await SpotifyAPI.shared.me(),
+              isLoggedIn, gen == authGeneration else { return }
         profile = Profile(name: j["display_name"].string ?? j["id"].string ?? "Spotify",
                           image: SpotifyMap.image(j["images"]))
     }
@@ -340,7 +377,8 @@ enum SpotifyMap {
     }
 
     static func next(_ page: J, offset: Int, count: Int) -> String? {
-        page["next"].isNull ? nil : String(offset + count)
+        guard count > 0, !page["next"].isNull else { return nil }
+        return String(offset + count)
     }
 
     /// `album` is a fallback for track objects that carry no album (e.g. `albums/{id}/tracks`).
@@ -472,23 +510,15 @@ struct SpotifyDevice: Identifiable, Hashable, Sendable {
 
     var iconName: String {
         switch category {
-        case .computer:
-            return "laptopcomputer"
-        case .tv:
-            return "tv.fill"
+        case .computer: return "laptopcomputer"
+        case .tv: return "tv.fill"
         case .speaker:
-            if name.lowercased().contains("homepod") {
-                return "homepod.fill"
-            }
+            if name.lowercased().contains("homepod") { return "homepod.fill" }
             return "hifispeaker.2.fill"
-        case .smartphone:
-            return "iphone"
-        case .tablet:
-            return "ipad"
-        case .cast:
-            return "airplayvideo"
-        case .airplay, .other:
-            return "hifispeaker.fill"
+        case .smartphone: return "iphone"
+        case .tablet: return "ipad"
+        case .cast: return "airplayvideo"
+        case .airplay, .other: return "hifispeaker.fill"
         }
     }
 
@@ -513,6 +543,14 @@ actor SpotifyAPI {
 
     private let base = "https://api.spotify.com/v1/"
     private var albumCache: [String: J] = [:]
+    private var albumCacheOrder: [String] = []
+    private var rateLimitedUntil: Date?
+
+    func clearCaches() {
+        albumCache.removeAll()
+        albumCacheOrder.removeAll()
+        rateLimitedUntil = nil
+    }
 
     func get(_ path: String, _ query: [String: String] = [:]) async throws -> J {
         try await request(method: "GET", path: path, query: query, body: nil)
@@ -527,7 +565,10 @@ actor SpotifyAPI {
     }
 
     private func request(method: String, path: String, query: [String: String] = [:], body: [String: Any]? = nil) async throws -> J {
-        guard var comps = URLComponents(string: base + path) else { throw URLError(.badURL) }
+        guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              var comps = URLComponents(string: base + encodedPath) else {
+            throw URLError(.badURL)
+        }
         if !query.isEmpty {
             comps.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
@@ -536,26 +577,36 @@ actor SpotifyAPI {
         var retriedAuth = false
         var retriedRate = false
         while true {
+            try Task.checkCancellation()
+            if let until = rateLimitedUntil {
+                let wait = until.timeIntervalSinceNow
+                if wait > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(min(wait, 30) * 1_000_000_000))
+                }
+            }
             let token = try await SpotifyAuth.shared.validToken()
             var req = URLRequest(url: url)
             req.httpMethod = method
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             if let body {
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
             }
             let (data, resp) = try await URLSession.shared.data(for: req)
             let http = resp as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 401, !retriedAuth {
                 retriedAuth = true
-                await SpotifyAuth.shared.invalidateToken()
+                await SpotifyAuth.shared.invalidateToken(ifMatching: token)
                 continue
             }
             if code == 429, !retriedRate {
                 retriedRate = true
-                let wait = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 1
-                try await Task.sleep(nanoseconds: UInt64(min(max(wait, 0), 5) * 1_000_000_000))
+                let wait = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 2
+                if wait > 30 { throw SpotifyError.http(429, nil) }
+                let clamped = max(wait, 1)
+                rateLimitedUntil = Date().addingTimeInterval(clamped)
+                try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
                 continue
             }
             if code == 204 { return J(nil) }
@@ -570,7 +621,6 @@ actor SpotifyAPI {
 
     // MARK: - Playback Control (Spotify Connect Web API)
 
-    /// Fetches a list of available Spotify Connect devices.
     func getDevices() async throws -> [SpotifyDevice] {
         let j = try await get("me/player/devices")
         return j["devices"].array.compactMap { d in
@@ -589,14 +639,12 @@ actor SpotifyAPI {
         }
     }
 
-    /// Sets playback volume percentage (0 - 100) on active Spotify Connect device.
     func setVolume(percent: Int, deviceId: String? = nil) async throws {
         var q = ["volume_percent": String(min(max(percent, 0), 100))]
         if let deviceId { q["device_id"] = deviceId }
         _ = try await put("me/player/volume", query: q)
     }
 
-    /// Transfers playback to a target Spotify device.
     func transferPlayback(to deviceId: String, play: Bool = true) async throws {
         let body: [String: Any] = [
             "device_ids": [deviceId],
@@ -605,46 +653,63 @@ actor SpotifyAPI {
         _ = try await put("me/player", body: body)
     }
 
-    /// Starts playback of a track URI directly on the user's active Spotify device or app.
-    func playTrack(uri: String) async throws {
+    func playTrack(uri: String, deviceId: String? = nil) async throws {
         let body: [String: Any] = ["uris": [uri]]
+        let query = deviceId.map { ["device_id": $0] } ?? [:]
         do {
-            _ = try await put("me/player/play", body: body)
+            _ = try await put("me/player/play", query: query, body: body)
         } catch let SpotifyError.http(code, _) where code == 404 {
-            // No active device found: attempt to find any available device and transfer playback
             if let devices = try? await getDevices(), let first = devices.first {
                 try await transferPlayback(to: first.id, play: true)
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                _ = try await put("me/player/play", body: body)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                _ = try await put("me/player/play", query: ["device_id": first.id], body: body)
             } else {
                 throw SpotifyError.message("Không tìm thấy thiết bị Spotify đang mở.")
             }
         }
     }
 
-    /// Pauses playback on active Spotify device.
     func pause() async throws {
         _ = try await put("me/player/pause")
     }
 
-    /// Resumes playback on active Spotify device.
     func resume() async throws {
         _ = try await put("me/player/play")
     }
 
-    /// Skips to next track on active Spotify device.
+    func pausePlayback() async throws {
+        try await pause()
+    }
+
+    func resumePlayback() async throws {
+        try await resume()
+    }
+
+    func seekPlayback(positionMs: Int) async throws {
+        try await seek(positionMs: max(0, positionMs))
+    }
+
     func next() async throws {
         _ = try await post("me/player/next")
     }
 
-    /// Skips to previous track on active Spotify device.
     func previous() async throws {
         _ = try await post("me/player/previous")
     }
 
-    /// Seeks to a position in milliseconds on active Spotify device.
     func seek(positionMs: Int) async throws {
-        _ = try await put("me/player/seek", query: ["position_ms": String(positionMs)])
+        _ = try await put("me/player/seek", query: ["position_ms": String(max(0, positionMs))])
+    }
+
+    func currentPlaybackState() async throws -> (isPlaying: Bool, progressMs: Int, durationMs: Int, trackId: String?)? {
+        let j = try await get("me/player")
+        guard !j.isNull else { return nil }
+        return (
+            isPlaying: j["is_playing"].bool ?? false,
+            progressMs: j["progress_ms"].int ?? 0,
+            durationMs: j["item"]["duration_ms"].int ?? 0,
+            trackId: j["item"]["id"].string
+        )
     }
 
     private func paging(_ offset: Int, limit: Int = 50) -> [String: String] {
@@ -700,7 +765,6 @@ actor SpotifyAPI {
         do {
             j = try await get("playlists/\(id)/tracks", q)
         } catch SpotifyError.http(let code, _) where code == 404 {
-            // Newer API revisions renamed the endpoint to `/items`.
             j = try await get("playlists/\(id)/items", q)
         }
         let items = j["items"].array
@@ -734,6 +798,11 @@ actor SpotifyAPI {
     private func albumInfo(id: String) async throws -> J {
         if let cached = albumCache[id] { return cached }
         let j = try await get("albums/\(id)")
+        while albumCacheOrder.count >= 100 {
+            let old = albumCacheOrder.removeFirst()
+            albumCache.removeValue(forKey: old)
+        }
+        albumCacheOrder.append(id)
         albumCache[id] = j
         return j
     }
@@ -837,7 +906,7 @@ final class SpotifyConnectManager: ObservableObject {
             name: devName,
             type: devType,
             isActive: true,
-            volumePercent: 85,
+            volumePercent: nil,
             protocolType: protoName,
             isLocal: true
         )
@@ -850,7 +919,6 @@ final class SpotifyConnectManager: ObservableObject {
         lastError = nil
         defer { isLoading = false }
 
-        // Local output device
         let currentRoute = AVAudioSession.sharedInstance().currentRoute
         let outputPort = currentRoute.outputs.first
         let isAirPlay = outputPort?.portType == .airPlay
@@ -859,92 +927,44 @@ final class SpotifyConnectManager: ObservableObject {
         let localName = isAirPlay ? (outputPort?.portName ?? "AirPlay") : (isBluetooth ? (outputPort?.portName ?? "Bluetooth") : UIDevice.current.name)
         let localProto = isAirPlay ? "AirPlay" : (isBluetooth ? "Bluetooth" : "Thiết bị này")
 
-        var result: [SpotifyDevice] = []
-
-        // 1. Fetch remote devices from Spotify Connect Web API if user is authenticated
         var remoteDevices: [SpotifyDevice] = []
         if SpotifyAuth.shared.isLoggedIn {
-            if let fetched = try? await SpotifyAPI.shared.getDevices() {
-                remoteDevices = fetched
+            do {
+                remoteDevices = try await SpotifyAPI.shared.getDevices()
+            } catch {
+                lastError = error.localizedDescription
             }
         }
 
-        // 2. Discover local Wi-Fi Smart Devices (TV, PC, Speakers)
-        let networkDevices = discoverLocalNetworkDevices()
-
-        // Combine: Remote active device or local phone
         let isRemoteActive = remoteDevices.contains { $0.isActive }
-
         let thisDevice = SpotifyDevice(
             id: "this_device",
             name: localName,
             type: (isAirPlay || isBluetooth) ? "Speaker" : "Smartphone",
             isActive: !isRemoteActive,
-            volumePercent: 85,
+            volumePercent: nil,
             protocolType: localProto,
             isLocal: true
         )
-        result.append(thisDevice)
 
-        // Add remote Spotify Connect devices
-        for dev in remoteDevices {
-            if dev.name.lowercased() != localName.lowercased() {
-                result.append(dev)
-            }
-        }
+        var result: [SpotifyDevice] = [thisDevice]
+        result.append(contentsOf: remoteDevices)
 
-        // Add discovered network devices if not duplicated
-        for netDev in networkDevices {
-            if !result.contains(where: { $0.name.lowercased() == netDev.name.lowercased() }) {
-                result.append(netDev)
-            }
-        }
-
-        // Update active device
         if let currentActiveRemote = remoteDevices.first(where: { $0.isActive }) {
             self.activeDevice = currentActiveRemote
-        } else if self.activeDevice == nil || self.activeDevice?.id == "this_device" {
+        } else {
             self.activeDevice = thisDevice
         }
-
         self.devices = result
-    }
-
-    /// Discovers common local Wi-Fi ecosystem devices (Smart TVs, Mac/PC, Speakers) on the network
-    private func discoverLocalNetworkDevices() -> [SpotifyDevice] {
-        return [
-            SpotifyDevice(
-                id: "net_smart_tv",
-                name: "Phòng khách (Smart TV)",
-                type: "TV",
-                isActive: false,
-                protocolType: "Spotify Connect / Google Cast",
-                isLocal: false
-            ),
-            SpotifyDevice(
-                id: "net_computer",
-                name: "MacBook Pro (Bàn làm việc)",
-                type: "Computer",
-                isActive: false,
-                protocolType: "Spotify Connect",
-                isLocal: false
-            ),
-            SpotifyDevice(
-                id: "net_speaker",
-                name: "Loa Phòng Ngủ (Sonos / HomePod)",
-                type: "Speaker",
-                isActive: false,
-                protocolType: "AirPlay / Spotify Connect",
-                isLocal: false
-            )
-        ]
     }
 
     func selectDevice(_ device: SpotifyDevice) async {
         transferringDeviceId = device.id
         lastError = nil
 
-        // Optimistic UI update
+        let previousDevices = devices
+        let previousActive = activeDevice
+
         let updated = devices.map { d -> SpotifyDevice in
             var copy = d
             copy.isActive = (d.id == device.id)
@@ -955,22 +975,21 @@ final class SpotifyConnectManager: ObservableObject {
         self.activeDevice = target
         self.devices = updated
 
-        // Haptic feedback
         let generator = UIImpactFeedbackGenerator(style: .medium)
         generator.prepare()
         generator.impactOccurred()
 
-        // Transfer playback
         if !device.isLocal && SpotifyAuth.shared.isLoggedIn {
             do {
                 try await SpotifyAPI.shared.transferPlayback(to: device.id, play: true)
             } catch {
-                self.lastError = nil
+                self.activeDevice = previousActive
+                self.devices = previousDevices
+                self.lastError = error.localizedDescription
             }
         }
 
-        // Short feedback delay
-        try? await Task.sleep(nanoseconds: 350_000_000)
+        try? await Task.sleep(nanoseconds: 250_000_000)
         transferringDeviceId = nil
     }
 

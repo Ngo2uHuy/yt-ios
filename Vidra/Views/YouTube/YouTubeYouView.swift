@@ -98,7 +98,7 @@ struct YouTubeYouView: View {
                 SettingsView()
             }
             .navigationDestination(isPresented: $showSearch) {
-                SearchView()
+                SearchView(needsNavigationStack: false)
             }
             .navigationDestination(isPresented: $showHistory) {
                 HistoryView()
@@ -519,10 +519,10 @@ struct YouTubeHistoryCard: View {
     }
 
     var body: some View {
-        Button {
-            PlayerManager.shared.play(video)
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                PlayerManager.shared.play(video)
+            } label: {
                 // 16:9 Thumbnail
                 ZStack(alignment: .bottomTrailing) {
                     Color(.secondarySystemFill)
@@ -558,15 +558,21 @@ struct YouTubeHistoryCard: View {
                         GeometryReader { g in
                             Rectangle()
                                 .fill(Color.red)
-                                .frame(width: g.size.width * CGFloat(progress), height: 3)
+                                .frame(width: g.size.width * min(max(progress, 0), 1), height: 3)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         }
+                        .allowsHitTesting(false)
                     }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
 
-                // Title & 3-dots
-                HStack(alignment: .top, spacing: 4) {
+            // Title & 3-dots (separate sibling Menu to avoid button conflict)
+            HStack(alignment: .top, spacing: 4) {
+                Button {
+                    PlayerManager.shared.play(video)
+                } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(video.title)
                             .font(.caption.weight(.medium))
@@ -579,39 +585,39 @@ struct YouTubeHistoryCard: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
-
-                    Spacer(minLength: 0)
-
-                    Menu {
-                        Button { PlayerManager.shared.playNext(video) } label: {
-                            Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
-                        }
-                        Button { lib.toggleWatchLater(video) } label: {
-                            Label(lib.isInWatchLater(video.id) ? "Bỏ khỏi Xem sau" : "Xem sau", systemImage: "clock")
-                        }
-                        Menu {
-                            Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
-                            Button("Chỉ âm thanh") { DownloadManager.shared.start(video, audioOnly: true) }
-                        } label: {
-                            Label("Tải xuống", systemImage: "arrow.down.circle")
-                        }
-                        ShareLink(item: video.shareURL) {
-                            Label("Chia sẻ", systemImage: "square.and.arrow.up")
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis")
-                            .rotationEffect(.degrees(90))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 20, height: 20)
-                            .contentShape(Rectangle())
-                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                .frame(width: 156)
+                .buttonStyle(.plain)
+
+                Menu {
+                    Button { PlayerManager.shared.playNext(video) } label: {
+                        Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
+                    }
+                    Button { lib.toggleWatchLater(video) } label: {
+                        Label(lib.isInWatchLater(video.id) ? "Bỏ khỏi Xem sau" : "Xem sau", systemImage: "clock")
+                    }
+                    Menu {
+                        Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
+                        Button("Chỉ âm thanh") { DownloadManager.shared.start(video, audioOnly: true) }
+                    } label: {
+                        Label("Tải xuống", systemImage: "arrow.down.circle")
+                    }
+                    ShareLink(item: video.shareURL) {
+                        Label("Chia sẻ", systemImage: "square.and.arrow.up")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .rotationEffect(.degrees(90))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-            .contentShape(Rectangle())
+            .frame(width: 156)
         }
-        .buttonStyle(.plain)
         .videoMenu(video)
     }
 }
@@ -734,6 +740,11 @@ struct YouTubeSubscriptionsView: View {
     @State private var showCastSheet = false
     @State private var showNotificationsSheet = false
     @State private var showAllSubscriptions = false
+    @State private var selectedVideoForActions: Video? = nil
+    @State private var pendingPlaylistVideo: Video? = nil
+    @State private var selectedVideoForPlaylists: Video? = nil
+    @State private var hiddenVideoIds: Set<String> = []
+    @State private var shareTarget: Video? = nil
 
     private let filters = ["Tất cả", "Hôm nay", "Tiếp tục xem", "Chưa xem", "Trực tiếp", "Bài đăng"]
 
@@ -799,10 +810,10 @@ struct YouTubeSubscriptionsView: View {
                 }
             }
             .navigationDestination(isPresented: $showSearch) {
-                SearchView()
+                SearchView(needsNavigationStack: false)
             }
             .navigationDestination(isPresented: $showAllSubscriptions) {
-                SubscriptionsView()
+                SubscriptionsView(needsNavigationStack: false)
             }
             .sheet(isPresented: $showCastSheet) {
                 YouTubeCastSheet()
@@ -810,7 +821,52 @@ struct YouTubeSubscriptionsView: View {
             .sheet(isPresented: $showNotificationsSheet) {
                 YouTubeNotificationsSheet()
             }
-            .task(id: lib.subscriptions.count) {
+            .sheet(item: $selectedVideoForActions, onDismiss: {
+                if let pending = pendingPlaylistVideo {
+                    pendingPlaylistVideo = nil
+                    selectedVideoForPlaylists = pending
+                }
+            }) { video in
+                YouTubeVideoActionSheet(
+                    video: video,
+                    onSaveToPlaylist: {
+                        pendingPlaylistVideo = video
+                        selectedVideoForActions = nil
+                    },
+                    onToggleWatchLater: {
+                        lib.toggleWatchLater(video)
+                    },
+                    onDownload: {
+                        DownloadManager.shared.start(video, audioOnly: false)
+                    },
+                    onShare: {
+                        shareTarget = video
+                    },
+                    onNotInterested: {
+                        hiddenVideoIds.insert(video.id)
+                    },
+                    onDontRecommendChannel: {
+                        if let cid = video.channelId, !cid.isEmpty {
+                            hiddenVideoIds.formUnion(feed.filter { $0.channelId == cid }.map(\.id))
+                        }
+                    }
+                )
+                .presentationDetents([.fraction(0.48), .large])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $selectedVideoForPlaylists) { video in
+                YouTubePlaylistPickerSheet(video: video)
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $shareTarget) { video in
+                ShareLink(item: video.shareURL) {
+                    Label("Chia sẻ video", systemImage: "square.and.arrow.up")
+                }
+                .padding()
+                .presentationDetents([.height(140)])
+            }
+            .task(id: lib.subscriptions.map(\.id)) {
                 await loadFeed()
             }
         }
@@ -936,17 +992,23 @@ struct YouTubeSubscriptionsView: View {
                 Spacer()
             }
         } else {
-            List {
-                ForEach(filteredFeed) { video in
-                    YouTubeVideoCard(
-                        video: video,
-                        queue: Array(filteredFeed.drop { $0.id != video.id }.dropFirst())
-                    )
-                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 16, trailing: 12))
-                    .listRowSeparator(.hidden)
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 12) {
+                    ForEach(Array(filteredFeed.enumerated()), id: \.element.id) { idx, video in
+                        YouTubeVideoCard(
+                            video: video,
+                            queue: Array(filteredFeed.dropFirst(idx + 1)),
+                            onMoreTap: {
+                                selectedVideoForActions = video
+                            },
+                            onCardTap: {
+                                PlayerManager.shared.play(video, queue: Array(filteredFeed.dropFirst(idx + 1)))
+                            }
+                        )
+                    }
                 }
+                .padding(.vertical, 8)
             }
-            .listStyle(.plain)
             .refreshable {
                 await loadFeed()
             }
@@ -954,13 +1016,27 @@ struct YouTubeSubscriptionsView: View {
     }
 
     private var filteredFeed: [Video] {
+        let base = feed.filter { !hiddenVideoIds.contains($0.id) }
         switch selectedFilter {
+        case "Hôm nay":
+            return base.filter { video in
+                guard let pub = video.published?.lowercased() else { return false }
+                let recentMarkers = ["giờ", "phút", "giây", "vừa", "hôm nay", "hour", "minute", "second", "today", "just now"]
+                return recentMarkers.contains { pub.contains($0) }
+            }
         case "Tiếp tục xem":
-            return feed.filter { lib.position($0.id) > 0 }
+            return base.filter { lib.position($0.id) > 0 }
         case "Chưa xem":
-            return feed.filter { lib.position($0.id) == 0 }
+            return base.filter { lib.position($0.id) == 0 }
+        case "Trực tiếp":
+            return base.filter { video in
+                let dur = video.duration?.lowercased() ?? ""
+                return dur.isEmpty || dur.contains("trực tiếp") || dur.contains("live")
+            }
+        case "Bài đăng":
+            return []
         default:
-            return feed
+            return base
         }
     }
 
@@ -1051,6 +1127,9 @@ struct YouTubeCastSheet: View {
                     Button("Xong") { dismiss() }
                 }
             }
+        }
+        .onReceive(PlayerManager.shared.$showWatch) { show in
+            if show { dismiss() }
         }
     }
 }
@@ -1161,6 +1240,9 @@ struct YouTubeAccountSwitchSheet: View {
                 }
             }
         }
+        .onReceive(PlayerManager.shared.$showWatch) { show in
+            if show { dismiss() }
+        }
     }
 }
 
@@ -1223,6 +1305,9 @@ struct YouTubeYourChannelSheet: View {
                 }
             }
         }
+        .onReceive(PlayerManager.shared.$showWatch) { show in
+            if show { dismiss() }
+        }
     }
 }
 
@@ -1273,6 +1358,9 @@ struct YouTubeTimeWatchedSheet: View {
                     Button("Xong") { dismiss() }
                 }
             }
+        }
+        .onReceive(PlayerManager.shared.$showWatch) { show in
+            if show { dismiss() }
         }
     }
 }
@@ -1438,6 +1526,9 @@ struct YouTubeAllPlaylistsSheet: View {
                     Button("Xong") { dismiss() }
                 }
             }
+        }
+        .onReceive(PlayerManager.shared.$showWatch) { show in
+            if show { dismiss() }
         }
     }
 }

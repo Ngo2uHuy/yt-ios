@@ -19,9 +19,12 @@ struct YouTubeHomeView: View {
     @State private var isLoadingMore: Bool = false
     @State private var errorMessage: String? = nil
     @State private var loadTask: Task<Void, Never>? = nil
+    @State private var nextPageTask: Task<Void, Never>? = nil
+    @State private var scrollToTopToken: Int = 0
 
     // Sheets & Dialogs
     @State private var selectedVideoForActions: Video? = nil
+    @State private var pendingPlaylistVideo: Video? = nil
     @State private var selectedVideoForPlaylists: Video? = nil
     @State private var showSearchSheet: Bool = false
     @State private var showCastAlert: Bool = false
@@ -113,14 +116,17 @@ struct YouTubeHomeView: View {
                 }
             }
             .navigationBarHidden(true)
-            .sheet(item: $selectedVideoForActions) { video in
+            .sheet(item: $selectedVideoForActions, onDismiss: {
+                if let pending = pendingPlaylistVideo {
+                    pendingPlaylistVideo = nil
+                    selectedVideoForPlaylists = pending
+                }
+            }) { video in
                 YouTubeVideoActionSheet(
                     video: video,
                     onSaveToPlaylist: {
+                        pendingPlaylistVideo = video
                         selectedVideoForActions = nil
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            selectedVideoForPlaylists = video
-                        }
                     },
                     onToggleWatchLater: {
                         lib.toggleWatchLater(video)
@@ -151,6 +157,11 @@ struct YouTubeHomeView: View {
             }
             .sheet(isPresented: $showSearchSheet) {
                 SearchView()
+            }
+            .onReceive(PlayerManager.shared.$showWatch) { show in
+                if show && showSearchSheet {
+                    showSearchSheet = false
+                }
             }
             .sheet(isPresented: $showNotificationsSheet) {
                 YouTubeNotificationsView()
@@ -257,7 +268,7 @@ struct YouTubeHomeView: View {
                             .frame(height: 1)
                             .id("FEED_TOP")
 
-                        ForEach(visibleVideos) { video in
+                        ForEach(Array(visibleVideos.enumerated()), id: \.element.id) { idx, video in
                             YouTubeVideoCard(
                                 video: video,
                                 cornerRadius: CGFloat(cardCornerRadiusSetting),
@@ -265,7 +276,7 @@ struct YouTubeHomeView: View {
                                     selectedVideoForActions = video
                                 },
                                 onCardTap: {
-                                    PlayerManager.shared.play(video, queue: visibleVideos)
+                                    PlayerManager.shared.play(video, queue: Array(visibleVideos.dropFirst(idx + 1)))
                                     PlayerManager.shared.showWatch = true
                                 }
                             )
@@ -304,6 +315,11 @@ struct YouTubeHomeView: View {
                 .refreshable {
                     await refreshFeed()
                 }
+                .onChange(of: scrollToTopToken) { _ in
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        proxy.scrollTo("FEED_TOP", anchor: .top)
+                    }
+                }
             }
         }
     }
@@ -311,6 +327,7 @@ struct YouTubeHomeView: View {
     // MARK: - Actions & Data Fetching
 
     private func scrollToTopAndRefresh() {
+        scrollToTopToken += 1
         Task {
             await refreshFeed()
         }
@@ -323,58 +340,76 @@ struct YouTubeHomeView: View {
 
     private func loadInitialFeed() async {
         loadTask?.cancel()
-        loadTask = Task {
+        nextPageTask?.cancel()
+        isLoadingMore = false
+        videos = []
+        continuationToken = nil
+        errorMessage = nil
+
+        let targetCategory = selectedCategory
+        let task = Task {
             isLoading = true
-            errorMessage = nil
-            continuationToken = nil
+            defer {
+                if !Task.isCancelled {
+                    isLoading = false
+                }
+            }
 
             do {
-                if selectedCategory == "Đã xem" {
+                if targetCategory == "Đã xem" {
                     videos = lib.history.map(\.video)
-                    isLoading = false
                     return
                 }
 
-                let query = queryForCategory(selectedCategory)
+                let query = queryForCategory(targetCategory)
                 let page = try await InnerTube.shared.search(query, params: nil, continuation: nil)
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, selectedCategory == targetCategory else { return }
 
                 videos = page.videos
                 continuationToken = page.continuation
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !(error is CancellationError), !Task.isCancelled, selectedCategory == targetCategory else { return }
                 errorMessage = error.localizedDescription
             }
-            isLoading = false
         }
+        loadTask = task
+        await task.value
     }
 
     private func refreshFeed() async {
+        let targetCategory = selectedCategory
         do {
-            if selectedCategory == "Đã xem" {
+            if targetCategory == "Đã xem" {
                 videos = lib.history.map(\.video)
                 return
             }
 
-            let query = queryForCategory(selectedCategory)
+            let query = queryForCategory(targetCategory)
             let page = try await InnerTube.shared.search(query, params: nil, continuation: nil)
+            guard !Task.isCancelled, selectedCategory == targetCategory else { return }
             videos = page.videos
             continuationToken = page.continuation
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            guard !(error is CancellationError), !Task.isCancelled else { return }
+            if videos.isEmpty {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     private func loadNextPage() {
         guard !isLoadingMore, !isLoading, let token = continuationToken else { return }
+        let targetCategory = selectedCategory
         isLoadingMore = true
 
-        Task {
+        nextPageTask?.cancel()
+        nextPageTask = Task {
+            defer { isLoadingMore = false }
             do {
-                let query = queryForCategory(selectedCategory)
+                let query = queryForCategory(targetCategory)
                 let page = try await InnerTube.shared.search(query, params: nil, continuation: token)
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, selectedCategory == targetCategory else { return }
 
                 let existing = Set(videos.map(\.id))
                 let newVideos = page.videos.filter { !existing.contains($0.id) }
@@ -383,7 +418,6 @@ struct YouTubeHomeView: View {
             } catch {
                 // Silently ignore pagination failures; user can scroll to retrigger
             }
-            isLoadingMore = false
         }
     }
 
@@ -418,10 +452,12 @@ struct YouTubeHomeView: View {
         if let cId = video.channelId, !cId.isEmpty {
             hiddenChannelIds.insert(cId)
         }
-        hiddenChannelTitles.insert(video.channelTitle)
+        if !video.channelTitle.isEmpty {
+            hiddenChannelTitles.insert(video.channelTitle)
+        }
         showToast("Sẽ không đề xuất video từ kênh này nữa", undo: {
             if let cId = video.channelId { hiddenChannelIds.remove(cId) }
-            hiddenChannelTitles.remove(video.channelTitle)
+            if !video.channelTitle.isEmpty { hiddenChannelTitles.remove(video.channelTitle) }
         })
     }
 
@@ -444,10 +480,15 @@ struct YouTubeHomeView: View {
     private func shareVideo(_ video: Video) {
         #if canImport(UIKit)
         let av = UIActivityViewController(activityItems: [video.shareURL], applicationActivities: nil)
-        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let root = scene.windows.first?.rootViewController {
+        if let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+           let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController {
             var top = root
             while let presented = top.presentedViewController { top = presented }
+            if let popover = av.popoverPresentationController {
+                popover.sourceView = top.view
+                popover.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 0, height: 0)
+                popover.permittedArrowDirections = []
+            }
             top.present(av, animated: true)
         }
         #endif
@@ -601,9 +642,10 @@ struct YouTubeVideoCard: View {
                         GeometryReader { geo in
                             Rectangle()
                                 .fill(YTColor.brandRed)
-                                .frame(width: geo.size.width * CGFloat(progress), height: 3.5)
-                                .frame(maxHeight: .infinity, alignment: .bottomLeading)
+                                .frame(width: geo.size.width * min(max(progress, 0), 1), height: 3.5)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         }
+                        .allowsHitTesting(false)
                     }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))

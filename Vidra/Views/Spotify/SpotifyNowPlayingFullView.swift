@@ -48,11 +48,13 @@ struct SpotifyNowPlayingFullView: View {
     @State private var tintColor: Color = Color(red: 0.18, green: 0.28, blue: 0.22)
 
     // Player state
-    @State private var scrubFraction: Double? = nil
-    @State private var isScrubbing = false
+    @GestureState private var dragScrubFraction: Double? = nil
+    @State private var pendingSeekFraction: Double? = nil
     @State private var isShuffle = false
+    @State private var originalQueueBeforeShuffle: [Video]? = nil
     @State private var repeatMode: SpotifyRepeatMode = .off
     @State private var artDragOffset: CGFloat = 0
+    @State private var haloPulse = false
 
     // Lyrics
     @State private var lyrics: LyricsResult? = nil
@@ -106,12 +108,31 @@ struct SpotifyNowPlayingFullView: View {
             SpotifyRemapSheet(video: v).presentationDetents([.medium, .large])
         }
         .task(id: pm.current?.id) {
-            scrubFraction = nil
+            pendingSeekFraction = nil
             artDragOffset = 0
             userScrolledAway = false
-            await loadAlbumArtworkColor()
-            await loadTrackLyrics()
-            await connectManager.refreshDevices()
+            lyrics = nil
+            lyricsLoading = true
+            if pm.loop {
+                repeatMode = .one
+            } else if pm.repeatAll {
+                repeatMode = .all
+            } else {
+                repeatMode = .off
+            }
+            async let colorTask: Void = loadAlbumArtworkColor()
+            async let lyricsTask: Void = loadTrackLyrics()
+            async let devicesTask: Void = connectManager.refreshDevices()
+            _ = await (colorTask, lyricsTask, devicesTask)
+        }
+        .onChange(of: pm.duration) { newDur in
+            if newDur > 0 && !lyricsLoading && lyrics == nil && pm.current != nil {
+                Task { await loadTrackLyrics() }
+            }
+        }
+        .onDisappear {
+            pendingSeekFraction = nil
+            artDragOffset = 0
         }
     }
 
@@ -336,11 +357,27 @@ struct SpotifyNowPlayingFullView: View {
                         endRadius: 210
                     )
                 )
-                .frame(maxWidth: 360, maxHeight: 360)
-                .blur(radius: pm.isPlaying ? 40 : 20)
-                .drawingGroup()
-                .scaleEffect(pm.isPlaying ? 1.08 : 0.92)
-                .animation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true), value: pm.isPlaying)
+                .blur(radius: pm.isPlaying ? 38 : 20)
+                .frame(maxWidth: 380, maxHeight: 380)
+                .scaleEffect(pm.isPlaying ? (haloPulse ? 1.08 : 0.96) : 0.90)
+                .onAppear {
+                    if pm.isPlaying {
+                        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                            haloPulse = true
+                        }
+                    }
+                }
+                .onChange(of: pm.isPlaying) { playing in
+                    if playing {
+                        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                            haloPulse = true
+                        }
+                    } else {
+                        withAnimation(.easeOut(duration: 0.35)) {
+                            haloPulse = false
+                        }
+                    }
+                }
 
             CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 400, height: 400)) { image in
                 image
@@ -373,17 +410,23 @@ struct SpotifyNowPlayingFullView: View {
         .gesture(
             DragGesture(minimumDistance: 15)
                 .onChanged { gesture in
-                    if abs(gesture.translation.width) > abs(gesture.translation.height) {
-                        artDragOffset = gesture.translation.width
+                    let dx = gesture.translation.width
+                    let dy = gesture.translation.height
+                    if abs(dx) > abs(dy) + 8 {
+                        artDragOffset = dx
                     }
                 }
                 .onEnded { gesture in
-                    if gesture.translation.width < -80 {
-                        triggerHaptic(style: .medium)
-                        pm.next()
-                    } else if gesture.translation.width > 80 {
-                        triggerHaptic(style: .medium)
-                        pm.previous()
+                    let dx = gesture.translation.width
+                    let dy = gesture.translation.height
+                    if abs(dx) > abs(dy) {
+                        if dx < -80 {
+                            triggerHaptic(style: .medium)
+                            pm.next()
+                        } else if dx > 80 {
+                            triggerHaptic(style: .medium)
+                            pm.previous()
+                        }
                     }
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                         artDragOffset = 0
@@ -476,8 +519,9 @@ struct SpotifyNowPlayingFullView: View {
 
     private func scrubberSection(_ v: Video) -> some View {
         let total = max(pm.duration, 0)
-        let fraction = scrubFraction ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
-        let shownTime = scrubFraction.map { $0 * total } ?? pm.currentTime
+        let activeFraction = dragScrubFraction ?? pendingSeekFraction
+        let fraction = activeFraction ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
+        let shownTime = activeFraction.map { $0 * total } ?? pm.currentTime
 
         return VStack(spacing: 4) {
             GeometryReader { geo in
@@ -496,27 +540,32 @@ struct SpotifyNowPlayingFullView: View {
                         .frame(width: progressWidth, height: 4)
 
                     // Spotify Scrubber Thumb: appears and scales on interaction
+                    let isScrubbingNow = dragScrubFraction != nil || pendingSeekFraction != nil
                     Circle()
                         .fill(Color.white)
-                        .frame(width: isScrubbing ? 14 : 10, height: isScrubbing ? 14 : 10)
+                        .frame(width: isScrubbingNow ? 14 : 10, height: isScrubbingNow ? 14 : 10)
                         .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
-                        .offset(x: max(0, min(width - (isScrubbing ? 14 : 10), progressWidth - (isScrubbing ? 7 : 5))))
-                        .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isScrubbing)
+                        .offset(x: max(0, min(width - (isScrubbingNow ? 14 : 10), progressWidth - (isScrubbingNow ? 7 : 5))))
+                        .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isScrubbingNow)
                 }
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 0)
-                        .onChanged { g in
-                            isScrubbing = true
-                            scrubFraction = min(max(g.location.x / max(width, 1), 0), 1)
+                        .updating($dragScrubFraction) { g, state, _ in
+                            guard total > 0 else { return }
+                            state = min(max(g.location.x / max(width, 1), 0), 1)
                         }
                         .onEnded { g in
+                            guard total > 0 else {
+                                pendingSeekFraction = nil
+                                return
+                            }
                             let f = min(max(g.location.x / max(width, 1), 0), 1)
-                            isScrubbing = false
-                            scrubFraction = nil
-                            if total > 0 {
-                                pm.seek(to: f * total)
+                            pendingSeekFraction = f
+                            pm.seek(to: f * total)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                if pendingSeekFraction == f { pendingSeekFraction = nil }
                             }
                         }
                 )
@@ -542,7 +591,14 @@ struct SpotifyNowPlayingFullView: View {
             Button {
                 isShuffle.toggle()
                 if isShuffle {
+                    originalQueueBeforeShuffle = pm.queue
                     pm.queue.shuffle()
+                } else if let original = originalQueueBeforeShuffle {
+                    let currentIds = Set(pm.queue.map(\.id))
+                    let restored = original.filter { currentIds.contains($0.id) }
+                    let extras = pm.queue.filter { q in !restored.contains(where: { $0.id == q.id }) }
+                    pm.queue = restored + extras
+                    originalQueueBeforeShuffle = nil
                 }
                 triggerHaptic(style: .light)
             } label: {
@@ -619,10 +675,13 @@ struct SpotifyNowPlayingFullView: View {
                 switch repeatMode {
                 case .off:
                     pm.loop = false
+                    pm.repeatAll = false
                 case .all:
                     pm.loop = false
+                    pm.repeatAll = true
                 case .one:
                     pm.loop = true
+                    pm.repeatAll = false
                 }
                 triggerHaptic(style: .light)
             } label: {
@@ -748,8 +807,8 @@ struct SpotifyNowPlayingFullView: View {
                 let slice = Array(lyrics.synced[start..<min(start + 3, lyrics.synced.count)])
 
                 VStack(alignment: .leading, spacing: 10) {
-                    ForEach(slice, id: \.self) { line in
-                        let isCurrent = (lyrics.synced.firstIndex(of: line) == activeIdx)
+                    ForEach(Array(slice.enumerated()), id: \.offset) { offset, line in
+                        let isCurrent = ((start + offset) == activeIdx)
                         Button {
                             pm.seek(to: line.time)
                             triggerHaptic(style: .medium)
@@ -1048,8 +1107,9 @@ struct SpotifyNowPlayingFullView: View {
         VStack(spacing: 8) {
             // Interactive slim progress bar
             let total = max(pm.duration, 0)
-            let fraction = scrubFraction ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
-            let shownTime = scrubFraction.map { $0 * total } ?? pm.currentTime
+            let activeFraction = dragScrubFraction ?? pendingSeekFraction
+            let fraction = activeFraction ?? (total > 0 ? min(max(pm.currentTime / total, 0), 1) : 0)
+            let shownTime = activeFraction.map { $0 * total } ?? pm.currentTime
 
             HStack(spacing: 8) {
                 Text(Fmt.time(shownTime))
@@ -1065,7 +1125,7 @@ struct SpotifyNowPlayingFullView: View {
                         Capsule().fill(SpotifyColors.trackUnfilled).frame(height: 3)
                         Capsule().fill(Color.white).frame(width: progressWidth, height: 3)
 
-                        if isScrubbing {
+                        if dragScrubFraction != nil || pendingSeekFraction != nil {
                             Circle()
                                 .fill(Color.white)
                                 .frame(width: 10, height: 10)
@@ -1076,16 +1136,20 @@ struct SpotifyNowPlayingFullView: View {
                     .contentShape(Rectangle())
                     .gesture(
                         DragGesture(minimumDistance: 0)
-                            .onChanged { g in
-                                isScrubbing = true
-                                scrubFraction = min(max(g.location.x / max(width, 1), 0), 1)
+                            .updating($dragScrubFraction) { g, state, _ in
+                                guard total > 0 else { return }
+                                state = min(max(g.location.x / max(width, 1), 0), 1)
                             }
                             .onEnded { g in
+                                guard total > 0 else {
+                                    pendingSeekFraction = nil
+                                    return
+                                }
                                 let f = min(max(g.location.x / max(width, 1), 0), 1)
-                                isScrubbing = false
-                                scrubFraction = nil
-                                if total > 0 {
-                                    pm.seek(to: f * total)
+                                pendingSeekFraction = f
+                                pm.seek(to: f * total)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                    if pendingSeekFraction == f { pendingSeekFraction = nil }
                                 }
                             }
                     )
@@ -1181,22 +1245,32 @@ struct SpotifyNowPlayingFullView: View {
     }
 
     private func loadAlbumArtworkColor() async {
-        guard let v = pm.current else { return }
-        if let url = v.thumbnail, let c = await ArtworkColorCache.shared.color(for: url) {
-            withAnimation(.easeInOut(duration: 0.65)) {
-                tintColor = c
+        let defaultTint = Color(red: 0.18, green: 0.28, blue: 0.22)
+        guard let v = pm.current, let url = v.thumbnail,
+              let c = await ArtworkColorCache.shared.color(for: url) else {
+            withAnimation(.easeInOut(duration: 0.45)) {
+                tintColor = defaultTint
             }
+            return
+        }
+        guard !Task.isCancelled else { return }
+        withAnimation(.easeInOut(duration: 0.65)) {
+            tintColor = c
         }
     }
 
     private func loadTrackLyrics() async {
         lyrics = nil
-        guard let v = pm.current else { return }
+        guard let v = pm.current else {
+            lyricsLoading = false
+            return
+        }
         lyricsLoading = true
-        let result = await LyricsService.shared.lyrics(for: v, duration: pm.duration)
-        guard !Task.isCancelled else { return }
+        defer { lyricsLoading = false }
+        let dur = pm.duration > 0 ? pm.duration : (Fmt.seconds(v.duration) ?? 0)
+        let result = await LyricsService.shared.lyrics(for: v, duration: dur)
+        guard !Task.isCancelled, pm.current?.id == v.id else { return }
         lyrics = result
-        lyricsLoading = false
     }
 
     private func triggerHaptic(style: UIImpactFeedbackGenerator.FeedbackStyle) {
@@ -1312,8 +1386,13 @@ struct SpotifyQueueSheet: View {
                                 .foregroundStyle(SpotifyColors.subtextGray)
                                 .font(.subheadline)
                         } else {
-                            ForEach(pm.queue) { track in
-                                queueRow(track)
+                            ForEach(Array(pm.queue.enumerated()), id: \.offset) { idx, track in
+                                Button {
+                                    pm.play(track, queue: Array(pm.queue.dropFirst(idx + 1)))
+                                } label: {
+                                    queueRow(track)
+                                }
+                                .buttonStyle(.plain)
                             }
                             .onMove { pm.queue.move(fromOffsets: $0, toOffset: $1) }
                             .onDelete { pm.queue.remove(atOffsets: $0) }
@@ -1327,9 +1406,9 @@ struct SpotifyQueueSheet: View {
 
                     if !pm.related.isEmpty {
                         Section {
-                            ForEach(pm.related) { v in
+                            ForEach(Array(pm.related.enumerated()), id: \.offset) { idx, v in
                                 Button {
-                                    pm.play(v)
+                                    pm.play(v, queue: Array(pm.related.dropFirst(idx + 1)))
                                 } label: {
                                     queueRow(v)
                                 }
@@ -1451,6 +1530,12 @@ struct SpotifyEqualizerBars: View {
         .onChange(of: isPlaying) { playing in
             if playing {
                 startAnimation()
+            } else {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    bar1 = 0.25
+                    bar2 = 0.25
+                    bar3 = 0.25
+                }
             }
         }
     }
@@ -1525,6 +1610,19 @@ struct SpotifyConnectSheet: View {
                             }
                             .foregroundStyle(SpotifyColors.subtextGray)
 
+                            if let err = connectManager.lastError, !err.isEmpty {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text(err)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(Color.white)
+                                }
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+
                             // List of Devices
                             VStack(spacing: 8) {
                                 ForEach(connectManager.devices) { dev in
@@ -1560,7 +1658,7 @@ struct SpotifyConnectSheet: View {
             .navigationTitle("Nghe trên thiết bị khác")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         dismiss()
                         triggerHaptic(style: .light)
@@ -1691,11 +1789,6 @@ struct SpotifyConnectSheet: View {
                 .foregroundStyle(SpotifyColors.subtextGray)
 
             ZStack {
-                // Invisible RoutePicker covering the entire card to trigger native iOS AirPlay
-                RoutePicker()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .opacity(0.02)
-
                 HStack(spacing: 14) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1729,6 +1822,12 @@ struct SpotifyConnectSheet: View {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(SpotifyColors.cardBlack)
                 )
+                .allowsHitTesting(false)
+
+                // RoutePicker sits above card background so taps reach AVRoutePickerView
+                RoutePicker()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(0.02)
             }
             .frame(height: 60)
         }

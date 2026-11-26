@@ -58,80 +58,111 @@ struct SpotifySetupView: View {
                     .padding(.bottom, 4)
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Kết nối Spotify").font(.title2.bold())
-                    Text("Đồng bộ thư viện, playlist và phát nhạc trực tiếp chất lượng cao qua Spotify App Remote (hoặc nguồn âm thanh thay thế).")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Cách lấy Client ID (miễn phí)").font(.headline)
-                    HStack(alignment: .top, spacing: 6) {
-                        Text("1.")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Mở trang dashboard và đăng nhập:")
-                            if let url = URL(string: "https://developer.spotify.com/dashboard") {
-                                Link("developer.spotify.com/dashboard", destination: url)
+                if auth.isLoggedIn {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "checkmark.seal.fill")
+                                .font(.title2)
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(auth.profile?.name ?? "Đã kết nối Spotify")
+                                    .font(.headline)
+                                Text("Tài khoản Spotify đã được liên kết")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                    }
-                    step("2.", "Nhấn \"Create app\", đặt tên bất kỳ.")
-                    HStack(alignment: .top, spacing: 6) {
-                        Text("3.")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Ở mục Redirect URI nhập đúng:")
-                            Text(SpotifyAuth.redirectURI)
-                                .font(.callout.monospaced())
-                                .textSelection(.enabled)
+                        Button(role: .destructive) {
+                            auth.logout()
+                            dismiss()
+                        } label: {
+                            Text("Đăng xuất tài khoản Spotify")
+                                .frame(maxWidth: .infinity)
                         }
+                        .buttonStyle(.bordered)
                     }
-                    step("4.", "Tick chọn \"Web API\" rồi lưu.")
-                    step("5.", "Vào Settings, sao chép Client ID và dán vào ô bên dưới.")
-                    step("6.", "App ở Development Mode: vào User Management, thêm email tài khoản Spotify của bạn.")
-                }
-                .font(.subheadline)
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Kết nối Spotify").font(.title2.bold())
+                        Text("Đồng bộ thư viện, playlist và phát nhạc trực tiếp chất lượng cao qua Spotify App Remote (hoặc nguồn âm thanh thay thế).")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
 
-                HStack(spacing: 8) {
-                    TextField("Client ID", text: $auth.clientId)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Cách lấy Client ID (miễn phí)").font(.headline)
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("1.")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Mở trang dashboard và đăng nhập:")
+                                if let url = URL(string: "https://developer.spotify.com/dashboard") {
+                                    Link("developer.spotify.com/dashboard", destination: url)
+                                }
+                            }
+                        }
+                        step("2.", "Nhấn \"Create app\", đặt tên bất kỳ.")
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("3.")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Ở mục Redirect URI nhập đúng:")
+                                Text(SpotifyAuth.redirectURI)
+                                    .font(.callout.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        step("4.", "Tick chọn \"Web API\" rồi lưu.")
+                        step("5.", "Vào Settings, sao chép Client ID và dán vào ô bên dưới.")
+                        step("6.", "App ở Development Mode: vào User Management, thêm email tài khoản Spotify của bạn.")
+                    }
+                    .font(.subheadline)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 12))
 
-                    if let clip = UIPasteboard.general.string, !clip.isEmpty, clip != auth.clientId {
+                    HStack(spacing: 8) {
+                        TextField("Client ID", text: $auth.clientId)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
                         Button("Dán") {
-                            auth.clientId = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let clip = UIPasteboard.general.string {
+                                let trimmed = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !trimmed.isEmpty {
+                                    auth.clientId = trimmed
+                                }
+                            }
                         }
                         .font(.subheadline.bold())
                         .tint(.green)
                     }
-                }
-                .padding(12)
-                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(12)
+                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
 
-                Button {
-                    Task { await auth.login() }
-                } label: {
-                    HStack {
-                        if auth.isWorking { ProgressView() }
-                        Text("Đăng nhập Spotify").font(.headline)
+                    Button {
+                        Task { await auth.login() }
+                    } label: {
+                        HStack {
+                            if auth.isWorking { ProgressView() }
+                            Text("Đăng nhập Spotify").font(.headline)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-                .disabled(auth.isWorking || auth.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .disabled(auth.isWorking || auth.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                if let error = auth.error {
-                    Text(error).font(.footnote).foregroundStyle(.red)
+                    if let error = auth.error {
+                        Text(error).font(.footnote).foregroundStyle(.red)
+                    }
                 }
 
                 Divider()
 
                 NavigationLink {
-                    SpotifyImportView()
+                    SpotifyImportView(needsNavigationStack: false)
                 } label: {
                     Label("Nhập playlist bằng link (không cần đăng nhập)", systemImage: "link")
                         .font(.subheadline)
@@ -277,6 +308,31 @@ struct SpotifyLibraryView: View {
                 // 4. Sort & Layout Bar
                 sortAndLayoutToolbar
 
+                if auth.isLoggedIn && model.loading && !model.loaded {
+                    HStack(spacing: 8) {
+                        ProgressView().tint(SpotifyColor.brandGreen)
+                        Text("Đang đồng bộ thư viện Spotify…")
+                            .font(.caption)
+                            .foregroundColor(SpotifyColor.textSecondary)
+                    }
+                    .padding(.horizontal, 16)
+                } else if auth.isLoggedIn, let err = model.error, !err.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(err)
+                            .font(.caption)
+                            .foregroundColor(SpotifyColor.textSecondary)
+                        Spacer()
+                        Button("Thử lại") {
+                            Task { await model.load() }
+                        }
+                        .font(.caption.bold())
+                        .foregroundColor(SpotifyColor.brandGreen)
+                    }
+                    .padding(.horizontal, 16)
+                }
+
                 // 5. Library Content (List or Grid)
                 if isGridView {
                     gridLayoutContent
@@ -298,13 +354,37 @@ struct SpotifyLibraryView: View {
                 if !model.loaded { await model.load() }
             }
         }
+        .onChange(of: auth.isLoggedIn) { loggedIn in
+            if loggedIn {
+                Task {
+                    await auth.loadProfile()
+                    await model.load()
+                }
+            } else {
+                model.liked = []
+                model.playlists = []
+                model.albums = []
+                model.artists = []
+                model.loaded = false
+                model.error = nil
+            }
+        }
         .refreshable {
             if auth.isLoggedIn {
                 await model.load()
             }
         }
         .sheet(isPresented: $showSpotifyConnect) {
-            SpotifySetupView(showModeSwitch: false)
+            NavigationStack {
+                SpotifySetupView(showModeSwitch: false)
+                    .navigationTitle(auth.isLoggedIn ? "Tài khoản Spotify" : "Kết nối Spotify")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button("Đóng") { showSpotifyConnect = false }
+                        }
+                    }
+            }
         }
         .sheet(isPresented: $showImportSheet) {
             SpotifyImportView()
@@ -330,14 +410,10 @@ struct SpotifyLibraryView: View {
 
     private var libraryHeader: some View {
         HStack(spacing: 12) {
-            // User Avatar
-            Button {
-                if auth.isLoggedIn {
+                // User Avatar
+                Button {
                     showSpotifyConnect = true
-                } else {
-                    showSpotifyConnect = true
-                }
-            } label: {
+                } label: {
                 if let img = auth.profile?.image {
                     CachedAsyncImage(url: img, targetSize: CGSize(width: 34, height: 34)) { $0.resizable().scaledToFill() } placeholder: {
                         avatarPlaceholder
@@ -578,7 +654,7 @@ struct SpotifyLibraryView: View {
                                 Image(systemName: "pin.fill")
                                     .font(.system(size: 10))
                                     .foregroundColor(SpotifyColor.brandGreen)
-                                Text("Playlist • \(lib.likedTracks.count) bài hát")
+                                Text("Playlist • \(likedSongsCount) bài hát")
                                     .font(.system(size: 13))
                                     .foregroundColor(SpotifyColor.textSecondary)
                             }
@@ -646,9 +722,10 @@ struct SpotifyLibraryView: View {
 
                 // When specifically filtered to "Đã tải xuống", list individual downloaded songs
                 if selectedFilter == .downloaded && !filteredDownloads.isEmpty {
-                    ForEach(filteredDownloads) { item in
+                    let tracks = filteredDownloads.map(\.video)
+                    ForEach(Array(filteredDownloads.enumerated()), id: \.element.id) { idx, item in
                         Button {
-                            PlayerManager.shared.play(item.video, queue: filteredDownloads.map(\.video))
+                            PlayerManager.shared.play(item.video, queue: Array(tracks.dropFirst(idx + 1)))
                         } label: {
                             HStack(spacing: 12) {
                                 ZStack {
@@ -747,12 +824,7 @@ struct SpotifyLibraryView: View {
             if shouldShowAlbums {
                 ForEach(filteredAlbums) { card in
                     NavigationLink {
-                        SpotifyPlaylistDetailView(
-                            albumId: card.id,
-                            name: card.title,
-                            cover: card.image,
-                            subtitle: card.subtitle
-                        )
+                        albumDestination(card)
                     } label: {
                         HStack(spacing: 14) {
                             ZStack {
@@ -791,27 +863,19 @@ struct SpotifyLibraryView: View {
                 }
             }
 
-            // 5. Followed Artists / Channels
+            // 5. Followed Artists / Local Track Artists
             if shouldShowArtists {
-                ForEach(filteredArtists) { channel in
+                ForEach(filteredArtistCards) { artist in
                     NavigationLink {
-                        SpotifyPlaylistDetailView(
-                            title: channel.title,
-                            cover: channel.avatar,
-                            subtitle: "Nghệ sĩ",
-                            creator: channel.title,
-                            loader: { offset in
-                                try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
-                            }
-                        )
+                        artistCardDestination(artist)
                     } label: {
                         HStack(spacing: 14) {
                             // Circular Artist Avatar
-                            Avatar(url: channel.avatar, name: channel.title, size: 60)
+                            Avatar(url: artist.image, name: artist.title, size: 60)
                                 .clipShape(Circle())
 
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(channel.title)
+                                Text(artist.title)
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundColor(SpotifyColor.textPrimary)
                                     .lineLimit(1)
@@ -830,11 +894,51 @@ struct SpotifyLibraryView: View {
                 }
             }
 
-            // 6. Remote Spotify Playlists (if connected)
+            // 6. Remote Spotify Playlists (compact 60x60 rows matching List layout)
             if auth.isLoggedIn && !filteredRemotePlaylists.isEmpty && shouldShowPlaylists {
                 ForEach(filteredRemotePlaylists) { card in
-                    SpotifyCardLink(card: card, width: nil)
+                    NavigationLink {
+                        SpotifyPlaylistView(
+                            playlistId: card.id,
+                            name: card.title,
+                            cover: card.image,
+                            subtitle: card.subtitle
+                        )
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let img = card.image {
+                                    CachedAsyncImage(url: img, targetSize: CGSize(width: 60, height: 60)) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "music.note.list")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .frame(width: 60, height: 60)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(card.title)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text(card.subtitle.isEmpty ? "Playlist Spotify" : card.subtitle)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                                    .lineLimit(1)
+                            }
+
+                            Spacer()
+                        }
                         .padding(.horizontal, 16)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -984,16 +1088,58 @@ struct SpotifyLibraryView: View {
                 }
             }
 
+            // Remote Spotify Playlists in Grid
+            if auth.isLoggedIn && !filteredRemotePlaylists.isEmpty && shouldShowPlaylists {
+                ForEach(filteredRemotePlaylists) { card in
+                    SpotifyCardLink(card: card, width: nil)
+                }
+            }
+
+            // Individual Downloaded Tracks when filtered to Downloaded
+            if selectedFilter == .downloaded && !filteredDownloads.isEmpty {
+                let tracks = filteredDownloads.map(\.video)
+                ForEach(Array(filteredDownloads.enumerated()), id: \.element.id) { idx, item in
+                    Button {
+                        PlayerManager.shared.play(item.video, queue: Array(tracks.dropFirst(idx + 1)))
+                    } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                if let thumb = item.video.thumbnail {
+                                    CachedAsyncImage(url: thumb, targetSize: CGSize(width: 180, height: 180)) { $0.resizable().scaledToFill() } placeholder: {
+                                        Color.clear
+                                    }
+                                } else {
+                                    Image(systemName: "arrow.down.circle")
+                                        .font(.system(size: 32))
+                                        .foregroundColor(SpotifyColor.textSecondary)
+                                }
+                            }
+                            .aspectRatio(1, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.video.title)
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(SpotifyColor.textPrimary)
+                                    .lineLimit(1)
+
+                                Text(item.video.channelTitle)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             // Albums in Grid
             if shouldShowAlbums {
                 ForEach(filteredAlbums) { card in
                     NavigationLink {
-                        SpotifyPlaylistDetailView(
-                            albumId: card.id,
-                            name: card.title,
-                            cover: card.image,
-                            subtitle: card.subtitle
-                        )
+                        albumDestination(card)
                     } label: {
                         VStack(alignment: .leading, spacing: 8) {
                             ZStack {
@@ -1030,23 +1176,15 @@ struct SpotifyLibraryView: View {
 
             // Artists in Grid (Circular)
             if shouldShowArtists {
-                ForEach(filteredArtists) { channel in
+                ForEach(filteredArtistCards) { artist in
                     NavigationLink {
-                        SpotifyPlaylistDetailView(
-                            title: channel.title,
-                            cover: channel.avatar,
-                            subtitle: "Nghệ sĩ",
-                            creator: channel.title,
-                            loader: { offset in
-                                try await InnerTube.shared.search(channel.title, params: nil, continuation: offset > 0 ? "\(offset)" : nil)
-                            }
-                        )
+                        artistCardDestination(artist)
                     } label: {
                         VStack(alignment: .center, spacing: 8) {
-                            Avatar(url: channel.avatar, name: channel.title, size: 140)
+                            Avatar(url: artist.image, name: artist.title, size: 140)
                                 .clipShape(Circle())
 
-                            Text(channel.title)
+                            Text(artist.title)
                                 .font(.system(size: 14, weight: .bold))
                                 .foregroundColor(SpotifyColor.textPrimary)
                                 .lineLimit(1)
@@ -1195,6 +1333,95 @@ struct SpotifyLibraryView: View {
         }
     }
 
+    private var likedSongsCount: Int {
+        auth.isLoggedIn && !model.liked.isEmpty ? model.liked.count : lib.likedTracks.count
+    }
+
+    @ViewBuilder
+    private func albumDestination(_ card: SpotifyCard) -> some View {
+        if card.id.hasPrefix("local_album_") {
+            let albumName = String(card.id.dropFirst("local_album_".count))
+            let tracks = lib.likedTracks.filter { ($0.published ?? "") == albumName }
+            SpotifyPlaylistDetailView(
+                title: card.title,
+                cover: card.image,
+                subtitle: card.subtitle,
+                creator: card.subtitle.isEmpty ? "Nghệ sĩ" : card.subtitle,
+                isAlbum: true,
+                loader: { offset in
+                    let slice = Array(tracks.dropFirst(offset).prefix(50))
+                    return Page(videos: slice, continuation: offset + 50 < tracks.count ? "\(offset + 50)" : nil)
+                }
+            )
+        } else {
+            SpotifyPlaylistDetailView(
+                albumId: card.id,
+                name: card.title,
+                cover: card.image,
+                subtitle: card.subtitle
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func artistCardDestination(_ artist: SpotifyCard) -> some View {
+        if artist.id.hasPrefix("local_artist_") {
+            SpotifyPlaylistDetailView(
+                title: artist.title,
+                cover: artist.image,
+                subtitle: "Nghệ sĩ",
+                creator: artist.title,
+                continuationLoader: { token in
+                    try await InnerTube.shared.search(artist.title, params: nil, continuation: token)
+                }
+            )
+        } else {
+            SpotifyArtistView(artistId: artist.id, name: artist.title)
+        }
+    }
+
+    private var filteredArtistCards: [SpotifyCard] {
+        var list: [SpotifyCard]
+        if auth.isLoggedIn && !model.artists.isEmpty {
+            list = model.artists
+        } else {
+            var seen = Set<String>()
+            var derived: [SpotifyCard] = []
+            for track in lib.likedTracks {
+                let artist = track.channelTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !artist.isEmpty else { continue }
+                let key = artist.lowercased()
+                if seen.insert(key).inserted {
+                    derived.append(SpotifyCard(
+                        id: "local_artist_\(artist)",
+                        kind: .artist,
+                        title: artist,
+                        subtitle: "Nghệ sĩ",
+                        image: track.thumbnail
+                    ))
+                }
+            }
+            list = derived
+        }
+        if !searchQuery.isEmpty {
+            list = list.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) }
+        }
+        switch sortOption {
+        case .recentPlayed:
+            let historyChannelTitles = lib.history.map { $0.video.channelTitle.lowercased() }
+            return list.sorted { c1, c2 in
+                let idx1 = historyChannelTitles.firstIndex(of: c1.title.lowercased()) ?? Int.max
+                let idx2 = historyChannelTitles.firstIndex(of: c2.title.lowercased()) ?? Int.max
+                if idx1 != idx2 { return idx1 < idx2 }
+                return c1.title.localizedCompare(c2.title) == .orderedAscending
+            }
+        case .recentlyAdded:
+            return list
+        case .alphabetical:
+            return list.sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
+        }
+    }
+
     private var filteredAlbums: [SpotifyCard] {
         var list = model.albums
         if list.isEmpty {
@@ -1215,10 +1442,10 @@ struct SpotifyLibraryView: View {
         }
         switch sortOption {
         case .recentPlayed:
-            let historyTitles = lib.history.map(\.video.title)
+            let historyAlbums = lib.history.compactMap { $0.video.published?.lowercased() }
             return list.sorted { a1, a2 in
-                let idx1 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a1.title) }) ?? Int.max
-                let idx2 = historyTitles.firstIndex(where: { $0.localizedCaseInsensitiveContains(a2.title) }) ?? Int.max
+                let idx1 = historyAlbums.firstIndex(of: a1.title.lowercased()) ?? Int.max
+                let idx2 = historyAlbums.firstIndex(of: a2.title.lowercased()) ?? Int.max
                 if idx1 != idx2 { return idx1 < idx2 }
                 return a1.title.localizedCompare(a2.title) == .orderedAscending
             }
@@ -1244,7 +1471,7 @@ struct SpotifyLibraryView: View {
                 return d1.video.title.localizedCompare(d2.video.title) == .orderedAscending
             }
         case .recentlyAdded:
-            return Array(list.reversed())
+            return list
         case .alphabetical:
             return list.sorted { $0.video.title.localizedCompare($1.video.title) == .orderedAscending }
         }

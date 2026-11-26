@@ -33,7 +33,9 @@ struct WatchDetails: View {
                             Spacer()
                             Button("Xoá") { pm.clearQueue() }.font(.subheadline)
                         }
-                        ForEach(pm.queue) { q in VideoButton(video: q) }
+                        ForEach(Array(pm.queue.enumerated()), id: \.element.id) { idx, q in
+                            VideoButton(video: q, queue: Array(pm.queue.dropFirst(idx + 1)))
+                        }
                     }
                     HStack {
                         Text(v.source == nil ? "Tiếp theo" : "Radio – phát tiếp").font(.headline)
@@ -43,7 +45,9 @@ struct WatchDetails: View {
                     if pm.related.isEmpty {
                         ProgressView().frame(maxWidth: .infinity)
                     }
-                    ForEach(pm.related) { r in VideoButton(video: r) }
+                    ForEach(Array(pm.related.enumerated()), id: \.element.id) { idx, r in
+                        VideoButton(video: r, queue: Array(pm.related.dropFirst(idx + 1)))
+                    }
                 }
                 .padding()
             }
@@ -209,7 +213,7 @@ struct AddToPlaylistView: View {
                             lib.add(video, to: lib.createPlaylist(name))
                             name = ""
                         }
-                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
                 Section {
@@ -227,7 +231,11 @@ struct AddToPlaylistView: View {
             }
             .navigationTitle("Lưu vào danh sách phát")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Xong") { dismiss() } }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Xong") { dismiss() }
+                }
+            }
         }
     }
 }

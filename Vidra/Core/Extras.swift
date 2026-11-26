@@ -1,21 +1,22 @@
 import AVFoundation
 import Foundation
 
-struct Votes: Decodable {
+struct Votes: Decodable, Sendable {
     let likes: Int
     let dislikes: Int
     let rating: Double?
     let viewCount: Int?
 }
 
-struct SponsorSegment: Decodable {
+struct SponsorSegment: Decodable, Sendable {
     let segment: [Double]
     let category: String
     let actionType: String?
     let UUID: String?
 
-    var start: Double { segment.first ?? 0 }
-    var end: Double { segment.last ?? 0 }
+    var start: Double { segment.count >= 2 ? segment[0] : 0 }
+    var end: Double { segment.count >= 2 ? segment[1] : 0 }
+    var isValid: Bool { segment.count >= 2 && start.isFinite && end.isFinite && end > start }
 
     var label: String {
         switch category {
@@ -37,11 +38,21 @@ enum Extras {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 8
         cfg.timeoutIntervalForResource = 12
+        cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg)
     }()
 
-    private static let votesCache = NSCache<NSString, CacheEntry<Votes>>()
-    private static let segmentsCache = NSCache<NSString, CacheEntry<[SponsorSegment]>>()
+    private static let votesCache: NSCache<NSString, CacheEntry<Votes>> = {
+        let c = NSCache<NSString, CacheEntry<Votes>>()
+        c.countLimit = 200
+        return c
+    }()
+
+    private static let segmentsCache: NSCache<NSString, CacheEntry<[SponsorSegment]>> = {
+        let c = NSCache<NSString, CacheEntry<[SponsorSegment]>>()
+        c.countLimit = 200
+        return c
+    }()
 
     private final class CacheEntry<T>: @unchecked Sendable {
         let value: T
@@ -51,24 +62,26 @@ enum Extras {
 
     /// Return YouTube Dislike community API with memory caching.
     static func votes(_ id: String) async -> Votes? {
-        if let cached = votesCache.object(forKey: id as NSString) {
-            if Date().timeIntervalSince(cached.timestamp) < 300 {
-                return cached.value
-            }
+        if let cached = votesCache.object(forKey: id as NSString),
+           Date().timeIntervalSince(cached.timestamp) < 300 {
+            return cached.value
         }
-        guard let url = URL(string: "https://returnyoutubedislikeapi.com/votes?videoId=\(id)"),
-              let res = try? await session.data(from: url),
-              let votes = try? JSONDecoder().decode(Votes.self, from: res.0) else { return nil }
+        var c = URLComponents(string: "https://returnyoutubedislikeapi.com/votes")!
+        c.queryItems = [URLQueryItem(name: "videoId", value: id)]
+        guard let url = c.url,
+              let (data, resp) = try? await session.data(from: url),
+              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let votes = try? JSONDecoder().decode(Votes.self, from: data) else { return nil }
         votesCache.setObject(CacheEntry(votes), forKey: id as NSString)
         return votes
     }
 
     /// SponsorBlock API to skip sponsors, self-promo, intros, outros, and fillers.
+    /// Transient server/rate-limit errors are not negatively cached.
     static func segments(_ id: String) async -> [SponsorSegment] {
-        if let cached = segmentsCache.object(forKey: id as NSString) {
-            if Date().timeIntervalSince(cached.timestamp) < 600 {
-                return cached.value
-            }
+        if let cached = segmentsCache.object(forKey: id as NSString),
+           Date().timeIntervalSince(cached.timestamp) < 600 {
+            return cached.value
         }
         var c = URLComponents(string: "https://sponsor.ajay.app/api/skipSegments")!
         c.queryItems = [
@@ -76,17 +89,30 @@ enum Extras {
             .init(name: "categories", value: #"["sponsor","selfpromo","interaction","intro","outro","preview","music_offtopic","filler"]"#),
             .init(name: "actionTypes", value: #"["skip","mute"]"#),
         ]
-        guard let url = c.url, let res = try? await session.data(from: url) else { return [] }
-        let segs = (try? JSONDecoder().decode([SponsorSegment].self, from: res.0)) ?? []
+        guard let url = c.url, let (data, resp) = try? await session.data(from: url),
+              let http = resp as? HTTPURLResponse else { return [] }
+        if http.statusCode == 404 {
+            segmentsCache.setObject(CacheEntry([]), forKey: id as NSString)
+            return []
+        }
+        guard (200..<300).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode([SponsorSegment].self, from: data) else {
+            return []
+        }
+        let segs = decoded.filter(\.isValid)
         segmentsCache.setObject(CacheEntry(segs), forKey: id as NSString)
         return segs
     }
 
     /// Per-channel RSS is cheap and needs no login, unlike the real subscription feed.
     static func channelFeed(_ id: String) async -> [FeedEntry] {
-        guard let url = URL(string: "https://www.youtube.com/feeds/videos.xml?channel_id=\(id)"),
-              let res = try? await session.data(from: url) else { return [] }
-        return RSSParser.parse(res.0)
+        var c = URLComponents(string: "https://www.youtube.com/feeds/videos.xml")!
+        c.queryItems = [URLQueryItem(name: "channel_id", value: id)]
+        guard let url = c.url,
+              let (data, resp) = try? await session.data(from: url),
+              let http = resp as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return [] }
+        return RSSParser.parse(data)
     }
 
     static func subscriptionFeed(_ channels: [Channel]) async -> [Video] {
@@ -94,25 +120,41 @@ enum Extras {
         let entries = await withTaskGroup(of: [FeedEntry].self) { group -> [FeedEntry] in
             var pending = channels.makeIterator()
             for _ in 0..<8 {
-                if let c = pending.next() { group.addTask { await channelFeed(c.id) } }
+                guard !Task.isCancelled, let c = pending.next() else { break }
+                group.addTask { await channelFeed(c.id) }
             }
             var all: [FeedEntry] = []
             for await batch in group {
                 all += batch
-                if let c = pending.next() { group.addTask { await channelFeed(c.id) } }
+                if !Task.isCancelled, let c = pending.next() {
+                    group.addTask { await channelFeed(c.id) }
+                }
             }
             return all
         }
-        return entries
-            .filter { !(hideShorts && $0.isShort) }
-            .sorted { $0.date > $1.date }
-            .prefix(300)
-            .map(\.video)
+        var seen = Set<String>()
+        var out: [Video] = []
+        for entry in entries.filter({ !(hideShorts && $0.isShort) }).sorted(by: { $0.date > $1.date }) {
+            if seen.insert(entry.video.id).inserted {
+                out.append(entry.video)
+                if out.count >= 300 { break }
+            }
+        }
+        return out
     }
 }
 
 final class RSSParser: NSObject, XMLParserDelegate {
-    private static let isoFormatter = ISO8601DateFormatter()
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let isoFractionalFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
     private static let isoLock = NSLock()
 
     private var entries: [FeedEntry] = []
@@ -137,7 +179,10 @@ final class RSSParser: NSObject, XMLParserDelegate {
         } else if inEntry, elementName == "media:statistics" {
             fields["views"] = attributeDict["views"]
         } else if inEntry, elementName == "link", let href = attributeDict["href"] {
-            fields["link"] = href
+            let rel = attributeDict["rel"]
+            if rel == "alternate" || fields["link"] == nil {
+                fields["link"] = href
+            }
         }
     }
 
@@ -166,7 +211,9 @@ final class RSSParser: NSObject, XMLParserDelegate {
             guard let p = fields["published"] else { return .distantPast }
             Self.isoLock.lock()
             defer { Self.isoLock.unlock() }
-            return Self.isoFormatter.date(from: p) ?? .distantPast
+            return Self.isoFormatter.date(from: p)
+                ?? Self.isoFractionalFormatter.date(from: p)
+                ?? .distantPast
         }()
         let views = fields["views"].flatMap { Int($0) }
         let video = Video(
@@ -175,55 +222,117 @@ final class RSSParser: NSObject, XMLParserDelegate {
             channelTitle: fields["name"] ?? "",
             channelId: fields["yt:channelId"],
             views: views.map { "\(Fmt.count($0)) lượt xem" },
-            published: Fmt.ago(date)
+            published: date == .distantPast ? nil : Fmt.ago(date)
         )
         return FeedEntry(video: video, date: date, isShort: fields["link"]?.contains("/shorts/") ?? false)
     }
 }
 
 enum Media {
-    static func asset(_ url: URL) -> AVURLAsset {
+    static func asset(_ url: URL, userAgent: String? = nil) -> AVURLAsset {
+        if url.isFileURL {
+            return AVURLAsset(url: url)
+        }
+        if let ua = userAgent, !ua.isEmpty {
+            return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": ua]])
+        }
         if url.host?.contains("googlevideo") == true {
             return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": YTClient.ios.userAgent]])
         }
         return AVURLAsset(url: url)
     }
 
-    /// Joins separate video-only and audio-only streams (how YouTube serves >360p) into one item.
+    /// Joins separate video-only and audio-only streams into one composition.
     static func composition(video: AVURLAsset, audio: AVURLAsset) async throws -> AVMutableComposition {
+        try Task.checkCancellation()
         guard let vt = try await video.loadTracks(withMediaType: .video).first,
               let at = try await audio.loadTracks(withMediaType: .audio).first else { throw YTError.noStreams }
         let vd = try await video.load(.duration)
         let ad = try await audio.load(.duration)
+        guard vd.isNumeric, ad.isNumeric, vd.seconds > 0, ad.seconds > 0 else {
+            throw YTError.noStreams
+        }
         let range = CMTimeRange(start: .zero, duration: CMTimeMinimum(vd, ad))
 
         let comp = AVMutableComposition()
-        let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
-        try cv?.insertTimeRange(range, of: vt, at: .zero)
-        cv?.preferredTransform = try await vt.load(.preferredTransform)
-        let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-        try ca?.insertTimeRange(range, of: at, at: .zero)
+        guard let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw YTError.noStreams
+        }
+        try cv.insertTimeRange(range, of: vt, at: .zero)
+        cv.preferredTransform = try await vt.load(.preferredTransform)
+        try ca.insertTimeRange(range, of: at, at: .zero)
         return comp
     }
 
     static func merge(video: URL, audio: URL, to output: URL) async throws {
+        try Task.checkCancellation()
+        try? FileManager.default.removeItem(at: output)
         let comp = try await composition(video: AVURLAsset(url: video), audio: AVURLAsset(url: audio))
-        var export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough)
-        if export == nil {
-            export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality)
-        }
-        guard let session = export else { throw YTError.noStreams }
+        let primaryPreset = AVAssetExportPresetPassthrough
+        let fallbackPreset = AVAssetExportPresetHighestQuality
+        let session = AVAssetExportSession(asset: comp, presetName: primaryPreset)
+            ?? AVAssetExportSession(asset: comp, presetName: fallbackPreset)
+        guard let session else { throw YTError.noStreams }
         session.outputURL = output
         session.outputFileType = .mp4
-        await session.export()
+
+        await withTaskCancellationHandler {
+            await session.export()
+        } onCancel: {
+            session.cancelExport()
+        }
+        try Task.checkCancellation()
+
         if session.status != .completed {
-            if let retry = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality) {
+            if session.presetName == primaryPreset,
+               let retry = AVAssetExportSession(asset: comp, presetName: fallbackPreset) {
                 try? FileManager.default.removeItem(at: output)
                 retry.outputURL = output
                 retry.outputFileType = .mp4
-                await retry.export()
+                await withTaskCancellationHandler {
+                    await retry.export()
+                } onCancel: {
+                    retry.cancelExport()
+                }
+                try Task.checkCancellation()
                 if retry.status == .completed { return }
+                throw retry.error ?? session.error ?? YTError.noStreams
             }
+            throw session.error ?? YTError.noStreams
+        }
+    }
+
+    /// Remuxes DASH fragmented MP4 audio into a seekable M4A container for reliable offline seeking.
+    static func remuxAudioToM4A(source: URL, to output: URL) async throws {
+        try Task.checkCancellation()
+        try? FileManager.default.removeItem(at: output)
+        let asset = AVURLAsset(url: source)
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+            throw YTError.noStreams
+        }
+        let duration = try await asset.load(.duration)
+        guard duration.isNumeric, duration.seconds > 0 else {
+            throw YTError.noStreams
+        }
+        let comp = AVMutableComposition()
+        guard let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw YTError.noStreams
+        }
+        try ca.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: track, at: .zero)
+
+        let session = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough)
+            ?? AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetAppleM4A)
+        guard let session else { throw YTError.noStreams }
+        session.outputURL = output
+        session.outputFileType = .m4a
+        await withTaskCancellationHandler {
+            await session.export()
+        } onCancel: {
+            session.cancelExport()
+        }
+        try Task.checkCancellation()
+        if session.status != .completed {
             throw session.error ?? YTError.noStreams
         }
     }

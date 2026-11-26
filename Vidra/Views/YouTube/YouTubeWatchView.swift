@@ -12,48 +12,66 @@ struct YouTubeWatchView: View {
     @State private var currentVideo: Video? = PlayerManager.shared.current
     @AppStorage("youtube_ambient_mode") private var ambientMode = true
     @State private var ambientColor: Color = Color(red: 0.15, green: 0.18, blue: 0.25)
+    @State private var pushedChannel: Channel?
+    @State private var showChannelPage = false
 
     var body: some View {
         NavigationStack {
-            Group {
-                if vsc == .compact {
-                    // Chế độ xoay ngang: Toàn màn hình tràn viền
-                    PlayerArea(onClose: { minimizeToMiniPlayer() })
+            GeometryReader { geo in
+                let compact = vsc == .compact
+                let playerHeight = geo.size.width > 0 ? geo.size.width * 9 / 16 : 220
+
+                ZStack(alignment: .top) {
+                    (compact ? Color.black : Color(.systemBackground))
                         .ignoresSafeArea()
-                } else {
-                    // Chế độ dọc: Trình phát ở trên cùng với hiệu ứng Ambient Mode
-                    ZStack(alignment: .top) {
-                        Color(.systemBackground).ignoresSafeArea()
 
-                        // Hiệu ứng ánh sáng chiếu rạp Ambient Mode
-                        if ambientMode {
-                            YouTubeAmbientLightingView(color: ambientColor, isEnabled: ambientMode)
-                                .ignoresSafeArea(edges: .top)
-                        }
+                    if !compact && ambientMode {
+                        YouTubeAmbientLightingView(color: ambientColor, isEnabled: ambientMode)
+                            .ignoresSafeArea(edges: .top)
+                    }
 
-                        VStack(spacing: 0) {
-                            // Video Player Area tương thích PlayerManager.shared
-                            PlayerArea(onClose: { minimizeToMiniPlayer() })
-                                .aspectRatio(16 / 9, contentMode: .fit)
+                    VStack(spacing: 0) {
+                        PlayerArea(onClose: { minimizeToMiniPlayer() })
+                            .frame(
+                                width: compact ? nil : geo.size.width,
+                                height: compact ? nil : playerHeight
+                            )
+                            .frame(
+                                maxWidth: compact ? .infinity : nil,
+                                maxHeight: compact ? .infinity : nil
+                            )
 
-                            // Nội dung chi tiết video có thể cuộn
+                        if !compact {
                             YouTubeWatchDetails(
                                 ambientColor: ambientColor,
-                                ambientMode: $ambientMode
+                                ambientMode: $ambientMode,
+                                onOpenChannel: { channel in
+                                    pushedChannel = channel
+                                    showChannelPage = true
+                                }
                             )
                         }
                     }
                 }
             }
+            .ignoresSafeArea(.all, edges: vsc == .compact ? .all : [])
             .background(vsc == .compact ? Color.black : Color(.systemBackground))
             .toolbar(.hidden, for: .navigationBar)
-            .task(id: currentVideo?.id) {
+            .navigationDestination(isPresented: $showChannelPage) {
+                if let ch = pushedChannel {
+                    ChannelView(channel: ch)
+                }
+            }
+            .task(id: "\(currentVideo?.id ?? "")_\(ambientMode)") {
                 guard ambientMode else { return }
                 await updateAmbientColor(for: currentVideo?.thumbnail)
             }
             .onReceive(PlayerManager.shared.$current) { v in
                 if currentVideo?.id != v?.id {
                     currentVideo = v
+                    if showChannelPage {
+                        showChannelPage = false
+                    }
                 }
             }
         }
@@ -63,6 +81,11 @@ struct YouTubeWatchView: View {
     private func minimizeToMiniPlayer() {
         #if canImport(UIKit)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if vsc == .compact,
+           UIDevice.current.userInterfaceIdiom == .phone,
+           let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { _ in }
+        }
         #endif
         PlayerManager.shared.showWatch = false
         dismiss()
@@ -157,6 +180,7 @@ struct YouTubeAmbientLightingView: View {
 struct YouTubeWatchDetails: View {
     let ambientColor: Color
     @Binding var ambientMode: Bool
+    var onOpenChannel: ((Channel) -> Void)? = nil
 
     @ObservedObject private var pm = PlayerManager.shared
     @ObservedObject private var lib = Library.shared
@@ -202,16 +226,27 @@ struct YouTubeWatchDetails: View {
             .environment(\.openURL, OpenURLAction { url in handleURL(url) })
             .task(id: v.id) {
                 votes = nil
+                channelDetail = nil
                 userLiked = lib.isLiked(v.id)
                 userDisliked = false
                 topComment = nil
                 topCommentCount = nil
-                loadVideoMeta(v)
+                await loadVideoMeta(v)
+            }
+            .onChange(of: lib.liked.count) { _ in
+                let liked = lib.isLiked(v.id)
+                if userLiked != liked {
+                    userLiked = liked
+                    if liked { userDisliked = false }
+                }
             }
             .onChange(of: pm.commentsToken) { token in
                 if let token, topComment == nil {
                     Task {
-                        if let res = try? await InnerTube.shared.comments(token), let first = res.items.first {
+                        if let res = try? await InnerTube.shared.comments(token),
+                           pm.current?.id == v.id,
+                           pm.commentsToken == token,
+                           let first = res.items.first {
                             self.topComment = first
                             self.topCommentCount = res.items.count > 0 ? "\(res.items.count)+" : nil
                         }
@@ -349,8 +384,8 @@ struct YouTubeWatchDetails: View {
             )
 
             HStack(spacing: 12) {
-                NavigationLink {
-                    ChannelView(channel: channel)
+                Button {
+                    onOpenChannel?(channel)
                 } label: {
                     HStack(spacing: 12) {
                         // Avatar to tròn 40x40
@@ -376,6 +411,7 @@ struct YouTubeWatchDetails: View {
                                 .lineLimit(1)
                         }
                     }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
@@ -617,7 +653,10 @@ struct YouTubeWatchDetails: View {
                     userDisliked = false
                 } else {
                     userDisliked = true
-                    userLiked = false
+                    if userLiked {
+                        userLiked = false
+                        if lib.isLiked(v.id) { lib.toggleLike(v) }
+                    }
                 }
             } label: {
                 HStack(spacing: 5) {
@@ -818,9 +857,9 @@ struct YouTubeWatchDetails: View {
                 }
                 .padding(.top, 4)
 
-                ForEach(pm.queue) { q in
+                ForEach(Array(pm.queue.enumerated()), id: \.offset) { idx, q in
                     YouTubeWatchVideoRow(video: q, isCurrentQueue: true) {
-                        pm.play(q)
+                        pm.play(q, queue: Array(pm.queue.dropFirst(idx + 1)))
                     }
                 }
             }
@@ -847,9 +886,9 @@ struct YouTubeWatchDetails: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 24)
             } else {
-                ForEach(pm.related) { r in
+                ForEach(Array(pm.related.enumerated()), id: \.offset) { idx, r in
                     YouTubeWatchVideoRow(video: r) {
-                        pm.play(r)
+                        pm.play(r, queue: Array(pm.related.dropFirst(idx + 1)))
                     }
                 }
             }
@@ -880,26 +919,26 @@ struct YouTubeWatchDetails: View {
         return page?.channel
     }
 
-    private func loadVideoMeta(_ v: Video) {
+    private func loadVideoMeta(_ v: Video) async {
         let token = pm.commentsToken
         let chId = v.channelId
         let knownSub = chId.flatMap { id in lib.subscriptions.first(where: { $0.id == id }) }
 
-        Task {
-            async let votesRes = Self.fetchVotes(for: v)
-            async let commentRes = Self.fetchTopComment(token: token)
-            async let channelRes = Self.fetchChannel(id: chId, known: knownSub)
+        async let votesRes = Self.fetchVotes(for: v)
+        async let commentRes = Self.fetchTopComment(token: token)
+        async let channelRes = Self.fetchChannel(id: chId, known: knownSub)
 
-            let vRes = await votesRes
-            let cRes = await commentRes
-            let chRes = await channelRes
-            guard pm.current?.id == v.id else { return }
-            self.votes = vRes
+        let vRes = await votesRes
+        let cRes = await commentRes
+        let chRes = await channelRes
+        guard !Task.isCancelled, pm.current?.id == v.id else { return }
+        self.votes = vRes
+        if cRes.0 != nil {
             self.topComment = cRes.0
             self.topCommentCount = cRes.1
-            if let chRes {
-                self.channelDetail = chRes
-            }
+        }
+        if let chRes {
+            self.channelDetail = chRes
         }
     }
 
@@ -946,92 +985,94 @@ struct YouTubeWatchVideoRow: View {
     }
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(alignment: .top, spacing: 12) {
-                // Thumbnail với badge thời lượng và progress bar
-                Thumbnail(
-                    url: video.thumbnail,
-                    duration: video.duration,
-                    progress: progress
-                )
-                .frame(width: 150)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        HStack(alignment: .top, spacing: 8) {
+            Button(action: onSelect) {
+                HStack(alignment: .top, spacing: 12) {
+                    // Thumbnail với badge thời lượng và progress bar
+                    Thumbnail(
+                        url: video.thumbnail,
+                        duration: video.duration,
+                        progress: progress
+                    )
+                    .frame(width: 150)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                // Thông tin video
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(video.title.isEmpty ? "Video YouTube" : video.title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
+                    // Thông tin video
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(video.title.isEmpty ? "Video YouTube" : video.title)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
 
-                    if !video.channelTitle.isEmpty {
-                        Text(video.channelTitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-
-                    HStack(spacing: 4) {
-                        if let v = video.views, !v.isEmpty {
-                            Text(v)
+                        if !video.channelTitle.isEmpty {
+                            Text(video.channelTitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
-                        if video.views != nil && video.published != nil {
-                            Text("•")
+
+                        HStack(spacing: 4) {
+                            if let v = video.views, !v.isEmpty {
+                                Text(v)
+                            }
+                            if video.views != nil && video.published != nil {
+                                Text("•")
+                            }
+                            if let p = video.published, !p.isEmpty {
+                                Text(p)
+                            }
                         }
-                        if let p = video.published, !p.isEmpty {
-                            Text(p)
-                        }
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                }
-
-                Spacer(minLength: 0)
-
-                // Nút tuỳ chọn 3 chấm (Menu)
-                Menu {
-                    Button {
-                        PlayerManager.shared.playNext(video)
-                    } label: {
-                        Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
-                    }
-
-                    Button {
-                        lib.toggleWatchLater(video)
-                    } label: {
-                        Label(lib.isInWatchLater(video.id) ? "Xoá khỏi Xem sau" : "Lưu vào Xem sau",
-                              systemImage: lib.isInWatchLater(video.id) ? "clock.fill" : "clock")
-                    }
-
-                    Button {
-                        showAddToPlaylist = true
-                    } label: {
-                        Label("Lưu vào danh sách phát", systemImage: "plus.square.on.square")
-                    }
-
-                    ShareLink(item: video.shareURL) {
-                        Label("Chia sẻ", systemImage: "arrowshape.turn.up.right")
-                    }
-
-                    Button {
-                        dl.start(video, audioOnly: false)
-                    } label: {
-                        Label("Tải xuống video", systemImage: "arrow.down.circle")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.subheadline)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 28)
-                        .contentShape(Rectangle())
+                        .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 0)
                 }
-                .buttonStyle(.plain)
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            // Nút tuỳ chọn 3 chấm (Menu) đặt ngoài Button để tránh xung đột cử chỉ
+            Menu {
+                Button {
+                    PlayerManager.shared.playNext(video)
+                } label: {
+                    Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+
+                Button {
+                    lib.toggleWatchLater(video)
+                } label: {
+                    Label(lib.isInWatchLater(video.id) ? "Xoá khỏi Xem sau" : "Lưu vào Xem sau",
+                          systemImage: lib.isInWatchLater(video.id) ? "clock.fill" : "clock")
+                }
+
+                Button {
+                    showAddToPlaylist = true
+                } label: {
+                    Label("Lưu vào danh sách phát", systemImage: "plus.square.on.square")
+                }
+
+                ShareLink(item: video.shareURL) {
+                    Label("Chia sẻ", systemImage: "arrowshape.turn.up.right")
+                }
+
+                Button {
+                    dl.start(video, audioOnly: false)
+                } label: {
+                    Label("Tải xuống video", systemImage: "arrow.down.circle")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
         .sheet(isPresented: $showAddToPlaylist) {
             AddToPlaylistView(video: video)
                 .presentationDetents([.medium, .large])
@@ -1164,11 +1205,14 @@ struct CommentsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var comments: [Comment] = []
     @State private var nextToken: String?
+    @State private var loadedToken: String?
     @State private var isLoading = false
     @State private var errorText: String?
     @State private var hasStarted = false
     @State private var expandedReplies: Set<String> = []
     @State private var loadingReplies: Set<String> = []
+    @State private var loadingMoreReplies: Set<String> = []
+    @State private var replyNextTokens: [String: String] = [:]
     @State private var selectedFilter: CommentFilter = .top
 
     enum CommentFilter: String, CaseIterable {
@@ -1211,11 +1255,10 @@ struct CommentsView: View {
         }
         .background(Color(.systemBackground))
         .navigationBarHidden(true)
-        .task {
-            guard !hasStarted else { return }
+        .task(id: token) {
+            guard !hasStarted || loadedToken != token else { return }
             hasStarted = true
-            nextToken = token
-            await loadComments(reset: false)
+            await loadComments(reset: true)
         }
     }
 
@@ -1243,7 +1286,9 @@ struct CommentsView: View {
             HStack(spacing: 8) {
                 ForEach(CommentFilter.allCases, id: \.self) { filter in
                     Button {
+                        guard selectedFilter != filter else { return }
                         selectedFilter = filter
+                        Task { await loadComments(reset: true) }
                     } label: {
                         Text(filter.rawValue)
                             .font(.system(size: 13, weight: .semibold))
@@ -1316,6 +1361,22 @@ struct CommentsView: View {
                                             channelAvatar: channelAvatar
                                         )
                                     }
+
+                                    if replyNextTokens[c.id] != nil {
+                                        Button {
+                                            loadMoreReplies(for: c.id)
+                                        } label: {
+                                            if loadingMoreReplies.contains(c.id) {
+                                                ProgressView()
+                                                    .scaleEffect(0.75)
+                                            } else {
+                                                Text("Xem thêm câu trả lời")
+                                                    .font(.caption.weight(.bold))
+                                                    .foregroundStyle(Color.blue)
+                                            }
+                                        }
+                                        .padding(.top, 2)
+                                    }
                                 }
                                 .padding(.leading, 46)
                             }
@@ -1357,38 +1418,71 @@ struct CommentsView: View {
     }
 
     private func loadReplies(for commentId: String, token: String) {
+        guard !loadingReplies.contains(commentId) else { return }
         loadingReplies.insert(commentId)
         Task {
-            if let res = try? await InnerTube.shared.comments(token) {
+            defer { loadingReplies.remove(commentId) }
+            if let res = try? await InnerTube.shared.comments(token), !Task.isCancelled {
                 if let idx = comments.firstIndex(where: { $0.id == commentId }) {
                     comments[idx].replies = res.items
+                    replyNextTokens[commentId] = res.next
                 }
             }
-            loadingReplies.remove(commentId)
+        }
+    }
+
+    private func loadMoreReplies(for commentId: String) {
+        guard !loadingMoreReplies.contains(commentId),
+              let next = replyNextTokens[commentId] else { return }
+        loadingMoreReplies.insert(commentId)
+        Task {
+            defer { loadingMoreReplies.remove(commentId) }
+            if let res = try? await InnerTube.shared.comments(next), !Task.isCancelled {
+                if let idx = comments.firstIndex(where: { $0.id == commentId }) {
+                    let seen = Set(comments[idx].replies.map(\.id))
+                    let newReplies = res.items.filter { !seen.contains($0.id) }
+                    comments[idx].replies.append(contentsOf: newReplies)
+                    replyNextTokens[commentId] = res.next
+                }
+            }
         }
     }
 
     private func loadComments(reset: Bool) async {
-        if reset {
-            nextToken = token
-            comments.removeAll()
-            expandedReplies.removeAll()
+        guard !isLoading else { return }
+        let targetToken = reset ? token : nextToken
+        guard let t = targetToken else {
+            if reset {
+                nextToken = nil
+                loadedToken = token
+                comments.removeAll()
+                expandedReplies.removeAll()
+                replyNextTokens.removeAll()
+            }
+            return
         }
-        guard let t = nextToken, !isLoading else { return }
         isLoading = true
         errorText = nil
+        if reset {
+            nextToken = token
+            loadedToken = token
+            comments.removeAll()
+            expandedReplies.removeAll()
+            replyNextTokens.removeAll()
+        }
+        defer { isLoading = false }
         do {
             let res = try await InnerTube.shared.comments(t)
+            guard !Task.isCancelled else { return }
             let seen = Set(comments.map(\.id))
             let newItems = res.items.filter { !seen.contains($0.id) }
             comments.append(contentsOf: newItems)
             nextToken = res.next
         } catch {
-            if comments.isEmpty {
+            if !(error is CancellationError) && !Task.isCancelled && comments.isEmpty {
                 errorText = error.localizedDescription
             }
         }
-        isLoading = false
     }
 }
 
@@ -1428,7 +1522,7 @@ private struct CommentRowView: View {
                         .padding(.vertical, 2)
                         .background(Color.primary.opacity(0.12), in: Capsule())
                     } else {
-                        Text("@\(comment.author)")
+                        Text(comment.author.hasPrefix("@") ? comment.author : "@\(comment.author)")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
                     }
@@ -1505,7 +1599,7 @@ private struct ReplyRowView: View {
                         .padding(.vertical, 1.5)
                         .background(Color.primary.opacity(0.12), in: Capsule())
                     } else {
-                        Text("@\(reply.author)")
+                        Text(reply.author.hasPrefix("@") ? reply.author : "@\(reply.author)")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.secondary)
                     }

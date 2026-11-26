@@ -1,29 +1,118 @@
 import Foundation
 import Network
 
-/// Lightweight in-memory loopback HLS server.
-/// Apple's AVPlayer natively excels at playing fragmented MP4 (fMP4) via HLS with `#EXT-X-MAP` and `#EXT-X-BYTERANGE`.
-/// Since YouTube only serves unthrottled streams via separate DASH video and audio tracks on iOS,
-/// HLSServer serves dynamically constructed HL master and media playlists on 127.0.0.1, allowing AVPlayer
-/// to play 1080p/720p video + audio in hardware with zero latency, full AirPlay, and PiP support.
+/// Lightweight in-memory loopback HLS server & authenticated byte-range proxy.
+/// Proxies `#EXT-X-MAP` and `#EXT-X-BYTERANGE` segment fetches through `127.0.0.1` so `AVPlayer`
+/// receives consistent `YTClient` User-Agent headers, retry recovery, HTTP 206 compliance, and
+/// fast cancellation on seek.
 final class HLSServer: @unchecked Sendable {
     static let shared = HLSServer()
 
+    struct ProxyTarget: Sendable {
+        let url: URL
+        let userAgent: String
+        let totalSize: Int64?
+    }
+
+    private final class ConnectionSession: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: Task<Void, Never>?
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func setTask(_ newTask: Task<Void, Never>?) {
+            lock.lock()
+            let prev = task
+            task = cancelled ? nil : newTask
+            let wasCancelled = cancelled
+            lock.unlock()
+            prev?.cancel()
+            if wasCancelled { newTask?.cancel() }
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let t = task
+            task = nil
+            lock.unlock()
+            t?.cancel()
+        }
+    }
+
     private var listener: NWListener?
-    private(set) var port: UInt16 = 0
+    private var _port: UInt16 = 0
+    private var portWaiters: [CheckedContinuation<UInt16, Never>] = []
+    private var nextTagSeq: UInt64 = 0
+    private var nextProxySeq: UInt64 = 0
+    private var restartScheduled = false
+
     typealias DynamicRouteHandler = @Sendable () -> (contentType: String, data: Data)?
     private var routes: [String: (contentType: String, data: Data)] = [:]
     private var dynamicRoutes: [String: DynamicRouteHandler] = [:]
-    private var routeKeys: [String] = [] // LRU tracking
-    private var dynamicRouteKeys: [String] = [] // LRU tracking for dynamic live routes
+    private var proxyTargets: [String: ProxyTarget] = [:]
+    private var routeKeys: [String] = []
+    private var dynamicRouteKeys: [String] = []
+    private var proxyKeys: [String] = []
+
     private let lock = NSLock()
-    private let queue = DispatchQueue(label: "vidra.hls.server", qos: .userInitiated)
+    private let acceptQueue = DispatchQueue(label: "vidra.hls.accept", qos: .userInitiated)
+    private let connQueue = DispatchQueue(label: "vidra.hls.conn", qos: .userInitiated, attributes: .concurrent)
+
+    private static let proxySession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 12
+        cfg.timeoutIntervalForResource = 45
+        cfg.httpMaximumConnectionsPerHost = 12
+        cfg.httpShouldUsePipelining = true
+        cfg.waitsForConnectivity = false
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: cfg)
+    }()
+
+    var port: UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _port
+    }
 
     init() {
         start()
     }
 
+    func ensureRunning() {
+        lock.lock()
+        let needsStart = listener == nil || _port == 0
+        lock.unlock()
+        if needsStart { start() }
+    }
+
+    func nextTag(prefix: String) -> String {
+        let safe = prefix
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        lock.lock()
+        nextTagSeq &+= 1
+        let seq = nextTagSeq
+        lock.unlock()
+        return "\(safe)_\(seq)"
+    }
+
     func start() {
+        lock.lock()
+        if listener != nil {
+            lock.unlock()
+            return
+        }
+        restartScheduled = false
+        lock.unlock()
+
         do {
             let tcpOptions = NWProtocolTCP.Options()
             tcpOptions.noDelay = true
@@ -31,15 +120,27 @@ final class HLSServer: @unchecked Sendable {
             params.allowLocalEndpointReuse = true
             params.requiredInterfaceType = .loopback
             let l = try NWListener(using: params, on: .any)
-            l.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
+            l.stateUpdateHandler = { [weak self, weak l] state in
+                guard let self, let l else { return }
                 switch state {
                 case .ready:
                     if let assignedPort = l.port?.rawValue {
                         self.lock.lock()
-                        self.port = assignedPort
+                        guard self.listener === l else {
+                            self.lock.unlock()
+                            return
+                        }
+                        self._port = assignedPort
+                        let waiters = self.portWaiters
+                        self.portWaiters.removeAll()
                         self.lock.unlock()
+                        for w in waiters { w.resume(returning: assignedPort) }
                     }
+                case .failed(let err):
+                    print("HLSServer listener failed: \(err)")
+                    self.resetListenerAndScheduleRestart(for: l)
+                case .cancelled:
+                    self.resetListenerAndScheduleRestart(for: l)
                 default:
                     break
                 }
@@ -47,26 +148,99 @@ final class HLSServer: @unchecked Sendable {
             l.newConnectionHandler = { [weak self] connection in
                 self?.handle(connection: connection)
             }
-            l.start(queue: queue)
+            lock.lock()
+            guard listener == nil else {
+                lock.unlock()
+                l.cancel()
+                return
+            }
             listener = l
+            lock.unlock()
+            l.start(queue: acceptQueue)
         } catch {
             print("HLSServer failed to start: \(error)")
         }
     }
 
-    /// Waits until the loopback server has bound an ephemeral port (with a 1.0s safety timeout to prevent deadlocks).
-    func ensurePort() async -> UInt16 {
-        for _ in 0..<20 {
-            lock.lock()
-            let p = port
-            lock.unlock()
-            if p > 0 { return p }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
+    private func resetListenerAndScheduleRestart(for failedListener: NWListener) {
         lock.lock()
-        let p = port
+        guard listener === failedListener else {
+            lock.unlock()
+            return
+        }
+        listener = nil
+        _port = 0
+        let shouldSchedule = !restartScheduled
+        restartScheduled = true
         lock.unlock()
-        return p
+
+        failedListener.cancel()
+        guard shouldSchedule else { return }
+        acceptQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.start()
+        }
+    }
+
+    /// Waits until the loopback server has bound an ephemeral port (with a 2.0s safety timeout).
+    func ensurePort() async -> UInt16 {
+        ensureRunning()
+        let immediate = port
+        if immediate > 0 { return immediate }
+
+        return await withTaskGroup(of: UInt16.self) { group in
+            group.addTask {
+                await withCheckedContinuation { cont in
+                    self.lock.lock()
+                    if self._port > 0 {
+                        let p = self._port
+                        self.lock.unlock()
+                        cont.resume(returning: p)
+                    } else {
+                        self.portWaiters.append(cont)
+                        self.lock.unlock()
+                    }
+                }
+            }
+            group.addTask {
+                for _ in 0..<40 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    let p = self.port
+                    if p > 0 { return p }
+                }
+                return self.port
+            }
+            let first = await group.next() ?? self.port
+            group.cancelAll()
+            // Drain any pending waiters if timeout won
+            self.lock.lock()
+            let current = self._port
+            if current > 0 || !self.portWaiters.isEmpty {
+                let leftovers = self.portWaiters
+                self.portWaiters.removeAll()
+                self.lock.unlock()
+                for w in leftovers { w.resume(returning: current) }
+            } else {
+                self.lock.unlock()
+            }
+            return first > 0 ? first : self.port
+        }
+    }
+
+    /// Registers a short `/s/<token>` local proxy URL for an upstream media URL + client User-Agent.
+    func registerProxy(url: URL, userAgent: String, totalSize: Int64? = nil) async -> URL? {
+        let p = await ensurePort()
+        guard p > 0 else { return nil }
+        lock.lock()
+        nextProxySeq &+= 1
+        let path = "/s/p\(nextProxySeq)"
+        proxyTargets[path] = ProxyTarget(url: url, userAgent: userAgent, totalSize: totalSize)
+        proxyKeys.append(path)
+        while proxyKeys.count > 300 {
+            let old = proxyKeys.removeFirst()
+            proxyTargets.removeValue(forKey: old)
+        }
+        lock.unlock()
+        return URL(string: "http://127.0.0.1:\(p)\(path)")
     }
 
     /// Registers a dynamic route whose content is computed on each request (e.g. live sliding-window HLS).
@@ -81,7 +255,7 @@ final class HLSServer: @unchecked Sendable {
             dynamicRouteKeys.remove(at: existing)
         }
         dynamicRouteKeys.append(path)
-        while dynamicRouteKeys.count > 20 {
+        while dynamicRouteKeys.count > 40 {
             let old = dynamicRouteKeys.removeFirst()
             dynamicRoutes.removeValue(forKey: old)
             dynamicRoutes.removeValue(forKey: old.removingPercentEncoding ?? old)
@@ -90,7 +264,7 @@ final class HLSServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(p)\(path)")
     }
 
-    /// Registers an in-memory route (e.g. `/hls/abc/master.m3u8`) and returns its local loopback URL.
+    /// Registers an in-memory route (e.g. `/hls/abc_1/master.m3u8`) and returns its local loopback URL.
     func register(path: String, contentType: String, data: Data) async -> URL? {
         let p = await ensurePort()
         guard p > 0 else { return nil }
@@ -102,8 +276,7 @@ final class HLSServer: @unchecked Sendable {
             routeKeys.remove(at: existing)
         }
         routeKeys.append(path)
-        // Keep at most 100 recent playlist paths in memory (~200 KB total)
-        while routeKeys.count > 100 {
+        while routeKeys.count > 400 {
             let old = routeKeys.removeFirst()
             routes.removeValue(forKey: old)
             routes.removeValue(forKey: old.removingPercentEncoding ?? old)
@@ -112,129 +285,576 @@ final class HLSServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(p)\(path)")
     }
 
+    // MARK: - HTTP Connection Handling
+
     private func handle(connection: NWConnection) {
-        connection.start(queue: queue)
-        connection.receive(minimumIncompleteLength: 4, maximumLength: 4096) { [weak self] data, _, _, _ in
-            guard let self, let data, let req = String(data: data, encoding: .utf8) else {
+        let session = ConnectionSession()
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled:
+                session.cancel()
+            default:
+                break
+            }
+        }
+        connection.start(queue: connQueue)
+        receiveRequest(on: connection, session: session, buffer: Data())
+    }
+
+    private func receiveRequest(on connection: NWConnection, session: ConnectionSession, buffer: Data) {
+        guard !session.isCancelled else {
+            connection.cancel()
+            return
+        }
+        if let headerRange = buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) {
+            let headerData = buffer[..<headerRange.lowerBound]
+            let remainder = Data(buffer[headerRange.upperBound...])
+            processHTTPRequest(headerData: Data(headerData), trailingBuffer: remainder, on: connection, session: session)
+            return
+        }
+        if buffer.count > 65_536 {
+            sendError(status: 431, text: "Request Header Fields Too Large", isHead: false, keepAlive: false, connection: connection, session: session, trailingBuffer: Data())
+            return
+        }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, isComplete, error in
+            guard let self else {
                 connection.cancel()
                 return
             }
-            // Parse HTTP request line, e.g. "GET /hls/xyz/master.m3u8 HTTP/1.1"
-            let firstLine = req.components(separatedBy: "\r\n").first ?? ""
-            let parts = firstLine.components(separatedBy: " ")
-            let isHead = parts.first == "HEAD"
-            guard parts.count >= 2, parts[0] == "GET" || isHead else {
-                self.send(status: 400, text: "Bad Request", connection: connection)
-                return
-            }
-            let rawPath = parts[1].components(separatedBy: "?").first ?? parts[1]
-            let decodedPath = rawPath.removingPercentEncoding ?? rawPath
-
-            self.lock.lock()
-            let matched = self.routes[rawPath] ?? self.routes[decodedPath]
-            let dynamicHandler = self.dynamicRoutes[rawPath] ?? self.dynamicRoutes[decodedPath]
-            self.lock.unlock()
-
-            let responsePair: (contentType: String, data: Data)? = {
-                if let matched { return (matched.contentType, matched.data) }
-                if let dynamicHandler { return dynamicHandler() }
-                return nil
-            }()
-
-            guard let (contentType, body) = responsePair else {
-                self.send(status: 404, text: "Not Found", connection: connection)
-                return
-            }
-
-            var resp = "HTTP/1.1 200 OK\r\n"
-            resp += "Content-Type: \(contentType)\r\n"
-            resp += "Content-Length: \(body.count)\r\n"
-            resp += "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            resp += "Pragma: no-cache\r\n"
-            resp += "Expires: 0\r\n"
-            resp += "Connection: close\r\n"
-            resp += "Access-Control-Allow-Origin: *\r\n\r\n"
-
-            var responseData = resp.data(using: .utf8) ?? Data()
-            if !isHead {
-                responseData.append(body)
-            }
-
-            connection.send(content: responseData, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+            if error != nil {
+                session.cancel()
                 connection.cancel()
+                return
+            }
+            var combined = buffer
+            if let data, !data.isEmpty { combined.append(data) }
+
+            if let headerRange = combined.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) {
+                let headerData = combined[..<headerRange.lowerBound]
+                let remainder = Data(combined[headerRange.upperBound...])
+                self.processHTTPRequest(headerData: Data(headerData), trailingBuffer: remainder, on: connection, session: session)
+            } else if isComplete || data == nil || data?.isEmpty == true {
+                connection.cancel()
+            } else {
+                self.receiveRequest(on: connection, session: session, buffer: combined)
+            }
+        }
+    }
+
+    private func processHTTPRequest(
+        headerData: Data,
+        trailingBuffer: Data,
+        on connection: NWConnection,
+        session: ConnectionSession
+    ) {
+        guard let req = String(data: headerData, encoding: .utf8) else {
+            sendError(status: 400, text: "Bad Request", isHead: false, keepAlive: false, connection: connection, session: session, trailingBuffer: trailingBuffer)
+            return
+        }
+        let lines = req.components(separatedBy: "\r\n")
+        guard let firstLine = lines.first else {
+            sendError(status: 400, text: "Bad Request", isHead: false, keepAlive: false, connection: connection, session: session, trailingBuffer: trailingBuffer)
+            return
+        }
+        let parts = firstLine.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        let method = parts.first ?? ""
+        let isHead = method == "HEAD"
+        guard parts.count >= 2, method == "GET" || isHead else {
+            sendError(status: 405, text: "Method Not Allowed", isHead: isHead, keepAlive: false, connection: connection, session: session, trailingBuffer: trailingBuffer)
+            return
+        }
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            if let colon = line.firstIndex(of: ":") {
+                let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                let val = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                headers[name] = val
+            }
+        }
+        let keepAlive = !(headers["connection"]?.lowercased().contains("close") ?? false)
+
+        let targetSpec = parts[1]
+        let qMark = targetSpec.firstIndex(of: "?")
+        let rawPath = qMark.map { String(targetSpec[..<$0]) } ?? targetSpec
+        let rawQuery = qMark.map { String(targetSpec[targetSpec.index(after: $0)...]) }
+        let decodedPath = rawPath.removingPercentEncoding ?? rawPath
+
+        // 1. Proxied upstream byte-range / live segment route
+        if rawPath.hasPrefix("/s/") || decodedPath.hasPrefix("/s/") {
+            lock.lock()
+            let key = proxyTargets[rawPath] != nil ? rawPath : decodedPath
+            let target = proxyTargets[key]
+            if target != nil, let idx = proxyKeys.firstIndex(of: key) {
+                proxyKeys.remove(at: idx)
+                proxyKeys.append(key)
+            }
+            lock.unlock()
+
+            guard let target else {
+                sendError(status: 404, text: "Not Found", isHead: isHead, keepAlive: keepAlive, connection: connection, session: session, trailingBuffer: trailingBuffer)
+                return
+            }
+
+            let rangeHeader = headers["range"]
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.serveProxy(
+                    target: target,
+                    rawQuery: rawQuery,
+                    rangeHeader: rangeHeader,
+                    isHead: isHead,
+                    keepAlive: keepAlive,
+                    connection: connection,
+                    session: session,
+                    trailingBuffer: trailingBuffer
+                )
+            }
+            session.setTask(task)
+            return
+        }
+
+        // 2. Dynamic / static playlist routes (true LRU touch on access)
+        var found: (contentType: String, data: Data)?
+        var dynamicHandler: DynamicRouteHandler?
+
+        lock.lock()
+        if let handler = dynamicRoutes[decodedPath] ?? dynamicRoutes[rawPath] {
+            dynamicHandler = handler
+            let k = dynamicRoutes[decodedPath] != nil ? decodedPath : rawPath
+            if let idx = dynamicRouteKeys.firstIndex(of: k) {
+                dynamicRouteKeys.remove(at: idx)
+                dynamicRouteKeys.append(k)
+            }
+        } else if let entry = routes[decodedPath] ?? routes[rawPath] {
+            found = entry
+            let k = routes[decodedPath] != nil ? decodedPath : rawPath
+            if let idx = routeKeys.firstIndex(of: k) {
+                routeKeys.remove(at: idx)
+                routeKeys.append(k)
+            }
+        }
+        lock.unlock()
+
+        if let dynamicHandler {
+            found = dynamicHandler()
+        }
+
+        guard let entry = found else {
+            sendError(status: 404, text: "Not Found", isHead: isHead, keepAlive: keepAlive, connection: connection, session: session, trailingBuffer: trailingBuffer)
+            return
+        }
+
+        serveInMemory(
+            contentType: entry.contentType,
+            body: entry.data,
+            rangeHeader: headers["range"],
+            isHead: isHead,
+            keepAlive: keepAlive,
+            connection: connection,
+            session: session,
+            trailingBuffer: trailingBuffer
+        )
+    }
+
+    private func serveInMemory(
+        contentType: String,
+        body: Data,
+        rangeHeader: String?,
+        isHead: Bool,
+        keepAlive: Bool,
+        connection: NWConnection,
+        session: ConnectionSession,
+        trailingBuffer: Data
+    ) {
+        let total = Int64(body.count)
+        var statusLine = "HTTP/1.1 200 OK"
+        var extraHeaders = ""
+        var payload = body
+
+        if let rangeHeader, !rangeHeader.isEmpty {
+            guard total > 0, let parsed = parseRange(rangeHeader, totalLength: total) else {
+                var resp = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                resp += "Content-Range: bytes */\(total)\r\n"
+                resp += "Content-Length: 0\r\n"
+                resp += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n\r\n"
+                sendResponse(Data(resp.utf8), keepAlive: keepAlive, on: connection, session: session, trailingBuffer: trailingBuffer)
+                return
+            }
+            statusLine = "HTTP/1.1 206 Partial Content"
+            extraHeaders = "Content-Range: bytes \(parsed.start)-\(parsed.end)/\(total)\r\n"
+            let lo = body.index(body.startIndex, offsetBy: Int(parsed.start))
+            let hi = body.index(body.startIndex, offsetBy: Int(parsed.end))
+            payload = Data(body[lo...hi])
+        }
+
+        var resp = "\(statusLine)\r\n"
+        resp += "Content-Type: \(contentType)\r\n"
+        resp += "Accept-Ranges: bytes\r\n"
+        resp += extraHeaders
+        resp += "Content-Length: \(payload.count)\r\n"
+        resp += "Cache-Control: no-cache\r\n"
+        resp += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n\r\n"
+
+        var out = Data(resp.utf8)
+        if !isHead { out.append(payload) }
+        sendResponse(out, keepAlive: keepAlive, on: connection, session: session, trailingBuffer: trailingBuffer)
+    }
+
+    private func serveProxy(
+        target: ProxyTarget,
+        rawQuery: String?,
+        rangeHeader: String?,
+        isHead: Bool,
+        keepAlive: Bool,
+        connection: NWConnection,
+        session: ConnectionSession,
+        trailingBuffer: Data
+    ) async {
+        guard !session.isCancelled, !Task.isCancelled else { return }
+
+        var upstreamURL = target.url
+        if let rawQuery, !rawQuery.isEmpty,
+           var comps = URLComponents(url: target.url, resolvingAgainstBaseURL: false) {
+            let extra = URLComponents(string: "http://x/?\(rawQuery)")?.queryItems ?? []
+            var items = comps.queryItems ?? []
+            for item in extra {
+                items.removeAll { $0.name == item.name }
+                items.append(item)
+            }
+            comps.queryItems = items
+            if let merged = comps.url { upstreamURL = merged }
+        }
+
+        // Normalize open-ended Range into a bounded 4 MB chunk so unbounded probes remain streaming-safe.
+        var effectiveRange = rangeHeader
+        var parsedRequestRange: (start: Int64, end: Int64?)?
+        if let rangeHeader, !rangeHeader.isEmpty {
+            parsedRequestRange = parseOpenRange(rangeHeader, knownTotal: target.totalSize)
+            if let r = parsedRequestRange, r.end == nil {
+                let cappedEnd = r.start + 4 * 1024 * 1024 - 1
+                effectiveRange = "bytes=\(r.start)-\(cappedEnd)"
+                parsedRequestRange = (r.start, cappedEnd)
+            } else if let r = parsedRequestRange, let end = r.end, end - r.start >= 16 * 1024 * 1024 {
+                let cappedEnd = r.start + 8 * 1024 * 1024 - 1
+                effectiveRange = "bytes=\(r.start)-\(cappedEnd)"
+                parsedRequestRange = (r.start, cappedEnd)
+            }
+        }
+
+        var lastStatus = 0
+        for attempt in 0..<3 {
+            if session.isCancelled || Task.isCancelled { return }
+            if attempt > 0 {
+                let delayNs: UInt64 = attempt == 1 ? 150_000_000 : 400_000_000
+                try? await Task.sleep(nanoseconds: delayNs)
+                if session.isCancelled || Task.isCancelled { return }
+            }
+
+            var req = URLRequest(url: upstreamURL)
+            req.httpMethod = isHead ? "HEAD" : "GET"
+            req.setValue(target.userAgent, forHTTPHeaderField: "User-Agent")
+            if let effectiveRange { req.setValue(effectiveRange, forHTTPHeaderField: "Range") }
+
+            do {
+                let (data, response) = try await Self.proxySession.data(for: req)
+                if session.isCancelled || Task.isCancelled { return }
+                guard let http = response as? HTTPURLResponse else {
+                    lastStatus = 502
+                    continue
+                }
+                lastStatus = http.statusCode
+
+                if http.statusCode == 416 {
+                    let cr = http.value(forHTTPHeaderField: "Content-Range") ?? "bytes */*"
+                    var resp = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                    resp += "Content-Range: \(cr)\r\n"
+                    resp += "Content-Length: 0\r\n"
+                    resp += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n\r\n"
+                    sendResponse(Data(resp.utf8), keepAlive: keepAlive, on: connection, session: session, trailingBuffer: trailingBuffer)
+                    return
+                }
+
+                if http.statusCode == 206 || http.statusCode == 200 {
+                    let upstreamCT = http.value(forHTTPHeaderField: "Content-Type") ?? "video/mp4"
+                    var outStatus = http.statusCode == 206 ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
+                    var contentRangeHeader = http.value(forHTTPHeaderField: "Content-Range")
+                    var body = data
+
+                    if http.statusCode == 200, let r = parsedRequestRange {
+                        if isHead {
+                            let declaredTotal = http.expectedContentLength > 0 ? http.expectedContentLength : target.totalSize
+                            if let total = declaredTotal, total > r.start {
+                                let end = min(r.end ?? (total - 1), total - 1)
+                                outStatus = "HTTP/1.1 206 Partial Content"
+                                contentRangeHeader = "bytes \(r.start)-\(end)/\(total)"
+                            }
+                        } else if Int64(data.count) > r.start {
+                            let total = Int64(data.count)
+                            let end = min(r.end ?? (total - 1), total - 1)
+                            let lo = data.index(data.startIndex, offsetBy: Int(r.start))
+                            let hi = data.index(data.startIndex, offsetBy: Int(end))
+                            body = Data(data[lo...hi])
+                            outStatus = "HTTP/1.1 206 Partial Content"
+                            contentRangeHeader = "bytes \(r.start)-\(end)/\(total)"
+                        } else {
+                            sendError(status: 416, text: "Range Not Satisfiable", isHead: isHead, keepAlive: keepAlive, connection: connection, session: session, trailingBuffer: trailingBuffer)
+                            return
+                        }
+                    } else if http.statusCode == 206, contentRangeHeader == nil, let r = parsedRequestRange {
+                        let end = r.end ?? (r.start + Int64(max(body.count, 1)) - 1)
+                        let totalPart = target.totalSize.map(String.init) ?? "*"
+                        contentRangeHeader = "bytes \(r.start)-\(end)/\(totalPart)"
+                    }
+
+                    if !isHead, body.isEmpty, parsedRequestRange != nil {
+                        lastStatus = 502
+                        continue
+                    }
+
+                    let contentLength: Int64 = isHead
+                        ? (http.expectedContentLength >= 0 ? http.expectedContentLength : Int64(body.count))
+                        : Int64(body.count)
+
+                    var resp = "\(outStatus)\r\n"
+                    resp += "Content-Type: \(upstreamCT)\r\n"
+                    resp += "Accept-Ranges: bytes\r\n"
+                    if let contentRangeHeader {
+                        resp += "Content-Range: \(contentRangeHeader)\r\n"
+                    }
+                    resp += "Content-Length: \(contentLength)\r\n"
+                    resp += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n\r\n"
+
+                    var out = Data(resp.utf8)
+                    if !isHead { out.append(body) }
+                    sendResponse(out, keepAlive: keepAlive, on: connection, session: session, trailingBuffer: trailingBuffer)
+                    return
+                }
+
+                if http.statusCode == 404 || http.statusCode == 410 {
+                    break
+                }
+            } catch is CancellationError {
+                return
+            } catch let urlErr as URLError where urlErr.code == .cancelled {
+                return
+            } catch {
+                lastStatus = 502
+            }
+        }
+
+        let errCode = (lastStatus == 403 || lastStatus == 404 || lastStatus == 410) ? lastStatus : 502
+        let errText = errCode == 403 ? "Forbidden" : (errCode == 404 ? "Not Found" : "Bad Gateway")
+        sendError(status: errCode, text: errText, isHead: isHead, keepAlive: keepAlive, connection: connection, session: session, trailingBuffer: trailingBuffer)
+    }
+
+    private func sendError(
+        status: Int,
+        text: String,
+        isHead: Bool,
+        keepAlive: Bool,
+        connection: NWConnection,
+        session: ConnectionSession,
+        trailingBuffer: Data
+    ) {
+        let bodyBytes = Data(text.utf8)
+        let shouldKeep = keepAlive && (status == 404 || status == 416)
+        var msg = "HTTP/1.1 \(status) \(text)\r\n"
+        msg += "Content-Type: text/plain; charset=utf-8\r\n"
+        msg += "Content-Length: \(bodyBytes.count)\r\n"
+        msg += "Connection: \(shouldKeep ? "keep-alive" : "close")\r\n\r\n"
+        var out = Data(msg.utf8)
+        if !isHead { out.append(bodyBytes) }
+        sendResponse(out, keepAlive: shouldKeep, on: connection, session: session, trailingBuffer: trailingBuffer)
+    }
+
+    private func sendResponse(
+        _ data: Data,
+        keepAlive: Bool,
+        on connection: NWConnection,
+        session: ConnectionSession,
+        trailingBuffer: Data
+    ) {
+        guard !session.isCancelled else {
+            connection.cancel()
+            return
+        }
+        if keepAlive {
+            connection.send(content: data, contentContext: .defaultMessage, isComplete: false, completion: .contentProcessed { [weak self] error in
+                if error != nil || session.isCancelled {
+                    connection.cancel()
+                    return
+                }
+                self?.receiveRequest(on: connection, session: session, buffer: trailingBuffer)
+            })
+        } else {
+            connection.send(content: data, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+                self?.connQueue.asyncAfter(deadline: .now() + 0.15) {
+                    connection.cancel()
+                }
             })
         }
     }
 
-    private func send(status: Int, text: String, connection: NWConnection) {
-        let msg = "HTTP/1.1 \(status) \(text)\r\nContent-Length: \(text.count)\r\nConnection: close\r\n\r\n\(text)"
-        connection.send(content: msg.data(using: .utf8), contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+    private func parseRange(_ header: String, totalLength: Int64) -> (start: Int64, end: Int64)? {
+        guard totalLength > 0, let parsed = parseOpenRange(header, knownTotal: totalLength) else { return nil }
+        let s = parsed.start
+        let e = min(parsed.end ?? (totalLength - 1), totalLength - 1)
+        guard s >= 0, s <= e else { return nil }
+        return (s, e)
+    }
+
+    private func parseOpenRange(_ header: String, knownTotal: Int64?) -> (start: Int64, end: Int64?)? {
+        let trimmed = header.trimmingCharacters(in: .whitespaces)
+        guard trimmed.lowercased().hasPrefix("bytes=") else { return nil }
+        let spec = trimmed.dropFirst(6).split(separator: ",", maxSplits: 1).first.map(String.init) ?? ""
+        let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2 else { return nil }
+
+        if parts[0].isEmpty {
+            // Suffix byte range: bytes=-N
+            guard let suffix = Int64(parts[1]), suffix > 0, let total = knownTotal, total > 0 else { return nil }
+            return (max(0, total - suffix), total - 1)
+        }
+        guard let start = Int64(parts[0]), start >= 0 else { return nil }
+        if parts[1].isEmpty {
+            return (start, knownTotal.map { max(start, $0 - 1) })
+        }
+        guard let end = Int64(parts[1]), end >= start else { return nil }
+        if let total = knownTotal, total > 0 {
+            guard start < total else { return nil }
+            return (start, min(end, total - 1))
+        }
+        return (start, end)
     }
 }
 
 // MARK: - SIDX Parser
 
-struct SIDXSegment {
+struct SIDXSegment: Sendable {
     let duration: Double
     let size: Int
     let offset: Int
 }
 
 enum SIDXParser {
-    /// Parses the ISO Base Media File Format `sidx` (Segment Index) box from raw binary data.
-    static func parse(data: Data, indexEnd: Int) -> [SIDXSegment]? {
-        let sidxBytes: [UInt8] = [0x73, 0x69, 0x64, 0x78] // 'sidx'
-        guard let sidxRange = data.range(of: Data(sidxBytes)), sidxRange.lowerBound >= 4 else { return nil }
-        let base = sidxRange.lowerBound - 4
-        guard data.count >= base + 12 else { return nil }
+    /// Parses the ISO Base Media File Format `sidx` (Segment Index) box from raw binary data,
+    /// properly applying `first_offset`, validating `reference_type`, and rejecting truncated data.
+    static func parse(data: Data, indexStart: Int, indexEnd: Int) -> [SIDXSegment]? {
+        let sidxTag: UInt32 = 0x73696478 // 'sidx'
+        var base: Int?
+        var boxSize64: UInt64 = 0
+        var headerLen = 8
 
-        let version = data[base + 8]
-        var pos = base + 12
+        // 1. Walk top-level ISO BMFF boxes properly so we never false-match inside payload bytes.
+        var pos = data.startIndex
+        while pos + 8 <= data.endIndex {
+            guard let rawSize = u32(in: data, at: pos), let boxType = u32(in: data, at: pos + 4) else { break }
+            var bSize = UInt64(rawSize)
+            var hLen = 8
+            if rawSize == 1 {
+                guard pos + 16 <= data.endIndex, let large = u64(in: data, at: pos + 8) else { break }
+                bSize = large
+                hLen = 16
+            } else if rawSize == 0 {
+                bSize = UInt64(data.endIndex - pos)
+            }
+            guard bSize >= UInt64(hLen) else { break }
+            if boxType == sidxTag {
+                base = pos
+                boxSize64 = bSize
+                headerLen = hLen
+                break
+            }
+            if pos + Int(min(bSize, UInt64(Int.max - pos))) <= pos { break }
+            pos += Int(min(bSize, UInt64(data.endIndex - pos)))
+        }
 
+        // Fallback scan if caller provided an offset-misaligned buffer.
+        if base == nil, let found = data.range(of: Data([0x73, 0x69, 0x64, 0x78])), found.lowerBound - data.startIndex >= 4 {
+            let candidate = found.lowerBound - 4
+            if let rawSize = u32(in: data, at: candidate), rawSize >= 20 || rawSize == 1 {
+                base = candidate
+                headerLen = rawSize == 1 ? 16 : 8
+                boxSize64 = rawSize == 1 ? (u64(in: data, at: candidate + 8) ?? 0) : UInt64(rawSize)
+            }
+        }
+
+        guard let sidxBase = base, boxSize64 >= UInt64(headerLen + 12) else { return nil }
+        let sidxOffsetFromStart = sidxBase - data.startIndex
+        let boxEndFromStart = sidxOffsetFromStart + Int(min(boxSize64, UInt64(Int.max - sidxOffsetFromStart)))
+        let sidxEndOffset = min(data.endIndex, sidxBase + Int(min(boxSize64, UInt64(data.endIndex - sidxBase))))
+
+        var offset = sidxBase + headerLen
         func readU16() -> UInt16? {
-            guard pos + 2 <= data.count else { return nil }
-            defer { pos += 2 }
-            return (UInt16(data[pos]) << 8) | UInt16(data[pos + 1])
+            guard offset + 2 <= sidxEndOffset, let v = u16(in: data, at: offset) else { return nil }
+            offset += 2
+            return v
         }
         func readU32() -> UInt32? {
-            guard pos + 4 <= data.count else { return nil }
-            defer { pos += 4 }
-            return (UInt32(data[pos]) << 24) |
-                   (UInt32(data[pos + 1]) << 16) |
-                   (UInt32(data[pos + 2]) << 8) |
-                   UInt32(data[pos + 3])
+            guard offset + 4 <= sidxEndOffset, let v = u32(in: data, at: offset) else { return nil }
+            offset += 4
+            return v
         }
         func readU64() -> UInt64? {
-            guard let high = readU32(), let low = readU32() else { return nil }
-            return (UInt64(high) << 32) | UInt64(low)
+            guard offset + 8 <= sidxEndOffset, let v = u64(in: data, at: offset) else { return nil }
+            offset += 8
+            return v
         }
+
+        guard let versionAndFlags = readU32() else { return nil }
+        let version = UInt8((versionAndFlags >> 24) & 0xFF)
 
         _ = readU32() // reference_id
         guard let timescale = readU32(), timescale > 0 else { return nil }
+        let firstOffset: UInt64
         if version == 0 {
-            _ = readU32() // earliest_pts
-            _ = readU32() // first_offset
+            guard readU32() != nil, let fo = readU32() else { return nil }
+            firstOffset = UInt64(fo)
         } else {
-            _ = readU64() // earliest_pts
-            _ = readU64() // first_offset
+            guard readU64() != nil, let fo = readU64() else { return nil }
+            firstOffset = fo
         }
         _ = readU16() // reserved
         guard let count = readU16(), count > 0 else { return nil }
 
-        var currentOffset = indexEnd + 1
+        // Require complete table inside `data` so partial fetches never poison cache.
+        guard offset + Int(count) * 12 <= sidxEndOffset else { return nil }
+
+        let baseAfterSidx = boxEndFromStart > 0 ? (indexStart + boxEndFromStart) : (indexEnd + 1)
+        var currentOffset = baseAfterSidx + Int(min(firstOffset, UInt64(Int.max - baseAfterSidx)))
         var segments: [SIDXSegment] = []
         segments.reserveCapacity(Int(count))
 
         for _ in 0..<count {
-            guard let d1 = readU32(), let d2 = readU32(), let _ = readU32() else { break }
-            let size = Int(d1 & 0x7FFFFFFF)
+            guard let d1 = readU32(), let d2 = readU32(), readU32() != nil else { return nil }
+            // reference_type == 1 indicates a hierarchical sub-sidx reference, not a media segment.
+            guard (d1 & 0x8000_0000) == 0 else { return nil }
+            let size = Int(d1 & 0x7FFF_FFFF)
+            guard size > 0, d2 > 0 else { return nil }
             let dur = Double(d2) / Double(timescale)
             segments.append(SIDXSegment(duration: dur, size: size, offset: currentOffset))
             currentOffset += size
         }
         return segments.isEmpty ? nil : segments
+    }
+
+    private static func u16(in data: Data, at pos: Int) -> UInt16? {
+        guard pos >= data.startIndex, pos + 2 <= data.endIndex else { return nil }
+        return (UInt16(data[pos]) << 8) | UInt16(data[pos + 1])
+    }
+
+    private static func u32(in data: Data, at pos: Int) -> UInt32? {
+        guard pos >= data.startIndex, pos + 4 <= data.endIndex else { return nil }
+        return (UInt32(data[pos]) << 24)
+            | (UInt32(data[pos + 1]) << 16)
+            | (UInt32(data[pos + 2]) << 8)
+            | UInt32(data[pos + 3])
+    }
+
+    private static func u64(in data: Data, at pos: Int) -> UInt64? {
+        guard let hi = u32(in: data, at: pos), let lo = u32(in: data, at: pos + 4) else { return nil }
+        return (UInt64(hi) << 32) | UInt64(lo)
     }
 }
 
@@ -243,16 +863,25 @@ enum SIDXParser {
 enum HLSBuilder {
     private static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 6
+        cfg.timeoutIntervalForRequest = 12
+        cfg.timeoutIntervalForResource = 30
+        cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg)
     }()
 
     private static let sidxLock = NSLock()
     private static var sidxCache: [String: [SIDXSegment]] = [:]
     private static var sidxKeys: [String] = []
+    private static var inFlightSidx: [String: Task<[SIDXSegment]?, Never>] = [:]
 
-    private static func getOrFetchSegments(id: String, trackType: String, url: URL, idx: (start: Int, end: Int)) async -> [SIDXSegment]? {
-        let key = "\(id)_\(trackType)"
+    private static func getOrFetchSegments(
+        id: String,
+        format: DirectFormat,
+        idx: (start: Int, end: Int)
+    ) async -> [SIDXSegment]? {
+        guard idx.end >= idx.start else { return nil }
+        let key = "\(id)_\(format.cacheIdentifier)_\(idx.start)-\(idx.end)"
+
         sidxLock.lock()
         if let cached = sidxCache[key] {
             if let pos = sidxKeys.firstIndex(of: key) {
@@ -262,35 +891,51 @@ enum HLSBuilder {
             sidxLock.unlock()
             return cached
         }
-        sidxLock.unlock()
-
-        guard let bytes = await fetchRange(url, start: idx.start, end: idx.end),
-              let segs = SIDXParser.parse(data: bytes, indexEnd: idx.end) else {
-            return nil
+        if let existingTask = inFlightSidx[key] {
+            sidxLock.unlock()
+            return await existingTask.value
         }
 
-        sidxLock.lock()
-        while sidxKeys.count >= 50 {
-            let oldKey = sidxKeys.removeFirst()
-            sidxCache.removeValue(forKey: oldKey)
+        let fetchTask = Task<[SIDXSegment]?, Never> {
+            defer {
+                sidxLock.lock()
+                inFlightSidx.removeValue(forKey: key)
+                sidxLock.unlock()
+            }
+            guard let bytes = await fetchRange(format.url, start: idx.start, end: idx.end, userAgent: format.effectiveUserAgent),
+                  let segs = SIDXParser.parse(data: bytes, indexStart: idx.start, indexEnd: idx.end) else {
+                return nil
+            }
+            sidxLock.lock()
+            if sidxCache[key] == nil {
+                while sidxKeys.count >= 120 {
+                    let oldKey = sidxKeys.removeFirst()
+                    sidxCache.removeValue(forKey: oldKey)
+                }
+                sidxKeys.append(key)
+            } else if let pos = sidxKeys.firstIndex(of: key) {
+                sidxKeys.remove(at: pos)
+                sidxKeys.append(key)
+            }
+            sidxCache[key] = segs
+            sidxLock.unlock()
+            return segs
         }
-        sidxKeys.append(key)
-        sidxCache[key] = segs
+        inFlightSidx[key] = fetchTask
         sidxLock.unlock()
-        return segs
+        return await fetchTask.value
     }
 
-    /// Builds an audio-only HLS Playlist for YouTube DASH audio.
-    /// YouTube returns HTTP 403 Forbidden for progressive requests on DASH formats;
-    /// serving via HLS with explicit byte ranges ensures AVPlayer only sends Range requests (HTTP 206).
+    /// Builds an audio-only HLS Playlist for YouTube DASH audio via the local byte-range proxy.
     static func buildAudio(id: String, audio: DirectFormat, startTimeSecs: Int? = nil) async -> URL? {
         guard let aInit = audio.initRange, let aIdx = audio.indexRange else { return nil }
-        guard let aSegs = await getOrFetchSegments(id: id, trackType: "a", url: audio.url, idx: aIdx) else {
+        guard let aSegs = await getOrFetchSegments(id: id, format: audio, idx: aIdx),
+              let proxyURL = await HLSServer.shared.registerProxy(url: audio.url, userAgent: audio.effectiveUserAgent, totalSize: audio.size) else {
             return nil
         }
 
-        let aPlaylist = makeMediaPlaylist(url: audio.url, initRange: aInit, segments: aSegs, startSec: startTimeSecs.map(Double.init))
-        let tag = "\(id)_\(Int(Date().timeIntervalSince1970 * 1000))".replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
+        let aPlaylist = makeMediaPlaylist(proxyURL: proxyURL, initRange: aInit, segments: aSegs, startSec: startTimeSecs.map(Double.init))
+        let tag = HLSServer.shared.nextTag(prefix: id)
         let aPath = "/hls/\(tag)/audio.m3u8"
 
         guard let aData = aPlaylist.data(using: .utf8) else { return nil }
@@ -298,173 +943,155 @@ enum HLSBuilder {
     }
 
     /// Builds a compliant Apple HLS Master Playlist for separate YouTube DASH video and audio tracks,
-    /// supporting seamless Adaptive Bitrate (ABR) switching between multiple resolutions (e.g. 1080p, 720p, 480p).
-    static func buildMaster(id: String, video: DirectFormat, audio: DirectFormat, variants: [DirectFormat] = [], startTimeSecs: Int? = nil) async -> URL? {
-        guard let aInit = audio.initRange, let aIdx = audio.indexRange else {
-            return nil
-        }
+    /// enforcing codec uniformity across ABR variants and routing all ranges through `HLSServer` proxy.
+    static func buildMaster(
+        id: String,
+        video: DirectFormat,
+        audio: DirectFormat,
+        variants: [DirectFormat] = [],
+        startTimeSecs: Int? = nil
+    ) async -> URL? {
+        guard let aInit = audio.initRange, let aIdx = audio.indexRange else { return nil }
 
-        // Prepare and deduplicate video variants (e.g. 1080p, 720p, 480p, 360p)
-        var allVariants = variants
-        if !allVariants.contains(where: { $0.url == video.url }) {
-            allVariants.append(video)
-        }
+        // Enforce single codec family in master playlist so ABR transitions never crash hardware decoders.
+        let primaryFamily = codecFamily(from: video.mime)
         var validVariants: [DirectFormat] = []
-        var seenHeights = Set<Int>()
-        // Sort descending by resolution & bitrate so higher qualities are indexed first
-        allVariants.sort { ($0.height ?? 0, $0.bitrate) > ($1.height ?? 0, $1.bitrate) }
-        for v in allVariants {
-            guard let h = v.height, h > 0, v.initRange != nil, v.indexRange != nil else { continue }
-            if seenHeights.insert(h).inserted {
-                validVariants.append(v)
+        var seenEdges = Set<Int>()
+        for variant in [video] + variants where variant.initRange != nil && variant.indexRange != nil {
+            if let pf = primaryFamily, let vf = codecFamily(from: variant.mime), pf != vf { continue }
+            let key = variant.shortEdge > 0 ? variant.shortEdge : (variant.height ?? variant.bitrate)
+            if seenEdges.insert(key).inserted {
+                validVariants.append(variant)
             }
         }
-        if validVariants.isEmpty {
-            guard video.initRange != nil, video.indexRange != nil else { return nil }
-            validVariants = [video]
-        }
+        guard !validVariants.isEmpty else { return nil }
 
-        let tag = "\(id)_\(Int(Date().timeIntervalSince1970 * 1000))".replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
-        let startD = startTimeSecs.map(Double.init)
+        async let aSegsTask = getOrFetchSegments(id: id, format: audio, idx: aIdx)
+        var fetchedVariants: [(format: DirectFormat, fileName: String, segments: [SIDXSegment])] = []
 
-        // Fetch audio and all video variant segments concurrently in parallel
-        async let aSegsRes = getOrFetchSegments(id: id, trackType: "a", url: audio.url, idx: aIdx)
-
-        var variantPlaylists: [(format: DirectFormat, fileName: String, path: String, playlist: String)] = []
-        await withTaskGroup(of: (DirectFormat, String, String, [SIDXSegment]?)?.self) { group in
-            for v in validVariants {
+        await withTaskGroup(of: (DirectFormat, String, [SIDXSegment]?)?.self) { group in
+            for (idxNum, v) in validVariants.enumerated() {
                 guard let vIdx = v.indexRange else { continue }
-                let h = v.height ?? 720
-                let fileName = "video_\(h).m3u8"
-                let vPath = "/hls/\(tag)/\(fileName)"
-                let vKey = "v_\(h)"
+                let edge = v.shortEdge > 0 ? v.shortEdge : (v.height ?? 720)
+                let fileName = "video_\(edge)_\(idxNum).m3u8"
                 group.addTask {
-                    let segs = await getOrFetchSegments(id: id, trackType: vKey, url: v.url, idx: vIdx)
-                    return (v, fileName, vPath, segs)
+                    guard let segs = await getOrFetchSegments(id: id, format: v, idx: vIdx) else { return nil }
+                    return (v, fileName, segs)
                 }
             }
-            for await result in group {
-                guard let (v, fileName, vPath, segs) = result, let segs, let vInit = v.initRange else { continue }
-                let vPlaylist = makeMediaPlaylist(url: v.url, initRange: vInit, segments: segs, startSec: startD)
-                variantPlaylists.append((v, fileName, vPath, vPlaylist))
+            for await res in group {
+                if let (v, fileName, segs) = res, let segs {
+                    fetchedVariants.append((v, fileName, segs))
+                }
             }
         }
 
-        guard let aSegs = await aSegsRes, !variantPlaylists.isEmpty else {
+        guard let aSegs = await aSegsTask, !fetchedVariants.isEmpty else { return nil }
+
+        guard let aProxy = await HLSServer.shared.registerProxy(url: audio.url, userAgent: audio.effectiveUserAgent, totalSize: audio.size) else {
             return nil
         }
 
-        let aPlaylist = makeMediaPlaylist(url: audio.url, initRange: aInit, segments: aSegs, startSec: startD)
+        let tag = HLSServer.shared.nextTag(prefix: id)
         let aPath = "/hls/\(tag)/audio.m3u8"
         let mPath = "/hls/\(tag)/master.m3u8"
 
-        guard let aData = aPlaylist.data(using: .utf8) else { return nil }
-        _ = await HLSServer.shared.register(path: aPath, contentType: "application/vnd.apple.mpegurl", data: aData)
-
-        // Register each video variant playlist
-        for item in variantPlaylists {
-            if let vData = item.playlist.data(using: .utf8) {
-                _ = await HLSServer.shared.register(path: item.path, contentType: "application/vnd.apple.mpegurl", data: vData)
-            }
+        let aPlaylist = makeMediaPlaylist(proxyURL: aProxy, initRange: aInit, segments: aSegs, startSec: startTimeSecs.map(Double.init))
+        guard let aData = aPlaylist.data(using: .utf8),
+              await HLSServer.shared.register(path: aPath, contentType: "application/vnd.apple.mpegurl", data: aData) != nil else {
+            return nil
         }
 
-        // Sort variants descending by height & bitrate for Apple HLS compliance
-        let sortedVariants = variantPlaylists.sorted { ($0.format.height ?? 0, $0.format.bitrate) > ($1.format.height ?? 0, $1.format.bitrate) }
-        let aCodec = extractCodec(from: audio.mime) ?? "mp4a.40.2"
+        // Order highest quality first so AVPlayer starts quickly on target quality while keeping ABR ladder intact.
+        let sortedVariants = fetchedVariants.sorted {
+            ($0.format.shortEdge, $0.format.fps ?? 30, $0.format.bitrate)
+                > ($1.format.shortEdge, $1.format.fps ?? 30, $1.format.bitrate)
+        }
 
+        let aCodec = extractCodec(from: audio.mime) ?? "mp4a.40.2"
         var master = "#EXTM3U\n"
         master += "#EXT-X-VERSION:7\n"
-        master += "#EXT-X-INDEPENDENT-SEGMENTS\n"
-        if let s = startTimeSecs, s > 0 {
-            master += String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", Double(s))
-        }
-        master += "\n"
+        master += "#EXT-X-INDEPENDENT-SEGMENTS\n\n"
         master += "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n\n"
 
+        var registeredCount = 0
         for item in sortedVariants {
             let v = item.format
-            let vCodec = extractCodec(from: v.mime) ?? "avc1.4d401f"
-            let width = v.width ?? (v.height.map { $0 * 16 / 9 } ?? 1280)
-            let height = v.height ?? 720
-            let bandwidth = max(v.bitrate + audio.bitrate, 400_000)
+            guard let vInit = v.initRange,
+                  let vProxy = await HLSServer.shared.registerProxy(url: v.url, userAgent: v.effectiveUserAgent, totalSize: v.size) else {
+                continue
+            }
+            let vPlaylist = makeMediaPlaylist(proxyURL: vProxy, initRange: vInit, segments: item.segments, startSec: startTimeSecs.map(Double.init))
+            let vPath = "/hls/\(tag)/\(item.fileName)"
+            guard let vData = vPlaylist.data(using: .utf8),
+                  await HLSServer.shared.register(path: vPath, contentType: "application/vnd.apple.mpegurl", data: vData) != nil else {
+                continue
+            }
 
-            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),CODECS=\"\(vCodec),\(aCodec)\",AUDIO=\"audio\"\n"
-            master += "\(item.fileName)\n\n"
+            let vCodec = extractCodec(from: v.mime) ?? "avc1.4d401f"
+            let height = v.height ?? 720
+            let width = v.width ?? (height * 16 / 9)
+            let bandwidth = max(v.bitrate + audio.bitrate, 150_000)
+            let fpsPart = (v.fps ?? 0) > 0 ? ",FRAME-RATE=\(v.fps!)" : ""
+
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\(fpsPart),CODECS=\"\(vCodec),\(aCodec)\",AUDIO=\"audio\"\n"
+            master += "\(item.fileName)\n"
+            registeredCount += 1
         }
 
-        guard let mData = master.data(using: .utf8) else { return nil }
+        guard registeredCount > 0, let mData = master.data(using: .utf8) else { return nil }
         return await HLSServer.shared.register(path: mPath, contentType: "application/vnd.apple.mpegurl", data: mData)
     }
 
-    private static func fetchLiveSequence(url: URL) async -> Int {
+    private static func fetchLiveInfo(url: URL, userAgent: String) async -> (seq: Int, segDur: Double)? {
         var req = URLRequest(url: url)
         req.httpMethod = "HEAD"
-        req.setValue(YTClient.ios.userAgent, forHTTPHeaderField: "User-Agent")
-        if let resp = try? await session.data(for: req).1 as? HTTPURLResponse,
-           let seqStr = resp.value(forHTTPHeaderField: "X-Sequence-Num") ?? resp.value(forHTTPHeaderField: "X-Head-Seqnum"),
-           let seq = Int(seqStr), seq > 0 {
-            return seq
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        guard let (_, response) = try? await session.data(for: req),
+              let resp = response as? HTTPURLResponse,
+              (200..<300).contains(resp.statusCode) else {
+            return nil
         }
-        return max(10, Int(Date().timeIntervalSince1970) % 50000)
+        guard let seqStr = resp.value(forHTTPHeaderField: "X-Head-Seqnum") ?? resp.value(forHTTPHeaderField: "X-Sequence-Num"),
+              let seq = Int(seqStr), seq > 0 else {
+            return nil
+        }
+        let targetDur = resp.value(forHTTPHeaderField: "X-Target-Duration").flatMap(Double.init)
+            ?? resp.value(forHTTPHeaderField: "X-Segment-Duration").flatMap(Double.init)
+            ?? 2.0
+        return (seq, max(targetDur, 1.0))
     }
 
-    /// Builds a compliant Apple Live HLS Master Playlist for YouTube live broadcasts.
+    /// Builds a compliant Apple Live HLS Master Playlist for YouTube live broadcasts when official HLS is unavailable.
     static func buildLiveMaster(id: String, video: DirectFormat, audio: DirectFormat) async -> URL? {
-        let baseSeq = await fetchLiveSequence(url: video.url)
+        guard let vLive = await fetchLiveInfo(url: video.url, userAgent: video.effectiveUserAgent) else { return nil }
+        let aLive = await fetchLiveInfo(url: audio.url, userAgent: audio.effectiveUserAgent) ?? vLive
         let startTime = Date()
 
-        let tag = "live_\(id)_\(Int(Date().timeIntervalSince1970 * 1000))"
+        guard let vProxy = await HLSServer.shared.registerProxy(url: video.url, userAgent: video.effectiveUserAgent),
+              let aProxy = await HLSServer.shared.registerProxy(url: audio.url, userAgent: audio.effectiveUserAgent) else {
+            return nil
+        }
+
+        let tag = HLSServer.shared.nextTag(prefix: "live_\(id)")
         let vPath = "/hls/\(tag)/video.m3u8"
         let aPath = "/hls/\(tag)/audio.m3u8"
         let mPath = "/hls/\(tag)/master.m3u8"
 
-        let vUrlStr = video.url.absoluteString
-        let aUrlStr = audio.url.absoluteString
+        let vBase = vProxy.absoluteString
+        let aBase = aProxy.absoluteString
 
         _ = await HLSServer.shared.registerDynamic(path: vPath) {
-            let elapsed = Int(Date().timeIntervalSince(startTime))
-            let currentSeq = baseSeq + elapsed
-            let windowStart = max(0, currentSeq - 5)
-            var lines: [String] = []
-            lines.append("#EXTM3U")
-            lines.append("#EXT-X-VERSION:7")
-            lines.append("#EXT-X-TARGETDURATION:2")
-            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
-            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            let vSep = vUrlStr.contains("?") ? "&" : "?"
-            lines.append("#EXT-X-MAP:URI=\"\(vUrlStr)\(vSep)sq=0\"")
-            for s in windowStart...currentSeq {
-                lines.append("#EXTINF:1.000,")
-                lines.append("\(vUrlStr)\(vSep)sq=\(s)")
-            }
-            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
-            return ("application/vnd.apple.mpegurl", data)
+            makeLiveMediaPlaylist(baseURL: vBase, baseSeq: vLive.seq, segDur: vLive.segDur, startTime: startTime)
         }
-
         _ = await HLSServer.shared.registerDynamic(path: aPath) {
-            let elapsed = Int(Date().timeIntervalSince(startTime))
-            let currentSeq = baseSeq + elapsed
-            let windowStart = max(0, currentSeq - 5)
-            var lines: [String] = []
-            lines.append("#EXTM3U")
-            lines.append("#EXT-X-VERSION:7")
-            lines.append("#EXT-X-TARGETDURATION:2")
-            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
-            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            let aSep = aUrlStr.contains("?") ? "&" : "?"
-            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)\(aSep)sq=0\"")
-            for s in windowStart...currentSeq {
-                lines.append("#EXTINF:1.000,")
-                lines.append("\(aUrlStr)\(aSep)sq=\(s)")
-            }
-            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
-            return ("application/vnd.apple.mpegurl", data)
+            makeLiveMediaPlaylist(baseURL: aBase, baseSeq: aLive.seq, segDur: aLive.segDur, startTime: startTime)
         }
 
         let vCodec = extractCodec(from: video.mime) ?? "avc1.4d401f"
         let aCodec = extractCodec(from: audio.mime) ?? "mp4a.40.2"
-        let width = video.width ?? (video.height.map { $0 * 16 / 9 } ?? 1280)
         let height = video.height ?? 720
+        let width = video.width ?? (height * 16 / 9)
         let bandwidth = max(video.bitrate + audio.bitrate, 800_000)
 
         var master = "#EXTM3U\n"
@@ -480,46 +1107,77 @@ enum HLSBuilder {
 
     /// Builds a compliant Apple Live HLS Audio Playlist for YouTube live broadcasts.
     static func buildLiveAudio(id: String, audio: DirectFormat) async -> URL? {
-        let baseSeq = await fetchLiveSequence(url: audio.url)
+        guard let aLive = await fetchLiveInfo(url: audio.url, userAgent: audio.effectiveUserAgent),
+              let aProxy = await HLSServer.shared.registerProxy(url: audio.url, userAgent: audio.effectiveUserAgent) else {
+            return nil
+        }
         let startTime = Date()
-
-        let tag = "live_\(id)_\(Int(Date().timeIntervalSince1970 * 1000))"
+        let tag = HLSServer.shared.nextTag(prefix: "live_\(id)")
         let aPath = "/hls/\(tag)/audio.m3u8"
-        let aUrlStr = audio.url.absoluteString
+        let aBase = aProxy.absoluteString
 
         return await HLSServer.shared.registerDynamic(path: aPath) {
-            let elapsed = Int(Date().timeIntervalSince(startTime))
-            let currentSeq = baseSeq + elapsed
-            let windowStart = max(0, currentSeq - 5)
-            var lines: [String] = []
-            lines.append("#EXTM3U")
-            lines.append("#EXT-X-VERSION:7")
-            lines.append("#EXT-X-TARGETDURATION:2")
-            lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
-            lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-            let aSep = aUrlStr.contains("?") ? "&" : "?"
-            lines.append("#EXT-X-MAP:URI=\"\(aUrlStr)\(aSep)sq=0\"")
-            for s in windowStart...currentSeq {
-                lines.append("#EXTINF:1.000,")
-                lines.append("\(aUrlStr)\(aSep)sq=\(s)")
-            }
-            let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
-            return ("application/vnd.apple.mpegurl", data)
+            makeLiveMediaPlaylist(baseURL: aBase, baseSeq: aLive.seq, segDur: aLive.segDur, startTime: startTime)
         }
     }
 
-    private static func fetchRange(_ url: URL, start: Int, end: Int) async -> Data? {
-        var req = URLRequest(url: url)
-        req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
-        req.setValue(YTClient.ios.userAgent, forHTTPHeaderField: "User-Agent")
-        return try? await session.data(for: req).0
+    private static func makeLiveMediaPlaylist(baseURL: String, baseSeq: Int, segDur: Double, startTime: Date) -> (String, Data) {
+        let elapsed = Date().timeIntervalSince(startTime)
+        let currentSeq = baseSeq + max(0, Int(elapsed / segDur))
+        let windowStart = max(0, currentSeq - 5)
+        let targetDur = max(1, Int(ceil(segDur)))
+        let sep = baseURL.contains("?") ? "&" : "?"
+
+        var lines: [String] = []
+        lines.append("#EXTM3U")
+        lines.append("#EXT-X-VERSION:7")
+        lines.append("#EXT-X-TARGETDURATION:\(targetDur)")
+        lines.append("#EXT-X-MEDIA-SEQUENCE:\(windowStart)")
+        lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+        for s in windowStart...currentSeq {
+            lines.append(String(format: "#EXTINF:%.3f,", segDur))
+            lines.append("\(baseURL)\(sep)sq=\(s)")
+        }
+        let data = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
+        return ("application/vnd.apple.mpegurl", data)
     }
 
-    private static func makeMediaPlaylist(url: URL, initRange: (start: Int, end: Int), segments: [SIDXSegment], startSec: Double? = nil) -> String {
-        let initLen = initRange.end - initRange.start + 1
+    private static func fetchRange(_ url: URL, start: Int, end: Int, userAgent: String) async -> Data? {
+        guard end >= start else { return nil }
+        let expected = end - start + 1
+        for attempt in 0..<2 {
+            if Task.isCancelled { return nil }
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 200_000_000) }
+            var req = URLRequest(url: url)
+            req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            guard let (data, response) = try? await session.data(for: req),
+                  let http = response as? HTTPURLResponse else { continue }
+            if http.statusCode == 206 {
+                guard data.count >= expected else { continue }
+                return data
+            } else if http.statusCode == 200, data.count > end {
+                let lo = data.index(data.startIndex, offsetBy: start)
+                let hi = data.index(data.startIndex, offsetBy: end)
+                return Data(data[lo...hi])
+            } else if http.statusCode == 403 || http.statusCode == 404 || http.statusCode == 410 {
+                return nil
+            }
+        }
+        return nil
+    }
+
+    private static func makeMediaPlaylist(
+        proxyURL: URL,
+        initRange: (start: Int, end: Int),
+        segments: [SIDXSegment],
+        startSec: Double? = nil
+    ) -> String {
+        let initLen = max(1, initRange.end - initRange.start + 1)
         let maxDur = segments.map(\.duration).max() ?? 10
-        let targetDur = Int(ceil(maxDur))
-        let urlStr = url.absoluteString
+        let targetDur = max(1, Int(ceil(maxDur)))
+        let totalDur = segments.reduce(0.0) { $0 + $1.duration }
+        let urlStr = proxyURL.absoluteString
 
         var lines: [String] = []
         lines.reserveCapacity(segments.count * 3 + 10)
@@ -529,13 +1187,13 @@ enum HLSBuilder {
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
-        if let s = startSec, s > 0 {
+        if let s = startSec, s > 0.5, totalDur > 2, s < totalDur - 1 {
             lines.append(String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES", s))
         }
         lines.append("#EXT-X-MAP:URI=\"\(urlStr)\",BYTERANGE=\"\(initLen)@\(initRange.start)\"")
 
         for s in segments {
-            lines.append(String(format: "#EXTINF:%.3f,", s.duration))
+            lines.append(String(format: "#EXTINF:%.6f,", s.duration))
             lines.append("#EXT-X-BYTERANGE:\(s.size)@\(s.offset)")
             lines.append(urlStr)
         }
@@ -544,9 +1202,23 @@ enum HLSBuilder {
     }
 
     private static func extractCodec(from mime: String) -> String? {
-        guard let r = mime.range(of: "codecs=\"") else { return nil }
-        let sub = mime[r.upperBound...]
-        guard let end = sub.firstIndex(of: "\"") else { return nil }
-        return String(sub[..<end])
+        if let r = mime.range(of: "codecs=\"") {
+            let sub = mime[r.upperBound...]
+            if let end = sub.firstIndex(of: "\"") { return String(sub[..<end]) }
+        }
+        if let r = mime.range(of: "codecs=") {
+            let sub = mime[r.upperBound...].trimmingCharacters(in: .whitespaces)
+            return String(sub.prefix { $0 != ";" && $0 != " " && $0 != "\"" })
+        }
+        return nil
+    }
+
+    private static func codecFamily(from mime: String) -> String? {
+        guard let c = extractCodec(from: mime)?.lowercased() else { return nil }
+        if c.hasPrefix("avc1") { return "avc1" }
+        if c.hasPrefix("av01") { return "av01" }
+        if c.hasPrefix("hvc1") || c.hasPrefix("hev1") { return "hevc" }
+        if c.hasPrefix("vp09") || c.hasPrefix("vp9") { return "vp09" }
+        return String(c.prefix(4))
     }
 }

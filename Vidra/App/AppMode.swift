@@ -45,13 +45,13 @@ final class AppModeManager: ObservableObject {
     }
 
     func toggle() {
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-            currentMode = (currentMode == .youtube) ? .spotify : .youtube
-        }
+        switchTo((currentMode == .youtube) ? .spotify : .youtube)
     }
 
     func switchTo(_ mode: AppMode) {
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+        guard currentMode != mode else { return }
+        PlayerManager.shared.showWatch = false
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
             currentMode = mode
         }
     }

@@ -37,6 +37,9 @@ targets:
           - spotify
         # Required for playback with the screen off / app in background.
         UIBackgroundModes: [audio]
+        # Allow AVPlayer HTTP loopback connections to HLSServer on 127.0.0.1
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -6,7 +6,11 @@ import Foundation
 actor TrackMatcher {
     static let shared = TrackMatcher()
     private static let key = "trackMatches"
+    private static let customKey = "trackMatchesCustom"
     private var cache = UserDefaults.standard.dictionary(forKey: TrackMatcher.key) as? [String: String] ?? [:]
+    private var customIds = Set(UserDefaults.standard.stringArray(forKey: TrackMatcher.customKey) ?? [])
+    private var cacheOrder: [String] = []
+    private var inFlight: [String: Task<String, Error>] = [:]
     private var saveTask: Task<Void, Never>?
 
     func currentMatch(for videoId: String) -> String? {
@@ -15,31 +19,61 @@ actor TrackMatcher {
 
     func setCustomMatch(for spotifyId: String, youtubeId: String) {
         cache[spotifyId] = youtubeId
+        customIds.insert(spotifyId)
         persist()
     }
 
     func youTubeId(for v: Video) async throws -> String {
         if let id = cache[v.id] { return id }
-        let artist = v.channelTitle.components(separatedBy: ",").first ?? v.channelTitle
-        let results = try await InnerTube.shared.musicSearch("\(v.title) \(artist)", continuation: nil).videos.prefix(5)
-        guard let first = results.first else {
-            throw YTError.unplayable("Không tìm thấy nguồn phát cho bài hát này")
+        if let existing = inFlight[v.id] {
+            return try await existing.value
         }
-        // Same song often has several uploads; the closest duration is usually the original.
-        var best = first
-        if let target = Fmt.seconds(v.duration) {
-            best = results.min { abs((Fmt.seconds($0.duration) ?? 1e9) - target) < abs((Fmt.seconds($1.duration) ?? 1e9) - target) } ?? first
+        let task = Task<String, Error> {
+            let artist = v.channelTitle.components(separatedBy: ",").first ?? v.channelTitle
+            let results = try await InnerTube.shared.musicSearch("\(v.title) \(artist)", continuation: nil).videos.prefix(5)
+            guard let first = results.first else {
+                throw YTError.unplayable("Không tìm thấy nguồn phát cho bài hát này")
+            }
+            var best = first
+            if let target = Fmt.seconds(v.duration), target > 0 {
+                let scored = results.min {
+                    abs((Fmt.seconds($0.duration) ?? 1e9) - target) < abs((Fmt.seconds($1.duration) ?? 1e9) - target)
+                }
+                if let scored, let sDur = Fmt.seconds(scored.duration), abs(sDur - target) <= 60 {
+                    best = scored
+                }
+            }
+            return best.id
         }
-        if cache.count > 5000 { cache.removeAll() }
-        cache[v.id] = best.id
+        inFlight[v.id] = task
+        defer { inFlight.removeValue(forKey: v.id) }
+
+        let matchedId = try await task.value
+        if cache.count > 5000 {
+            let customOnly = cache.filter { customIds.contains($0.key) }
+            let recentKeys = cacheOrder.suffix(2000)
+            var nextCache = customOnly
+            for k in recentKeys {
+                if let val = cache[k] { nextCache[k] = val }
+            }
+            cache = nextCache
+            cacheOrder = Array(recentKeys)
+        }
+        cache[v.id] = matchedId
+        cacheOrder.append(v.id)
         schedulePersist()
-        return best.id
+        return matchedId
+    }
+
+    func flush() {
+        persist()
     }
 
     private func persist() {
         saveTask?.cancel()
         saveTask = nil
         UserDefaults.standard.set(cache, forKey: Self.key)
+        UserDefaults.standard.set(Array(customIds), forKey: Self.customKey)
     }
 
     private func schedulePersist() {
@@ -48,6 +82,7 @@ actor TrackMatcher {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard !Task.isCancelled else { return }
             UserDefaults.standard.set(self.cache, forKey: Self.key)
+            UserDefaults.standard.set(Array(self.customIds), forKey: Self.customKey)
             self.saveTask = nil
         }
     }
@@ -66,9 +101,10 @@ enum Spotify {
 
     static func parseLink(_ text: String) -> (kind: String, id: String)? {
         guard let c = URLComponents(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              c.host?.contains("spotify.com") == true else { return nil }
+              let host = c.host?.lowercased(),
+              host == "open.spotify.com" || host == "play.spotify.com" else { return nil }
         let path = c.path.split(separator: "/").map(String.init).filter { !$0.hasPrefix("intl-") && $0 != "embed" }
-        guard path.count >= 2, ["playlist", "album", "track"].contains(path[0]) else { return nil }
+        guard path.count >= 2, ["playlist", "album", "track"].contains(path[0]), !path[1].isEmpty else { return nil }
         return (path[0], path[1])
     }
 
@@ -80,7 +116,10 @@ enum Spotify {
         let kind = parsed.kind
         var req = URLRequest(url: url)
         req.setValue(YTClient.web.userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw YTError.http(http.statusCode)
+        }
         let html = String(decoding: data, as: UTF8.self)
 
         guard let re = try? NSRegularExpression(pattern: #"<script id="__NEXT_DATA__"[^>]*>(.*?)</script>"#,
@@ -103,12 +142,13 @@ enum Spotify {
         return (name, tracks)
     }
 
-    static func matchAll(_ tracks: [Track], progress: @escaping (Int) -> Void) async -> [Video?] {
+    static func matchAll(_ tracks: [Track], progress: @escaping @Sendable (Int) -> Void) async -> [Video?] {
         await withTaskGroup(of: (Int, Video?).self) { group -> [Video?] in
             var results = [Video?](repeating: nil, count: tracks.count)
             var nextIndex = 0
             var done = 0
             for _ in 0..<min(4, tracks.count) {
+                if Task.isCancelled { break }
                 let i = nextIndex
                 nextIndex += 1
                 group.addTask { (i, await match(tracks[i])) }
@@ -117,7 +157,7 @@ enum Spotify {
                 results[i] = video
                 done += 1
                 progress(done)
-                if nextIndex < tracks.count {
+                if !Task.isCancelled, nextIndex < tracks.count {
                     let k = nextIndex
                     nextIndex += 1
                     group.addTask { (k, await match(tracks[k])) }
@@ -146,27 +186,51 @@ final class SpotifyImporter: ObservableObject {
     @Published private(set) var total = 0
     @Published private(set) var result: Result?
     @Published var error: String?
+    private var importTask: Task<Void, Never>?
+
+    func cancel() {
+        importTask?.cancel()
+        importTask = nil
+        running = false
+    }
 
     func run(_ link: String) {
         guard !running else { return }
         running = true
         error = nil
         result = nil
-        Task {
+        importTask?.cancel()
+        importTask = Task {
             do {
                 let (name, tracks) = try await Spotify.fetch(link)
+                guard !Task.isCancelled else {
+                    running = false
+                    return
+                }
                 total = tracks.count
                 done = 0
                 let matched = await Spotify.matchAll(tracks) { d in
                     Task { @MainActor in self.done = d }
                 }
+                guard !Task.isCancelled else {
+                    running = false
+                    return
+                }
+                let playable = matched.compactMap { $0 }
+                guard !playable.isEmpty else {
+                    error = "Không tìm thấy bài hát phù hợp trên YouTube Music"
+                    running = false
+                    return
+                }
                 let lib = Library.shared
                 let id = lib.createPlaylist("Spotify: \(name)")
-                matched.compactMap { $0 }.forEach { lib.add($0, to: id) }
+                playable.forEach { lib.add($0, to: id) }
                 let missed = zip(tracks, matched).filter { $0.1 == nil }.map { $0.0.label }
-                result = Result(name: name, playlist: id, matched: tracks.count - missed.count, missed: missed)
+                result = Result(name: name, playlist: id, matched: playable.count, missed: missed)
             } catch {
-                self.error = error.localizedDescription
+                if !(error is CancellationError) {
+                    self.error = error.localizedDescription
+                }
             }
             running = false
         }

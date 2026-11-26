@@ -32,24 +32,42 @@ final class DownloadManager: ObservableObject {
         return d
     }()
     private nonisolated static var indexURL: URL { dir.appendingPathComponent("index.json") }
+    private nonisolated static let indexQueue = DispatchQueue(label: "vidra.downloads.index", qos: .utility)
 
     @Published private(set) var items: [DownloadItem] = []
     @Published private(set) var active: [String: ActiveDownload] = [:]
     @Published var lastError: String?
     private var tasks: [String: Task<Void, Never>] = [:]
+    private var pendingQueue: [(video: Video, audioOnly: Bool)] = []
+    private let maxConcurrentDownloads = 2
+
+    private nonisolated static func safeBaseName(for id: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let mapped = id.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let out = String(mapped)
+        return out.isEmpty ? UUID().uuidString : out
+    }
 
     private init() {
-        guard let data = try? Data(contentsOf: Self.indexURL),
-              let saved = try? JSONDecoder().decode([DownloadItem].self, from: data) else { return }
-        items = saved.filter { FileManager.default.fileExists(atPath: Self.dir.appendingPathComponent($0.file).path) }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: Self.indexURL.path),
+              let data = try? Data(contentsOf: Self.indexURL) else { return }
+        guard let saved = try? JSONDecoder().decode([DownloadItem].self, from: data) else {
+            let backup = Self.dir.appendingPathComponent("index.corrupt-\(Int(Date().timeIntervalSince1970)).json")
+            try? fm.moveItem(at: Self.indexURL, to: backup)
+            return
+        }
+        items = saved.filter { fm.fileExists(atPath: Self.dir.appendingPathComponent($0.file).path) }
     }
 
     func localFile(for id: String) -> URL? {
-        items.first { $0.id == id }.map { Self.dir.appendingPathComponent($0.file) }
+        guard let entry = items.first(where: { $0.id == id }) else { return nil }
+        let url = Self.dir.appendingPathComponent(entry.file)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
     func localArtwork(for id: String) -> URL? {
-        let base = id.replacingOccurrences(of: ":", with: "_")
+        let base = Self.safeBaseName(for: id)
         let thumbURL = Self.dir.appendingPathComponent("\(base).thumb.jpg")
         if FileManager.default.fileExists(atPath: thumbURL.path) {
             return thumbURL
@@ -57,7 +75,7 @@ final class DownloadManager: ObservableObject {
         return nil
     }
 
-    func isDownloaded(_ id: String) -> Bool { items.contains { $0.id == id } }
+    func isDownloaded(_ id: String) -> Bool { localFile(for: id) != nil }
 
     func isDownloading(_ id: String) -> Bool {
         guard let a = active[id] else { return false }
@@ -69,6 +87,7 @@ final class DownloadManager: ObservableObject {
     }
 
     func start(_ video: Video, audioOnly: Bool) {
+        if isDownloaded(video.id) { return }
         if let existing = active[video.id] {
             if existing.isPaused {
                 resume(video.id)
@@ -76,47 +95,98 @@ final class DownloadManager: ObservableObject {
             return
         }
         active[video.id] = ActiveDownload(video: video, progress: 0, isPaused: false, audioOnly: audioOnly)
-        startTask(for: video, audioOnly: audioOnly)
+        enqueueOrStart(video: video, audioOnly: audioOnly)
     }
 
     func pause(_ id: String) {
         guard active[id] != nil else { return }
         active[id]?.isPaused = true
+        pendingQueue.removeAll { $0.video.id == id }
         tasks[id]?.cancel()
         tasks[id] = nil
+        pumpPendingQueue()
     }
 
     func resume(_ id: String) {
         guard let currentActive = active[id], currentActive.isPaused else { return }
         active[id]?.isPaused = false
-        startTask(for: currentActive.video, audioOnly: currentActive.audioOnly)
+        enqueueOrStart(video: currentActive.video, audioOnly: currentActive.audioOnly)
     }
 
     func cancel(_ id: String) {
+        pendingQueue.removeAll { $0.video.id == id }
         tasks[id]?.cancel()
         tasks[id] = nil
         active[id] = nil
-        let base = id.replacingOccurrences(of: ":", with: "_")
+        let base = Self.safeBaseName(for: id)
         let fm = FileManager.default
-        let partFiles = [
+        let tempFiles = [
             Self.dir.appendingPathComponent("\(base).part"),
+            Self.dir.appendingPathComponent("\(base).part.mp4"),
+            Self.dir.appendingPathComponent("\(base).part.m4a"),
+            Self.dir.appendingPathComponent("\(base)-v.part.mp4"),
+            Self.dir.appendingPathComponent("\(base)-a.part.m4a"),
             Self.dir.appendingPathComponent("\(base)-v.part"),
             Self.dir.appendingPathComponent("\(base)-a.part"),
             Self.dir.appendingPathComponent("\(base).thumb.jpg")
         ]
-        for p in partFiles {
+        for p in tempFiles {
             try? fm.removeItem(at: p)
         }
+        pumpPendingQueue()
     }
 
     func delete(_ item: DownloadItem) {
-        let fm = FileManager.default
-        try? fm.removeItem(at: Self.dir.appendingPathComponent(item.file))
-        if let thumb = item.thumbnailFile {
-            try? fm.removeItem(at: Self.dir.appendingPathComponent(thumb))
+        deleteBatch([item])
+    }
+
+    func delete(at offsets: IndexSet) {
+        let toDelete = offsets.compactMap { items.indices.contains($0) ? items[$0] : nil }
+        deleteBatch(toDelete)
+    }
+
+    private func deleteBatch(_ targets: [DownloadItem]) {
+        guard !targets.isEmpty else { return }
+        let targetIds = Set(targets.map(\.id))
+        if let activeId = PlayerManager.shared.current?.id, targetIds.contains(activeId) {
+            PlayerManager.shared.close()
         }
-        items.removeAll { $0.id == item.id }
+        let fm = FileManager.default
+        for item in targets {
+            try? fm.removeItem(at: Self.dir.appendingPathComponent(item.file))
+            if let thumb = item.thumbnailFile {
+                try? fm.removeItem(at: Self.dir.appendingPathComponent(thumb))
+            }
+        }
+        items.removeAll { targetIds.contains($0.id) }
         saveIndex()
+    }
+
+    func flushIndex() {
+        let snapshot = items
+        let url = Self.indexURL
+        Self.indexQueue.sync {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    private func enqueueOrStart(video: Video, audioOnly: Bool) {
+        if tasks.count < maxConcurrentDownloads {
+            startTask(for: video, audioOnly: audioOnly)
+        } else if !pendingQueue.contains(where: { $0.video.id == video.id }) {
+            pendingQueue.append((video, audioOnly))
+        }
+    }
+
+    private func pumpPendingQueue() {
+        while tasks.count < maxConcurrentDownloads, !pendingQueue.isEmpty {
+            let next = pendingQueue.removeFirst()
+            if active[next.video.id]?.isPaused == false {
+                startTask(for: next.video, audioOnly: next.audioOnly)
+            }
+        }
     }
 
     private func startTask(for video: Video, audioOnly: Bool) {
@@ -126,7 +196,7 @@ final class DownloadManager: ObservableObject {
                 let item = try await Self.download(video, audioOnly: audioOnly) { downloaded, total in
                     Task { @MainActor in
                         guard self.active[video.id] != nil, self.active[video.id]?.isPaused == false else { return }
-                        let progress = total > 0 ? min(Double(downloaded) / Double(total), 1.0) : 0
+                        let progress = total > 0 ? min(max(Double(downloaded) / Double(total), 0), 1.0) : 0
                         self.active[video.id]?.downloadedBytes = downloaded
                         self.active[video.id]?.totalBytes = total
                         self.active[video.id]?.progress = progress
@@ -139,7 +209,6 @@ final class DownloadManager: ObservableObject {
             } catch {
                 let isCancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
                 if isCancelled {
-                    // Paused or cancelled: keep state in active dictionary if paused
                     if self.active[video.id]?.isPaused != true {
                         self.active[video.id] = nil
                     }
@@ -149,13 +218,14 @@ final class DownloadManager: ObservableObject {
                 }
             }
             tasks[video.id] = nil
+            pumpPendingQueue()
         }
     }
 
     private func saveIndex() {
         let currentItems = items
         let url = Self.indexURL
-        Task.detached(priority: .utility) {
+        Self.indexQueue.async {
             if let data = try? JSONEncoder().encode(currentItems) {
                 try? data.write(to: url, options: .atomic)
             }
@@ -169,7 +239,7 @@ final class DownloadManager: ObservableObject {
         audioOnly: Bool,
         progress: @escaping (Int64, Int64) -> Void
     ) async throws -> DownloadItem {
-        let base = video.id.replacingOccurrences(of: ":", with: "_")
+        let base = safeBaseName(for: video.id)
         let fm = FileManager.default
 
         var ytId = video.id
@@ -177,15 +247,18 @@ final class DownloadManager: ObservableObject {
         let resolved = try await InnerTube.shared.directFormats(ytId)
         var meta = resolved.video
         if meta.title.isEmpty || video.source == .spotify { meta = video }
-        meta.published = video.published
+        meta.published = video.published ?? meta.published
         meta.source = video.source
-        meta.artwork = video.artwork
+        meta.artwork = video.artwork ?? meta.artwork
+        meta.link = video.link ?? meta.link
         let formats = resolved.formats
 
-        // Cache thumbnail locally for offline display
         var thumbFileName: String? = nil
         if let thumbURL = meta.thumbnail,
-           let thumbData = try? await URLSession.shared.data(from: thumbURL).0 {
+           let (thumbData, thumbResp) = try? await URLSession.shared.data(from: thumbURL),
+           let http = thumbResp as? HTTPURLResponse,
+           (200..<300).contains(http.statusCode),
+           !thumbData.isEmpty {
             let thumbDest = dir.appendingPathComponent("\(base).thumb.jpg")
             if (try? thumbData.write(to: thumbDest, options: .atomic)) != nil {
                 thumbFileName = "\(base).thumb.jpg"
@@ -196,7 +269,17 @@ final class DownloadManager: ObservableObject {
             guard let a = formats.audio else { throw YTError.noStreams }
             let name = "\(base).m4a"
             let dest = dir.appendingPathComponent(name)
-            try await fetch(a, to: dest, progress: progress)
+            // Remux DASH fragmented MP4 audio into standard M4A for reliable offline seeking.
+            let rawAudioPart = dir.appendingPathComponent("\(base)-a.part.m4a")
+            try await fetch(a, to: rawAudioPart, progress: progress)
+            do {
+                try await Media.remuxAudioToM4A(source: rawAudioPart, to: dest)
+                try? fm.removeItem(at: rawAudioPart)
+            } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                try? fm.removeItem(at: dest)
+                try fm.moveItem(at: rawAudioPart, to: dest)
+            }
             return DownloadItem(video: meta, file: name, audioOnly: true, bytes: fileSize(dest), thumbnailFile: thumbFileName)
         }
 
@@ -204,21 +287,25 @@ final class DownloadManager: ObservableObject {
         let dest = dir.appendingPathComponent(name)
 
         if let vf = formats.video, let af = formats.audio {
-            let tv = dir.appendingPathComponent("\(base)-v.part")
-            let ta = dir.appendingPathComponent("\(base)-a.part")
-            let vs = Double(vf.size ?? 1)
-            let asz = Double(af.size ?? 0)
-            let total = max(vs + asz, 1)
+            // Use .mp4/.m4a extensions on temp staging files so AVURLAsset can inspect and merge them cleanly.
+            let tv = dir.appendingPathComponent("\(base)-v.part.mp4")
+            let ta = dir.appendingPathComponent("\(base)-a.part.m4a")
+            let vs = vf.size ?? 0
+            let asz = af.size ?? 0
+            let estimatedTotal = (vs > 0 && asz > 0) ? (vs + asz) : 0
 
             do {
+                var actualVSize: Int64 = vs
                 try await fetch(vf, to: tv) { downloaded, vTotal in
-                    let effectiveTotal = vTotal > 0 ? Int64(total) : 0
-                    progress(downloaded, effectiveTotal)
+                    let effectiveV = max(vs, vTotal)
+                    actualVSize = max(actualVSize, vTotal, downloaded)
+                    let overallTotal = estimatedTotal > 0 ? estimatedTotal : (effectiveV + asz)
+                    progress(downloaded, overallTotal)
                 }
                 try await fetch(af, to: ta) { downloaded, aTotal in
-                    let currentOverall = Int64(vs) + downloaded
-                    let effectiveTotal = aTotal > 0 ? Int64(total) : 0
-                    progress(currentOverall, effectiveTotal)
+                    let effectiveA = max(asz, aTotal)
+                    let overallTotal = max(actualVSize + effectiveA, actualVSize + downloaded)
+                    progress(actualVSize + downloaded, overallTotal)
                 }
                 try await Media.merge(video: tv, audio: ta, to: dest)
                 try? fm.removeItem(at: tv)
@@ -228,61 +315,60 @@ final class DownloadManager: ObservableObject {
                 if Task.isCancelled || error is CancellationError {
                     throw CancellationError()
                 }
-                // Fallback to muxed stream if separate stream merging failed
+                try? fm.removeItem(at: tv)
+                try? fm.removeItem(at: ta)
                 try? fm.removeItem(at: dest)
             }
         }
 
         guard let m = formats.muxed else { throw YTError.noStreams }
-        try await fetch(m, to: dest, progress: progress)
+        let muxTemp = dir.appendingPathComponent("\(base).part.mp4")
+        try await fetch(m, to: muxTemp, progress: progress)
+        try? fm.removeItem(at: dest)
+        try fm.moveItem(at: muxTemp, to: dest)
         return DownloadItem(video: meta, file: name, audioOnly: false, bytes: fileSize(dest), thumbnailFile: thumbFileName)
     }
 
-    /// Downloads with support for resuming from existing byte offset
+    /// Downloads with resumable byte-range support into a temp URL.
     private nonisolated static func fetch(
         _ format: DirectFormat,
-        to dest: URL,
+        to tempPartURL: URL,
         progress: @escaping (Int64, Int64) -> Void
     ) async throws {
         let fm = FileManager.default
-        let isDirectPart = dest.pathExtension == "part"
-        let partURL = isDirectPart ? dest : dest.deletingPathExtension().appendingPathExtension("part")
-
         var existingSize: Int64 = 0
-        if fm.fileExists(atPath: partURL.path) {
-            existingSize = fileSize(partURL)
+        if fm.fileExists(atPath: tempPartURL.path) {
+            existingSize = fileSize(tempPartURL)
         } else {
-            fm.createFile(atPath: partURL.path, contents: nil)
+            fm.createFile(atPath: tempPartURL.path, contents: nil)
         }
 
-        let handle = try FileHandle(forWritingTo: partURL)
+        if let expected = format.size, expected > 0, existingSize == expected {
+            progress(existingSize, expected)
+            return
+        }
+        if let expected = format.size, expected > 0, existingSize > expected {
+            try? Data().write(to: tempPartURL)
+            existingSize = 0
+        }
+
+        let handle = try FileHandle(forWritingTo: tempPartURL)
         defer { try? handle.close() }
 
-        do {
-            try await fetchChunks(format, into: handle, existingBytes: existingSize, totalBytes: format.size ?? 0, progress: progress)
-            try? handle.close()
-            if !isDirectPart {
-                try? fm.removeItem(at: dest)
-                try fm.moveItem(at: partURL, to: dest)
-            }
-        } catch {
-            if Task.isCancelled || error is CancellationError {
-                throw CancellationError()
-            }
-            throw error
-        }
+        try await fetchChunks(format, fileURL: tempPartURL, into: handle, existingBytes: existingSize, totalBytes: format.size ?? 0, progress: progress)
     }
 
     private nonisolated static func fetchChunks(
         _ format: DirectFormat,
+        fileURL: URL,
         into handle: FileHandle,
         existingBytes: Int64,
         totalBytes: Int64,
         progress: @escaping (Int64, Int64) -> Void
     ) async throws {
-        let chunk: Int64 = 8_000_000 // 8MB chunk
+        let chunk: Int64 = 4_000_000 // 4MB chunk for smooth progress & fewer timeouts
         var offset: Int64 = existingBytes
-        var total: Int64 = totalBytes > 0 ? totalBytes : (format.size ?? 0)
+        var total: Int64 = totalBytes
 
         try handle.seek(toOffset: UInt64(offset))
 
@@ -293,13 +379,35 @@ final class DownloadManager: ObservableObject {
             var req = URLRequest(url: format.url)
             req.setValue("bytes=\(offset)-\(endByte)", forHTTPHeaderField: "Range")
             if format.url.host?.contains("googlevideo") == true {
-                req.setValue(YTClient.ios.userAgent, forHTTPHeaderField: "User-Agent")
+                req.setValue(format.effectiveUserAgent, forHTTPHeaderField: "User-Agent")
             }
 
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                throw YTError.http(code)
+            guard let http = resp as? HTTPURLResponse else { throw YTError.http(0) }
+
+            if http.statusCode == 416 && offset > 0 {
+                // Server reports requested start is at/past EOF -> check if file is complete or reset.
+                if let range = http.value(forHTTPHeaderField: "Content-Range"),
+                   let serverTotal = range.split(separator: "/").last.flatMap({ Int64($0) }),
+                   serverTotal > 0, offset == serverTotal {
+                    progress(offset, serverTotal)
+                    return
+                }
+                offset = 0
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
+                continue
+            }
+
+            guard (200..<300).contains(http.statusCode) else {
+                throw YTError.http(http.statusCode)
+            }
+
+            // If server ignored Range and returned 200 OK full resource, rewrite from offset 0 cleanly.
+            if http.statusCode == 200 && offset > 0 {
+                offset = 0
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
             }
 
             if total == 0 {

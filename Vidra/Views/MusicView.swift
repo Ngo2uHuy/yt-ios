@@ -31,18 +31,27 @@ struct MusicView: View {
     @State private var text = ""
     @State private var query = ""
     @State private var message: String?
+    @State private var loadingLink = false
+    @State private var linkTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 providerBar
+                if loadingLink {
+                    ProgressView("Đang tải danh sách…")
+                        .padding(.vertical, 8)
+                }
                 content
             }
             .navigationTitle("Nhạc")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $text, prompt: "Tìm bài hát, nghệ sĩ")
             .onSubmit(of: .search) { submit() }
-            .onChange(of: text) { if $0.isEmpty { query = "" } }
+            .onChange(of: text) {
+                if $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { query = "" }
+            }
+            .onDisappear { linkTask?.cancel() }
             .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK") {}
             }
@@ -105,28 +114,36 @@ struct MusicView: View {
         guard !q.isEmpty else { return }
         if let parsed = Spotify.parseLink(q) {
             provider = .spotify
-            Task {
+            linkTask?.cancel()
+            loadingLink = true
+            linkTask = Task {
+                defer { loadingLink = false }
                 do {
                     let (_, tracks) = try await Spotify.fetch(q)
-                    guard let first = tracks.first else { return }
+                    guard !Task.isCancelled, let first = tracks.first else { return }
                     if parsed.kind == "track" {
                         let v = Video(id: "sp:\(parsed.id)", title: first.title, channelTitle: first.artist, source: .spotify)
-                        PlayerManager.shared.play(v)
+                        PlayerManager.shared.play(v, queue: [])
                     } else {
                         let matched = await Spotify.matchAll(tracks) { _ in }
+                        guard !Task.isCancelled else { return }
                         let playable = matched.compactMap { $0 }
                         if let firstPlay = playable.first {
                             PlayerManager.shared.play(firstPlay, queue: Array(playable.dropFirst()))
+                        } else {
+                            message = "Không tìm thấy bài hát phù hợp để phát"
                         }
                     }
                 } catch {
-                    message = error.localizedDescription
+                    if !(error is CancellationError) {
+                        message = error.localizedDescription
+                    }
                 }
             }
             return
         }
         if case .video(let id)? = YTLink.parse(q) {
-            PlayerManager.shared.play(Video(id: id, title: "", channelTitle: "", source: .ytMusic))
+            PlayerManager.shared.play(Video(id: id, title: "", channelTitle: "", source: .ytMusic), queue: [])
             return
         }
         query = q
@@ -134,10 +151,30 @@ struct MusicView: View {
 }
 
 struct SpotifyImportView: View {
+    var needsNavigationStack: Bool = true
+
+    @Environment(\.dismiss) private var dismiss
     @StateObject private var importer = SpotifyImporter()
     @State private var link = ""
 
     var body: some View {
+        if needsNavigationStack {
+            NavigationStack {
+                formList
+                    .navigationTitle("Nhập từ Spotify")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button("Đóng") { dismiss() }
+                        }
+                    }
+            }
+        } else {
+            formList
+        }
+    }
+
+    private var formList: some View {
         List {
             Section {
                 TextField("Link playlist / album / bài hát Spotify", text: $link)
@@ -148,10 +185,18 @@ struct SpotifyImportView: View {
                         Task { @MainActor in link = strings.first ?? "" }
                     }
                     .labelStyle(.titleAndIcon)
+                    .buttonStyle(.borderless)
                     Spacer()
                     Button("Nhập") { importer.run(link) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.green)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(
+                            (importer.running || Spotify.parseLink(link) == nil)
+                                ? Color.gray.opacity(0.4) : Color.green,
+                            in: Capsule()
+                        )
                         .disabled(importer.running || Spotify.parseLink(link) == nil)
                 }
             } footer: {
@@ -191,5 +236,7 @@ struct SpotifyImportView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .onDisappear { importer.cancel() }
+        .onChange(of: PlayerManager.shared.showWatch) { if $0 && needsNavigationStack { dismiss() } }
     }
 }

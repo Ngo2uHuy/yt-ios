@@ -8,10 +8,14 @@ struct HomeView: View {
     @State private var category: String?
     @State private var feed: [Video] = []
     @State private var loading = false
-    @State private var loadedCount = -1
+    @State private var loadedKey = ""
 
     private let categories = ["Thịnh hành", "Âm nhạc", "Tin tức", "Trò chơi", "Bóng đá",
                               "Podcast", "Phim", "Học tập", "Công nghệ", "Nấu ăn", "Du lịch"]
+
+    private var subsKey: String {
+        lib.subscriptions.map(\.id).joined(separator: ",")
+    }
 
     var body: some View {
         NavigationStack {
@@ -91,8 +95,8 @@ struct HomeView: View {
             .listStyle(.plain)
             .overlay { if loading && feed.isEmpty { ProgressView() } }
             .refreshable { await loadFeed() }
-            .task(id: lib.subscriptions.count) {
-                guard loadedCount != lib.subscriptions.count else { return }
+            .task(id: subsKey) {
+                guard loadedKey != subsKey else { return }
                 await loadFeed()
             }
         }
@@ -100,13 +104,15 @@ struct HomeView: View {
 
     private func loadFeed() async {
         loading = true
-        let count = lib.subscriptions.count
+        let key = subsKey
         let result = await Extras.subscriptionFeed(lib.subscriptions)
+        guard !Task.isCancelled else {
+            loading = false
+            return
+        }
         loading = false
-        // A cancelled load returns partial/empty data; keep the old feed and retry next time.
-        guard !Task.isCancelled else { return }
         feed = result
-        loadedCount = count
+        loadedKey = key
     }
 }
 
@@ -136,6 +142,10 @@ enum SearchFilter: String, CaseIterable, Identifiable {
 }
 
 struct SearchView: View {
+    var needsNavigationStack: Bool = true
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var pm = PlayerManager.shared
     @State private var text = ""
     @State private var query = ""
     @State private var filter = SearchFilter.all
@@ -144,41 +154,70 @@ struct SearchView: View {
     @State private var showPlaylist = false
     @State private var linkChannel: Channel?
     @State private var showChannel = false
+    @State private var loadingLink = false
+    @State private var linkError: String?
+    @State private var linkTask: Task<Void, Never>?
     @AppStorage("recentSearches") private var recentRaw = ""
 
-    private var recents: [String] { recentRaw.split(separator: "\n").map(String.init) }
+    private var recents: [String] {
+        var seen = Set<String>()
+        return recentRaw.split(separator: "\n").map(String.init).filter { seen.insert($0).inserted }
+    }
 
     var body: some View {
-        NavigationStack {
+        if needsNavigationStack {
+            NavigationStack {
+                searchBody
+            }
+            .onChange(of: pm.showWatch) { showing in
+                if showing { dismiss() }
+            }
+        } else {
+            searchBody
+        }
+    }
+
+    private var searchBody: some View {
+        VStack(spacing: 0) {
+            if loadingLink {
+                ProgressView("Đang tải liên kết…")
+                    .padding(.vertical, 8)
+            }
             Group {
                 if query.isEmpty { recentList } else { results }
             }
-            .navigationTitle("Tìm kiếm")
-            .searchable(text: $text, prompt: "Tìm video, kênh hoặc dán link")
-            .searchSuggestions {
-                ForEach(suggestions, id: \.self) { s in
-                    Button { text = s; submit(s) } label: { Label(s, systemImage: "magnifyingglass") }
-                        .foregroundStyle(.primary)
-                }
+        }
+        .navigationTitle("Tìm kiếm")
+        .searchable(text: $text, prompt: "Tìm video, kênh hoặc dán link")
+        .searchSuggestions {
+            ForEach(suggestions, id: \.self) { s in
+                Button { text = s; submit(s) } label: { Label(s, systemImage: "magnifyingglass") }
+                    .foregroundStyle(.primary)
             }
-            .onSubmit(of: .search) { submit(text) }
-            .onChange(of: text) { if $0.isEmpty { query = "" } }
-            .task(id: text) {
-                let q = text.trimmingCharacters(in: .whitespaces)
-                guard q.count > 1, YTLink.parse(q) == nil else {
-                    suggestions = []
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled else { return }
-                suggestions = await InnerTube.shared.suggestions(q)
+        }
+        .onSubmit(of: .search) { submit(text) }
+        .onChange(of: text) {
+            if $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { query = "" }
+        }
+        .task(id: text) {
+            let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard q.count > 1, YTLink.parse(q) == nil, Spotify.parseLink(q) == nil else {
+                suggestions = []
+                return
             }
-            .navigationDestination(isPresented: $showPlaylist) {
-                if let id = linkPlaylist { RemotePlaylistView(id: id) }
-            }
-            .navigationDestination(isPresented: $showChannel) {
-                if let c = linkChannel { ChannelView(channel: c) }
-            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            suggestions = await InnerTube.shared.suggestions(q)
+        }
+        .onDisappear { linkTask?.cancel() }
+        .navigationDestination(isPresented: $showPlaylist) {
+            if let id = linkPlaylist { RemotePlaylistView(id: id) }
+        }
+        .navigationDestination(isPresented: $showChannel) {
+            if let c = linkChannel { ChannelView(channel: c) }
+        }
+        .alert(linkError ?? "", isPresented: Binding(get: { linkError != nil }, set: { if !$0 { linkError = nil } })) {
+            Button("OK") {}
         }
     }
 
@@ -222,12 +261,12 @@ struct SearchView: View {
     }
 
     private func submit(_ raw: String) {
-        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = raw.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         suggestions = []
         switch YTLink.parse(q) {
         case .video(let id)?:
-            PlayerManager.shared.play(Video(id: id, title: "", channelTitle: ""))
+            PlayerManager.shared.play(Video(id: id, title: "", channelTitle: ""), queue: [])
             return
         case .playlist(let id)?:
             linkPlaylist = id
@@ -241,17 +280,29 @@ struct SearchView: View {
             break
         }
         if let parsed = Spotify.parseLink(q) {
-            Task {
-                if let (_, tracks) = try? await Spotify.fetch(q), let first = tracks.first {
+            linkTask?.cancel()
+            loadingLink = true
+            linkTask = Task {
+                defer { loadingLink = false }
+                do {
+                    let (_, tracks) = try await Spotify.fetch(q)
+                    guard !Task.isCancelled, let first = tracks.first else { return }
                     if parsed.kind == "track" {
                         let v = Video(id: "sp:\(parsed.id)", title: first.title, channelTitle: first.artist, source: .spotify)
-                        PlayerManager.shared.play(v)
+                        PlayerManager.shared.play(v, queue: [])
                     } else {
                         let matched = await Spotify.matchAll(tracks) { _ in }
+                        guard !Task.isCancelled else { return }
                         let playable = matched.compactMap { $0 }
                         if let firstPlay = playable.first {
                             PlayerManager.shared.play(firstPlay, queue: Array(playable.dropFirst()))
+                        } else {
+                            linkError = "Không tìm thấy bài hát phù hợp trên YouTube Music"
                         }
+                    }
+                } catch {
+                    if !(error is CancellationError) {
+                        linkError = error.localizedDescription
                     }
                 }
             }
@@ -282,25 +333,12 @@ struct ChannelView: View {
             switch tab {
             case .videos:
                 PagedList(
-                    loader: { [id = channel.id, title = channel.title] token in
-                        var p = try await InnerTube.shared.channelVideos(id, continuation: token)
-                        let name = p.channel?.title ?? title
-                        p.videos = p.videos.map { v in
-                            var v = v
-                            if v.channelTitle.isEmpty { v.channelTitle = name }
-                            v.channelId = id
-                            return v
-                        }
-                        return p
+                    loader: { [id = channel.id] token in
+                        try await InnerTube.shared.channelVideos(id, continuation: token)
                     },
                     header: AnyView(header),
                     compact: false,
-                    onFirstPage: { p in
-                        guard let c = p.channel else { return }
-                        channel = Channel(id: c.id, title: c.title.isEmpty ? channel.title : c.title,
-                                          avatar: c.avatar ?? channel.avatar, subscribers: c.subscribers)
-                        lib.refreshChannel(channel)
-                    }
+                    onFirstPage: { applyChannelMetadata($0) }
                 )
                 .id("videos-\(channel.id)")
             case .playlists:
@@ -309,13 +347,25 @@ struct ChannelView: View {
                         try await InnerTube.shared.channelPlaylists(id, continuation: token)
                     },
                     header: AnyView(header),
-                    compact: false
+                    compact: false,
+                    onFirstPage: { applyChannelMetadata($0) }
                 )
                 .id("playlists-\(channel.id)")
             }
         }
         .navigationTitle(channel.title)
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func applyChannelMetadata(_ page: Page) {
+        guard let c = page.channel else { return }
+        channel = Channel(
+            id: c.id,
+            title: c.title.isEmpty ? channel.title : c.title,
+            avatar: c.avatar ?? channel.avatar,
+            subscribers: c.subscribers
+        )
+        lib.refreshChannel(channel)
     }
 
     private var header: some View {
@@ -340,15 +390,19 @@ struct RemotePlaylistView: View {
     let id: String
     @ObservedObject private var lib = Library.shared
     @State private var title = "Danh sách phát"
-    @State private var firstPage: [Video] = []
+    @State private var loadedVideos: [Video] = []
     @State private var saved = false
 
     var body: some View {
         PagedList(
             loader: { token in try await InnerTube.shared.playlist(id, continuation: token) },
+            queueFromRemaining: true,
             onFirstPage: { p in
-                if let t = p.title { title = t }
-                firstPage = p.videos
+                if let t = p.title, !t.isEmpty { title = t }
+                loadedVideos = p.videos
+            },
+            onVideosChanged: { all in
+                loadedVideos = all
             }
         )
         .navigationTitle(title)
@@ -356,20 +410,20 @@ struct RemotePlaylistView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button {
-                    let id = lib.createPlaylist(title)
-                    firstPage.forEach { lib.add($0, to: id) }
+                    let pid = lib.createPlaylist(title)
+                    loadedVideos.forEach { lib.add($0, to: pid) }
                     saved = true
                 } label: {
                     Image(systemName: saved ? "checkmark" : "square.and.arrow.down")
                 }
-                .disabled(firstPage.isEmpty || saved)
+                .disabled(loadedVideos.isEmpty || saved)
                 Button {
-                    guard let f = firstPage.first else { return }
-                    PlayerManager.shared.play(f, queue: Array(firstPage.dropFirst()))
+                    guard let f = loadedVideos.first else { return }
+                    PlayerManager.shared.play(f, queue: Array(loadedVideos.dropFirst()))
                 } label: {
                     Image(systemName: "play.fill")
                 }
-                .disabled(firstPage.isEmpty)
+                .disabled(loadedVideos.isEmpty)
             }
         }
     }
@@ -378,41 +432,56 @@ struct RemotePlaylistView: View {
 // MARK: - Subscriptions
 
 struct SubscriptionsView: View {
+    var needsNavigationStack: Bool = true
+
     @ObservedObject private var lib = Library.shared
     @State private var importing = false
     @State private var message: String?
 
     var body: some View {
-        NavigationStack {
-            List {
-                if lib.subscriptions.isEmpty {
-                    EmptyState(icon: "person.2", title: "Chưa có kênh",
-                               message: "Bấm ⤓ để nhập tệp subscriptions.csv từ Google Takeout (takeout.google.com → YouTube).")
-                        .listRowSeparator(.hidden)
-                }
-                ForEach(lib.subscriptions) { c in
-                    NavigationLink { ChannelView(channel: c) } label: { ChannelRow(channel: c) }
-                }
-                .onDelete { lib.subscriptions.remove(atOffsets: $0) }
+        if needsNavigationStack {
+            NavigationStack {
+                subsList
             }
-            .listStyle(.plain)
-            .navigationTitle("Kênh đăng ký (\(lib.subscriptions.count))")
-            .toolbar {
-                Button { importing = true } label: { Image(systemName: "square.and.arrow.down") }
+        } else {
+            subsList
+        }
+    }
+
+    private var subsList: some View {
+        List {
+            if lib.subscriptions.isEmpty {
+                EmptyState(icon: "person.2", title: "Chưa có kênh",
+                           message: "Bấm ⤓ để nhập tệp subscriptions.csv từ Google Takeout (takeout.google.com → YouTube).")
+                    .listRowSeparator(.hidden)
             }
-            .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .plainText, .data]) { result in
-                guard case .success(let url) = result else { return }
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                guard let csv = try? String(contentsOf: url, encoding: .utf8) else {
+            ForEach(lib.subscriptions) { c in
+                NavigationLink { ChannelView(channel: c) } label: { ChannelRow(channel: c) }
+            }
+            .onDelete { lib.subscriptions.remove(atOffsets: $0) }
+        }
+        .listStyle(.plain)
+        .navigationTitle("Kênh đăng ký (\(lib.subscriptions.count))")
+        .toolbar {
+            Button { importing = true } label: { Image(systemName: "square.and.arrow.down") }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .plainText, .data]) { result in
+            guard case .success(let url) = result else { return }
+            Task {
+                let text = await Task.detached(priority: .userInitiated) { () -> String? in
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    return try? String(contentsOf: url, encoding: .utf8)
+                }.value
+                guard let csv = text else {
                     message = "Không đọc được tệp"
                     return
                 }
                 message = "Đã nhập \(lib.importTakeout(csv)) kênh"
             }
-            .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
-                Button("OK") {}
-            }
+        }
+        .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+            Button("OK") {}
         }
     }
 }
@@ -460,7 +529,9 @@ struct LibraryView: View {
     }
 
     private var artists: [Channel] {
-        let list = (lib.followedArtists + lib.subscriptions).filter { matches($0.title) }
+        var seen = Set<String>()
+        let list = (lib.followedArtists + lib.subscriptions)
+            .filter { seen.insert($0.id).inserted && matches($0.title) }
         return sortAZ ? list.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } : list
     }
 
@@ -533,14 +604,16 @@ struct LibraryView: View {
                 }
 
                 if filter == .liked {
-                    ForEach(lib.likedTracks.filter { matches($0.title) || matches($0.channelTitle) }) { v in
-                        VideoButton(video: v)
+                    let liked = lib.likedTracks.filter { matches($0.title) || matches($0.channelTitle) }
+                    ForEach(Array(liked.enumerated()), id: \.element.id) { idx, v in
+                        VideoButton(video: v, queue: Array(liked.dropFirst(idx + 1)))
                     }
                 }
 
                 if filter == .downloads {
-                    ForEach(dl.items.filter { matches($0.video.title) }) { item in
-                        VideoButton(video: item.video)
+                    let filtered = dl.items.filter { matches($0.video.title) }
+                    ForEach(Array(filtered.enumerated()), id: \.element.id) { idx, item in
+                        VideoButton(video: item.video, queue: Array(filtered.dropFirst(idx + 1).map(\.video)))
                     }
                 }
 
@@ -593,15 +666,26 @@ struct LocalVideoList: View {
             if videos.isEmpty {
                 EmptyState(icon: "tray", title: "Trống").listRowSeparator(.hidden)
             } else {
-                HStack {
-                    Button { play(videos) } label: { Label("Phát tất cả", systemImage: "play.fill").frame(maxWidth: .infinity) }
-                    Button { play(videos.shuffled()) } label: { Label("Ngẫu nhiên", systemImage: "shuffle").frame(maxWidth: .infinity) }
+                HStack(spacing: 10) {
+                    Button { play(videos) } label: {
+                        Label("Phát tất cả", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.borderless)
+                    Button { play(videos.shuffled()) } label: {
+                        Label("Ngẫu nhiên", systemImage: "shuffle")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.borderless)
                 }
-                .buttonStyle(.bordered)
                 .listRowSeparator(.hidden)
             }
-            ForEach(videos) { v in
-                VideoButton(video: v, queue: Array(videos.drop { $0.id != v.id }.dropFirst()))
+            ForEach(Array(videos.enumerated()), id: \.element.id) { idx, v in
+                VideoButton(video: v, queue: Array(videos.dropFirst(idx + 1)))
             }
             .onDelete { lib.remove(at: $0, from: source) }
             .onMove { lib.move(from: $0, to: $1, in: source) }
@@ -668,7 +752,6 @@ struct DownloadsView: View {
                                 .foregroundStyle(.secondary)
                             }
 
-                            // Pause / Resume button
                             Button {
                                 if a.isPaused {
                                     dl.resume(a.id)
@@ -680,9 +763,8 @@ struct DownloadsView: View {
                                     .font(.title2)
                                     .foregroundStyle(a.isPaused ? .green : .orange)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.borderless)
 
-                            // Cancel button
                             Button {
                                 dl.cancel(a.id)
                             } label: {
@@ -690,7 +772,7 @@ struct DownloadsView: View {
                                     .font(.title2)
                                     .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.borderless)
                         }
                         .padding(.vertical, 2)
                     }
@@ -701,16 +783,19 @@ struct DownloadsView: View {
                     EmptyState(icon: "arrow.down.circle", title: "Chưa có video tải xuống",
                                message: "Nhấn giữ một video hoặc dùng nút Tải xuống khi đang xem.")
                 }
-                ForEach(dl.items) { item in
+                ForEach(Array(dl.items.enumerated()), id: \.element.id) { idx, item in
                     VStack(alignment: .leading, spacing: 4) {
-                        VideoButton(video: item.video)
+                        VideoButton(
+                            video: item.video,
+                            queue: Array(dl.items.dropFirst(idx + 1).map(\.video))
+                        )
                         Text((item.audioOnly ? "Âm thanh • " : "Video • ")
                              + ByteCountFormatter.string(fromByteCount: item.bytes, countStyle: .file))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
-                .onDelete { offsets in offsets.map { dl.items[$0] }.forEach { dl.delete($0) } }
+                .onDelete { offsets in dl.delete(at: offsets) }
             } footer: {
                 Text("Tệp nằm trong ứng dụng Tệp › Trên iPhone › Vidra › Downloads. Xem được khi không có mạng.")
             }
@@ -735,13 +820,15 @@ struct SettingsView: View {
     @State private var importingLibrary = false
     @State private var importMessage: String?
     @ObservedObject private var spotifyAuth = SpotifyAuth.shared
+    @ObservedObject private var spotifyRemote = SpotifyRemote.shared
+    @ObservedObject private var modeManager = AppModeManager.shared
 
     var body: some View {
         Form {
             Section("Chế độ ứng dụng") {
                 Picker("Chế độ giao diện", selection: Binding(
-                    get: { AppModeManager.shared.currentMode },
-                    set: { AppModeManager.shared.switchTo($0) }
+                    get: { modeManager.currentMode },
+                    set: { modeManager.switchTo($0) }
                 )) {
                     ForEach(AppMode.allCases) { mode in
                         Label(mode.title, systemImage: mode.iconName).tag(mode)
@@ -765,11 +852,11 @@ struct SettingsView: View {
                     .padding(.vertical, 4)
 
                     Toggle("Phát trực tiếp qua app Spotify (App Remote)", isOn: Binding(
-                        get: { SpotifyRemote.shared.isEnabled },
-                        set: { SpotifyRemote.shared.isEnabled = $0 }
+                        get: { spotifyRemote.isEnabled },
+                        set: { spotifyRemote.isEnabled = $0 }
                     ))
 
-                    if !SpotifyRemote.shared.isSpotifyInstalled {
+                    if !spotifyRemote.isSpotifyInstalled {
                         Text("Chưa phát hiện app Spotify trên máy. Vidra sẽ tự động phát trực tiếp qua nguồn âm thanh thay thế.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -832,7 +919,12 @@ struct SettingsView: View {
                 } label: {
                     Label("Nhập dữ liệu sao lưu (JSON)", systemImage: "square.and.arrow.down")
                 }
-                Button("Xoá bộ nhớ đệm ảnh") { URLCache.shared.removeAllCachedResponses() }
+                Button("Xoá bộ nhớ đệm ảnh") {
+                    ImageCache.shared.clear()
+                    ArtworkColorCache.shared.clear()
+                    URLCache.shared.removeAllCachedResponses()
+                    importMessage = "Đã xoá bộ nhớ đệm ảnh"
+                }
                 Button("Xoá lịch sử xem", role: .destructive) { confirmClear = true }
             }
             Section {
@@ -842,6 +934,14 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Cài đặt")
+        .onChange(of: maxHeight) { _ in PlayerManager.shared.qualityChanged() }
+        .onChange(of: defaultRate) { _ in PlayerManager.shared.syncSettings() }
+        .onChange(of: sponsorBlock) { _ in PlayerManager.shared.syncSettings() }
+        .onChange(of: musicAudioOnly) { _ in
+            if PlayerManager.shared.current?.source != nil {
+                PlayerManager.shared.retry()
+            }
+        }
         .task {
             if spotifyAuth.isLoggedIn && spotifyAuth.profile == nil {
                 await spotifyAuth.loadProfile()
@@ -853,14 +953,18 @@ struct SettingsView: View {
         }
         .fileImporter(isPresented: $importingLibrary, allowedContentTypes: [.json, .plainText, .data]) { result in
             guard case .success(let url) = result else { return }
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url),
-                  Library.shared.restoreBackup(from: data) else {
-                importMessage = "Không đọc được file sao lưu hoặc file không hợp lệ"
-                return
+            Task {
+                let fileData = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    return try? Data(contentsOf: url)
+                }.value
+                guard let data = fileData, Library.shared.restoreBackup(from: data) else {
+                    importMessage = "Không đọc được file sao lưu hoặc file không hợp lệ"
+                    return
+                }
+                importMessage = "Đã khôi phục dữ liệu thư viện thành công!"
             }
-            importMessage = "Đã khôi phục dữ liệu thư viện thành công!"
         }
         .alert(importMessage ?? "", isPresented: Binding(get: { importMessage != nil }, set: { if !$0 { importMessage = nil } })) {
             Button("OK") {}

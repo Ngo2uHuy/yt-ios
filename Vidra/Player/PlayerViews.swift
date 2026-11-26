@@ -9,6 +9,7 @@ final class PlayerUIView: UIView {
 struct VideoSurface: UIViewRepresentable {
     let player: AVPlayer
     var gravity: AVLayerVideoGravity = .resizeAspect
+    var enablePiP: Bool = true
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -17,15 +18,8 @@ struct VideoSurface: UIViewRepresentable {
         view.backgroundColor = .black
         view.playerLayer.player = player
         view.playerLayer.videoGravity = gravity
-        if AVPictureInPictureController.isPictureInPictureSupported(),
-           let pip = AVPictureInPictureController(playerLayer: view.playerLayer) {
-            pip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
-            pip.requiresLinearPlayback = false
-            pip.delegate = context.coordinator
-            context.coordinator.pip = pip
-            PlayerManager.shared.pipController = pip
-        }
         context.coordinator.view = view
+        configurePiP(on: view, coordinator: context.coordinator)
         return view
     }
 
@@ -36,17 +30,43 @@ struct VideoSurface: UIViewRepresentable {
         if uiView.playerLayer.videoGravity != gravity {
             uiView.playerLayer.videoGravity = gravity
         }
-        if let pip = context.coordinator.pip {
-            pip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
+        configurePiP(on: uiView, coordinator: context.coordinator)
+    }
+
+    static func dismantleUIView(_ uiView: PlayerUIView, coordinator: Coordinator) {
+        if let pip = coordinator.pip {
+            if PlayerManager.shared.pipController === pip {
+                PlayerManager.shared.pipController = nil
+            }
+            coordinator.pip = nil
+        }
+        uiView.playerLayer.player = nil
+    }
+
+    private func configurePiP(on view: PlayerUIView, coordinator: Coordinator) {
+        guard enablePiP, AVPictureInPictureController.isPictureInPictureSupported() else {
+            if let existing = coordinator.pip {
+                if PlayerManager.shared.pipController === existing {
+                    PlayerManager.shared.pipController = nil
+                }
+                coordinator.pip = nil
+            }
+            return
+        }
+        let autoPiP = Pref.autoPiP
+        if let pip = coordinator.pip {
+            if pip.canStartPictureInPictureAutomaticallyFromInline != autoPiP {
+                pip.canStartPictureInPictureAutomaticallyFromInline = autoPiP
+            }
+            if PlayerManager.shared.pipController !== pip {
+                PlayerManager.shared.pipController = pip
+            }
+        } else if let pip = AVPictureInPictureController(playerLayer: view.playerLayer) {
+            pip.canStartPictureInPictureAutomaticallyFromInline = autoPiP
             pip.requiresLinearPlayback = false
+            pip.delegate = coordinator
+            coordinator.pip = pip
             PlayerManager.shared.pipController = pip
-        } else if AVPictureInPictureController.isPictureInPictureSupported(),
-                  let newPip = AVPictureInPictureController(playerLayer: uiView.playerLayer) {
-            newPip.canStartPictureInPictureAutomaticallyFromInline = Pref.autoPiP
-            newPip.requiresLinearPlayback = false
-            newPip.delegate = context.coordinator
-            context.coordinator.pip = newPip
-            PlayerManager.shared.pipController = newPip
         }
     }
 
@@ -55,76 +75,31 @@ struct VideoSurface: UIViewRepresentable {
         weak var view: PlayerUIView?
 
         func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
-            Task { @MainActor in
-                PlayerManager.shared.isPiPActive = true
-            }
+            Task { @MainActor in PlayerManager.shared.isPiPActive = true }
         }
 
         func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
-            Task { @MainActor in
-                PlayerManager.shared.isPiPActive = true
-            }
+            Task { @MainActor in PlayerManager.shared.isPiPActive = true }
         }
 
         func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
-            Task { @MainActor in
-                PlayerManager.shared.isPiPActive = false
-            }
+            Task { @MainActor in PlayerManager.shared.isPiPActive = false }
         }
 
         func pictureInPictureControllerWillStopPictureInPicture(_ controller: AVPictureInPictureController) {
-            Task { @MainActor in
-                PlayerManager.shared.isPiPActive = false
-            }
+            Task { @MainActor in PlayerManager.shared.isPiPActive = false }
         }
 
         func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
-            Task { @MainActor in
-                PlayerManager.shared.isPiPActive = false
-            }
+            Task { @MainActor in PlayerManager.shared.isPiPActive = false }
         }
 
         func pictureInPictureController(_ controller: AVPictureInPictureController,
                                         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
             Task { @MainActor in
                 PlayerManager.shared.showWatch = true
+                try? await Task.sleep(nanoseconds: 100_000_000)
                 completionHandler(true)
-            }
-        }
-
-        // MARK: - 10-Second Skip & Play/Pause Controls
-
-        func pictureInPictureController(_ controller: AVPictureInPictureController,
-                                        skipByInterval skipInterval: CMTime,
-                                        completion completionHandler: @escaping () -> Void) {
-            let seconds = CMTimeGetSeconds(skipInterval)
-            Task { @MainActor in
-                PlayerManager.shared.seek(by: seconds)
-                completionHandler()
-            }
-        }
-
-        func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
-            Task { @MainActor in
-                if playing {
-                    PlayerManager.shared.resume()
-                } else {
-                    PlayerManager.shared.pause()
-                }
-            }
-        }
-
-        func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
-            MainActor.assumeIsolated {
-                let dur = PlayerManager.shared.duration
-                guard dur > 0 else { return CMTimeRange(start: .zero, duration: .indefinite) }
-                return CMTimeRange(start: .zero, duration: CMTime(seconds: dur, preferredTimescale: 600))
-            }
-        }
-
-        func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
-            MainActor.assumeIsolated {
-                !PlayerManager.shared.isPlaying
             }
         }
     }
@@ -145,18 +120,23 @@ struct RoutePicker: UIViewRepresentable {
 struct PlayerArea: View {
     var onClose: () -> Void
 
+    private enum DragAxis { case none, horizontal, vertical }
+
     @ObservedObject private var pm = PlayerManager.shared
     @AppStorage(Pref.maxHeightKey) private var maxHeight = 1080
     @Environment(\.verticalSizeClass) private var vsc
     @State private var controlsVisible = true
     @State private var scrub: Double?
     @State private var hideTask: Task<Void, Never>?
+    @State private var flashTask: Task<Void, Never>?
     @State private var hud: GestureHUD?
     @State private var hudTask: Task<Void, Never>?
     @State private var dragStart: Float?
+    @State private var dragStartSideIsLeft: Bool?
+    @State private var dragAxis: DragAxis = .none
+    @State private var isDragging = false
     @State private var flash: String?
 
-    // Gestures state: Pinch-to-zoom, interactive swipe-down to minimize, and horizontal swipe-seek
     @State private var videoGravity: AVLayerVideoGravity = .resizeAspect
     @State private var dragOffsetY: CGFloat = 0
     @State private var hasTriggeredHorizontalSwipe = false
@@ -164,7 +144,7 @@ struct PlayerArea: View {
     var body: some View {
         ZStack {
             Color.black
-            VideoSurface(player: pm.player, gravity: videoGravity)
+            VideoSurface(player: pm.player, gravity: videoGravity, enablePiP: !pm.showsArtwork)
             if pm.showsArtwork, let v = pm.current {
                 CachedAsyncImage(url: v.thumbnail, targetSize: CGSize(width: 480, height: 270)) { $0.resizable().scaledToFit() } placeholder: { Color.black }
                     .overlay(alignment: .topLeading) {
@@ -211,22 +191,25 @@ struct PlayerArea: View {
                     .allowsHitTesting(false)
             }
             if !controlsVisible && pm.duration > 0 && pm.info?.isLive != true {
-                GeometryReader { g in
-                    let prog = min(max(pm.currentTime / max(pm.duration, 1), 0), 1)
-                    Rectangle()
-                        .fill(Color.red)
-                        .frame(width: g.size.width * CGFloat(prog), height: 2)
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    GeometryReader { g in
+                        let prog = min(max(pm.currentTime / max(pm.duration, 1), 0), 1)
+                        Rectangle()
+                            .fill(Color.red)
+                            .frame(width: max(0, g.size.width * CGFloat(prog)), height: 2)
+                    }
+                    .frame(height: 2)
                 }
-                .frame(maxHeight: .infinity, alignment: .bottom)
                 .allowsHitTesting(false)
             }
         }
         .offset(y: vsc != .compact ? dragOffsetY : 0)
         .scaleEffect(vsc != .compact ? max(0.85, 1.0 - dragOffsetY / 1200) : 1.0)
         .simultaneousGesture(
-            // Cử chỉ chụm 2 ngón tay phóng to/thu nhỏ (Pinch to Zoom to Fill / Original 16:9)
             MagnificationGesture()
                 .onEnded { scale in
+                    guard !isDragging else { return }
                     if scale > 1.12 && videoGravity != .resizeAspectFill {
                         withAnimation(.easeInOut(duration: 0.25)) {
                             videoGravity = .resizeAspectFill
@@ -249,7 +232,46 @@ struct PlayerArea: View {
         .foregroundStyle(.white)
         .animation(.easeInOut(duration: 0.2), value: controlsVisible)
         .onAppear { scheduleHide() }
+        .onDisappear { resetTransientState() }
+        .onChange(of: pm.isPlaying) { playing in
+            if playing && controlsVisible {
+                scheduleHide()
+            } else if !playing {
+                hideTask?.cancel()
+            }
+        }
+        .onChange(of: pm.current?.id) { _ in
+            scrub = nil
+            dragOffsetY = 0
+            dragAxis = .none
+            isDragging = false
+            dragStart = nil
+            dragStartSideIsLeft = nil
+            hasTriggeredHorizontalSwipe = false
+            flash = nil
+            hud = nil
+            controlsVisible = true
+            scheduleHide()
+        }
         .onChange(of: maxHeight) { _ in pm.qualityChanged() }
+    }
+
+    private func resetTransientState() {
+        hideTask?.cancel()
+        flashTask?.cancel()
+        hudTask?.cancel()
+        scrub = nil
+        dragOffsetY = 0
+        dragAxis = .none
+        isDragging = false
+        dragStart = nil
+        dragStartSideIsLeft = nil
+        hasTriggeredHorizontalSwipe = false
+        pm.setBoost(false)
+    }
+
+    private var canSeekNow: Bool {
+        pm.info?.isLive != true && pm.duration.isFinite && pm.duration > 0
     }
 
     private func tapZone(delta: Double, isLeft: Bool) -> some View {
@@ -257,14 +279,16 @@ struct PlayerArea: View {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) {
+                    guard canSeekNow else { return }
                     pm.seek(by: delta)
                     showFlash(delta > 0 ? "+\(Int(delta))s" : "\(Int(delta))s")
                 }
                 .onTapGesture {
                     controlsVisible.toggle()
-                    if controlsVisible { scheduleHide() }
+                    if controlsVisible { scheduleHide() } else { hideTask?.cancel() }
                 }
                 .onLongPressGesture(minimumDuration: 0.4, perform: {
+                    guard !isDragging else { return }
                     pm.setBoost(true)
                 }, onPressingChanged: { pressing in
                     if !pressing { pm.setBoost(false) }
@@ -277,28 +301,30 @@ struct PlayerArea: View {
         }
     }
 
-    /// Xử lý cử chỉ vuốt đa hướng:
-    /// - Vuốt xuống ở chế độ dọc: Thu nhỏ video thành Mini-player
-    /// - Vuốt ngang: Tua nhanh 10 giây (+10s / -10s)
-    /// - Vuốt dọc ở chế độ xoay ngang: Điều chỉnh độ sáng (nửa trái) / Âm lượng (nửa phải)
     private func handleDrag(_ v: DragGesture.Value, isLeft: Bool, height: CGFloat) {
+        isDragging = true
         let dx = v.translation.width
         let dy = v.translation.height
 
-        // 1. Chế độ xoay ngang (Landscape compact): Vuốt dọc chỉnh độ sáng / âm lượng
-        if vsc == .compact && abs(dy) > abs(dx) {
-            adjust(v, isLeft: isLeft, height: height)
+        if dragAxis == .none {
+            if abs(dx) > 16 || abs(dy) > 16 {
+                dragAxis = abs(dx) > abs(dy) * 1.2 ? .horizontal : .vertical
+                dragStartSideIsLeft = isLeft
+            } else {
+                return
+            }
+        }
+
+        if dragAxis == .vertical {
+            if vsc == .compact {
+                adjust(v, isLeft: dragStartSideIsLeft ?? isLeft, height: height)
+            } else if dy > 0 {
+                dragOffsetY = dy
+            }
             return
         }
 
-        // 2. Chế độ dọc: Vuốt dọc xuống để thu nhỏ thành mini-player
-        if vsc != .compact && dy > 0 && dy > abs(dx) * 1.2 {
-            dragOffsetY = dy
-            return
-        }
-
-        // 3. Vuốt ngang để tua nhanh 10s (+10s hoặc -10s)
-        if abs(dx) > 50 && abs(dx) > abs(dy) * 1.4 && !hasTriggeredHorizontalSwipe {
+        if dragAxis == .horizontal && canSeekNow && abs(dx) > 50 && !hasTriggeredHorizontalSwipe {
             hasTriggeredHorizontalSwipe = true
             let seekDelta: Double = dx > 0 ? 10 : -10
             pm.seek(by: seekDelta)
@@ -310,29 +336,35 @@ struct PlayerArea: View {
     }
 
     private func handleDragEnd(_ v: DragGesture.Value, isLeft: Bool, height: CGFloat) {
+        isDragging = false
+        let axis = dragAxis
+        dragAxis = .none
         dragStart = nil
+        dragStartSideIsLeft = nil
         hideHUD()
         hasTriggeredHorizontalSwipe = false
 
-        // Kiểm tra ngưỡng vuốt xuống để thu nhỏ player
-        if vsc != .compact {
+        if axis == .vertical && vsc != .compact {
             if dragOffsetY > 70 || v.predictedEndTranslation.height > 200 {
                 #if canImport(UIKit)
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 #endif
+                dragOffsetY = 0
                 onClose()
             } else {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                     dragOffsetY = 0
                 }
             }
+        } else if dragOffsetY != 0 {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                dragOffsetY = 0
+            }
         }
     }
 
-    /// Full-screen only (in portrait a vertical drag belongs to the sheet's swipe-to-minimize):
-    /// left half = brightness, right half = volume.
     private func adjust(_ v: DragGesture.Value, isLeft: Bool, height: CGFloat) {
-        guard vsc == .compact, abs(v.translation.height) > abs(v.translation.width) else { return }
+        guard vsc == .compact else { return }
         let start = dragStart ?? (isLeft ? Float(UIScreen.main.brightness) : SystemVolume.value)
         dragStart = start
         let value = max(0, min(1, start - Float(v.translation.height / max(height * 0.8, 1))))
@@ -354,10 +386,11 @@ struct PlayerArea: View {
     }
 
     private func showFlash(_ text: String) {
+        flashTask?.cancel()
         flash = text
-        Task {
+        flashTask = Task {
             try? await Task.sleep(nanoseconds: 600_000_000)
-            if flash == text { flash = nil }
+            if !Task.isCancelled { flash = nil }
         }
     }
 
@@ -412,13 +445,17 @@ struct PlayerArea: View {
                 Spacer()
 
                 HStack(spacing: 34) {
-                    Button { pm.previous() } label: { Image(systemName: "backward.end.fill").font(.title3) }
-                    Button { pm.seek(by: -10) } label: { Image(systemName: "gobackward.10").font(.title2) }
+                    Button { pm.previous(); scheduleHide() } label: { Image(systemName: "backward.end.fill").font(.title3) }
+                    Button { pm.seek(by: -10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.title2) }
+                        .disabled(!canSeekNow)
+                        .opacity(canSeekNow ? 1 : 0.4)
                     Button { pm.togglePlay(); scheduleHide() } label: {
                         Image(systemName: pm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 42))
                     }
-                    Button { pm.seek(by: 10) } label: { Image(systemName: "goforward.10").font(.title2) }
-                    Button { pm.next() } label: { Image(systemName: "forward.end.fill").font(.title3) }
+                    Button { pm.seek(by: 10); scheduleHide() } label: { Image(systemName: "goforward.10").font(.title2) }
+                        .disabled(!canSeekNow)
+                        .opacity(canSeekNow ? 1 : 0.4)
+                    Button { pm.next(); scheduleHide() } label: { Image(systemName: "forward.end.fill").font(.title3) }
                 }
 
                 Spacer()
@@ -465,7 +502,7 @@ struct PlayerArea: View {
 
     private var settingsMenu: some View {
         Menu {
-            Picker(selection: Binding(get: { pm.rate }, set: { pm.setRate($0) })) {
+            Picker(selection: Binding(get: { pm.rate }, set: { pm.setRate($0); scheduleHide() })) {
                 ForEach([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3] as [Float], id: \.self) {
                     Text(Fmt.rate(Double($0))).tag($0)
                 }
@@ -487,7 +524,7 @@ struct PlayerArea: View {
             }
             .pickerStyle(.menu)
 
-            Toggle(isOn: Binding(get: { pm.audioOnly }, set: { _ in pm.toggleAudioOnly() })) {
+            Toggle(isOn: Binding(get: { pm.audioOnly }, set: { _ in pm.toggleAudioOnly(); scheduleHide() })) {
                 Label("Chỉ âm thanh", systemImage: "headphones")
             }
             Toggle(isOn: $pm.loop) { Label("Lặp lại", systemImage: "repeat.1") }
@@ -521,6 +558,7 @@ struct PlayerArea: View {
         } label: {
             Image(systemName: "gearshape")
         }
+        .simultaneousGesture(TapGesture().onEnded { hideTask?.cancel() })
     }
 
     private func qualityLabel(_ h: Int) -> String {
@@ -549,7 +587,7 @@ struct PlayerArea: View {
         hideTask?.cancel()
         hideTask = Task {
             try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard !Task.isCancelled, pm.isPlaying, scrub == nil else { return }
+            guard !Task.isCancelled, pm.isPlaying, scrub == nil, !isDragging else { return }
             controlsVisible = false
         }
     }
@@ -603,10 +641,14 @@ struct YouTubeInteractiveScrubber: View {
     @State private var isDragging = false
     @State private var lastChapterIndex: Int? = nil
 
+    private var canSeek: Bool {
+        duration.isFinite && duration > 0
+    }
+
     var body: some View {
-        let total = max(duration, 1)
-        let effectiveTime = scrub ?? currentTime
-        let progress = min(max(effectiveTime / total, 0), 1)
+        let total = canSeek ? duration : 0
+        let effectiveTime = (canSeek ? (scrub ?? currentTime) : currentTime)
+        let progress = total > 0 ? min(max(effectiveTime / total, 0), 1) : 0
 
         GeometryReader { geo in
             let width = geo.size.width
@@ -614,54 +656,49 @@ struct YouTubeInteractiveScrubber: View {
             let thumbRadius: CGFloat = isDragging ? 7 : 5
 
             ZStack(alignment: .leading) {
-                // Background track
                 Capsule()
                     .fill(Color.white.opacity(0.3))
                     .frame(height: trackHeight)
 
-                // Active red track
                 Capsule()
                     .fill(Color.red)
                     .frame(width: max(0, width * CGFloat(progress)), height: trackHeight)
 
-                // SponsorBlock highlighted segments on track
-                ForEach(segments.indices, id: \.self) { idx in
-                    let seg = segments[idx]
-                    if seg.end > seg.start && seg.start < total {
-                        let segStart = max(0, seg.start / total)
-                        let segEnd = min(1.0, seg.end / total)
-                        let segWidth = max(2, width * CGFloat(segEnd - segStart))
-                        Capsule()
-                            .fill(Color.green.opacity(0.85))
-                            .frame(width: segWidth, height: trackHeight)
-                            .offset(x: width * CGFloat(segStart))
+                if total > 0 {
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                        if seg.end > seg.start && seg.start < total {
+                            let segStart = max(0, seg.start / total)
+                            let segEnd = min(1.0, seg.end / total)
+                            let segWidth = max(2, width * CGFloat(segEnd - segStart))
+                            Capsule()
+                                .fill(Color.green.opacity(0.85))
+                                .frame(width: segWidth, height: trackHeight)
+                                .offset(x: width * CGFloat(segStart))
+                        }
+                    }
+
+                    ForEach(Array(chapters.enumerated()), id: \.offset) { _, ch in
+                        if ch.start > 0 && ch.start < total {
+                            let chFrac = ch.start / total
+                            Rectangle()
+                                .fill(Color.black.opacity(0.85))
+                                .frame(width: 2, height: trackHeight + 3)
+                                .offset(x: max(0, min(max(0, width - 2), width * CGFloat(chFrac) - 1)))
+                        }
                     }
                 }
 
-                // Chapter tick notches along the track
-                ForEach(chapters.indices, id: \.self) { idx in
-                    let ch = chapters[idx]
-                    if ch.start > 0 && ch.start < total {
-                        let chFrac = ch.start / total
-                        Rectangle()
-                            .fill(Color.black.opacity(0.85))
-                            .frame(width: 2, height: trackHeight + 3)
-                            .offset(x: max(0, min(width - 2, width * CGFloat(chFrac) - 1)))
-                    }
-                }
-
-                // Red thumb knob with glow
                 Circle()
                     .fill(Color.red)
                     .frame(width: thumbRadius * 2, height: thumbRadius * 2)
                     .shadow(color: Color.red.opacity(0.6), radius: isDragging ? 4 : 2)
-                    .offset(x: min(max(0, width * CGFloat(progress) - thumbRadius), width - thumbRadius * 2))
+                    .offset(x: min(max(0, width * CGFloat(progress) - thumbRadius), max(0, width - thumbRadius * 2)))
                     .scaleEffect(isDragging ? 1.25 : 1.0)
                     .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isDragging)
             }
             .frame(maxHeight: .infinity, alignment: .center)
             .overlay(alignment: .top) {
-                if isDragging || scrub != nil {
+                if canSeek && (isDragging || scrub != nil) {
                     floatingPreview(width: width, progress: progress, effectiveTime: effectiveTime, total: total)
                 }
             }
@@ -669,6 +706,7 @@ struct YouTubeInteractiveScrubber: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
+                        guard canSeek, width > 0 else { return }
                         if !isDragging {
                             isDragging = true
                             onScrubStart()
@@ -680,7 +718,6 @@ struct YouTubeInteractiveScrubber: View {
                         let target = frac * total
                         scrub = target
 
-                        // Haptic feedback when crossing chapter boundaries
                         let currentIdx = chapters.lastIndex(where: { $0.start <= target })
                         if currentIdx != lastChapterIndex {
                             if lastChapterIndex != nil {
@@ -694,22 +731,40 @@ struct YouTubeInteractiveScrubber: View {
                     .onEnded { g in
                         isDragging = false
                         lastChapterIndex = nil
-                        let frac = min(max(g.location.x / max(width, 1), 0), 1)
-                        let target = frac * total
                         scrub = nil
-                        onSeek(target)
+                        if canSeek && width > 0 {
+                            let frac = min(max(g.location.x / max(width, 1), 0), 1)
+                            onSeek(frac * total)
+                        }
                         onScrubEnd()
                     }
             )
         }
         .frame(height: 28)
+        .onDisappear {
+            if isDragging || scrub != nil {
+                isDragging = false
+                lastChapterIndex = nil
+                scrub = nil
+                onScrubEnd()
+            }
+        }
+        .onChange(of: canSeek) { valid in
+            if !valid {
+                isDragging = false
+                lastChapterIndex = nil
+                scrub = nil
+            }
+        }
     }
 
     @ViewBuilder
     private func floatingPreview(width: CGFloat, progress: Double, effectiveTime: Double, total: Double) -> some View {
         let thumbX = width * CGFloat(progress)
         let previewWidth: CGFloat = storyboard != nil ? CGFloat(storyboard!.width) : 130
-        let clampedCenterX = min(max(previewWidth / 2 + 6, thumbX), width - previewWidth / 2 - 6)
+        let minX = min(width / 2, previewWidth / 2 + 6)
+        let maxX = max(width / 2, width - previewWidth / 2 - 6)
+        let clampedCenterX = min(max(minX, thumbX), maxX)
         let currentChapter = Chapter.at(effectiveTime, in: chapters)
         let currentSponsor = segments.first(where: { effectiveTime >= $0.start && effectiveTime <= $0.end })
 
@@ -747,8 +802,7 @@ struct YouTubeInteractiveScrubber: View {
         }
         .frame(width: previewWidth)
         .position(x: clampedCenterX, y: storyboard != nil ? -(CGFloat(storyboard!.height) / 2 + 28) : -26)
-        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-        .animation(.easeOut(duration: 0.15), value: effectiveTime)
+        .allowsHitTesting(false)
     }
 }
 

@@ -145,49 +145,63 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
 
     private var nextOffset: String?
     private let loader: ((Int) async throws -> Page)?
+    private let continuationLoader: ((String?) async throws -> Page)?
     private let playlistId: String?
     private let albumId: String?
+    private var loadGeneration: UInt64 = 0
 
     init(
         metadata: SpotifyPlaylistMetadata,
         playlistId: String? = nil,
         albumId: String? = nil,
-        loader: (((Int) async throws -> Page))? = nil
+        loader: (((Int) async throws -> Page))? = nil,
+        continuationLoader: (((String?) async throws -> Page))? = nil
     ) {
         self.metadata = metadata
         self.playlistId = playlistId
         self.albumId = albumId
         self.loader = loader
+        self.continuationLoader = continuationLoader
         self.dominantColor = SpotifyColorExtractor.initialColor(for: metadata.title)
     }
 
     func load(reset: Bool = false) async {
-        guard !loading else { return }
+        guard reset || !loading else { return }
+        loadGeneration &+= 1
+        let generation = loadGeneration
         loading = true
         error = nil
 
-        // If loading for the first time, extract image color and fetch rich metadata if available
         if !loaded || reset {
-            Task {
-                if let extracted = await SpotifyColorExtractor.extractColor(from: metadata.coverURL) {
-                    withAnimation(.easeInOut(duration: 0.35)) {
-                        self.dominantColor = extracted
-                    }
-                }
-            }
-
             if let pid = playlistId {
                 await fetchPlaylistMetadata(id: pid)
             } else if let aid = albumId {
                 await fetchAlbumMetadata(id: aid)
             }
+            guard generation == loadGeneration, !Task.isCancelled else {
+                loading = false
+                return
+            }
+
+            let coverURL = metadata.coverURL
+            Task { [weak self] in
+                guard let self, let coverURL,
+                      let extracted = await SpotifyColorExtractor.extractColor(from: coverURL),
+                      self.loadGeneration == generation else { return }
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    self.dominantColor = extracted
+                }
+            }
         }
 
         do {
             let offset = reset ? 0 : (Int(nextOffset ?? "") ?? 0)
+            let token = reset ? nil : nextOffset
             let page: Page
 
-            if let customLoader = loader {
+            if let contLoader = continuationLoader {
+                page = try await contLoader(token)
+            } else if let customLoader = loader {
                 page = try await customLoader(offset)
             } else if let pid = playlistId {
                 page = try await SpotifyAPI.shared.playlistTracks(id: pid, offset: offset)
@@ -197,8 +211,14 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
                 page = Page()
             }
 
+            guard generation == loadGeneration, !Task.isCancelled else {
+                loading = false
+                return
+            }
+
             if reset {
                 tracks = page.videos
+                addedRecommendedTrackIds.removeAll()
             } else {
                 let seen = Set(tracks.map(\.id))
                 tracks += page.videos.filter { !seen.contains($0.id) }
@@ -209,17 +229,19 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
 
             // Automatically load recommended songs if not yet loaded
             if recommendedTracks.isEmpty && !tracks.isEmpty {
-                Task {
-                    await self.loadRecommendations()
+                Task { [weak self] in
+                    await self?.loadRecommendations()
                 }
             }
         } catch {
-            if !Task.isCancelled {
+            if generation == loadGeneration && !(error is CancellationError) && !Task.isCancelled {
                 self.error = error.localizedDescription
+                loaded = true
             }
-            loaded = true
         }
-        loading = false
+        if generation == loadGeneration {
+            loading = false
+        }
     }
 
     func loadRecommendations(refresh: Bool = false) async {
@@ -302,19 +324,27 @@ final class SpotifyPlaylistDetailModel: ObservableObject {
 
 // MARK: - Main View
 
+@MainActor
+private final class SpotifyScrollTracker: ObservableObject {
+    @Published var offsetY: CGFloat = 0
+}
+
 struct SpotifyPlaylistDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: SpotifyPlaylistDetailModel
-    @ObservedObject private var player = PlayerManager.shared
     @ObservedObject private var library = Library.shared
+    @State private var currentTrackId: String? = PlayerManager.shared.current?.id
+    @State private var isPlayerPlaying: Bool = PlayerManager.shared.isPlaying
 
-    @State private var scrollOffsetY: CGFloat = 0
+    @State private var scrollTracker = SpotifyScrollTracker()
     @State private var isLikedPlaylist = false
     @State private var isShuffle = false
     @State private var isDownloadingAll = false
     @State private var showOptionsActionSheet = false
     @State private var showShareSheet = false
     @AppStorage(Pref.endlessRadioKey) private var isEndlessRadio = true
+    private let likeStorageKey: String
+    private let player = PlayerManager.shared
 
     // Initializer with playlist ID
     init(playlistId: String, name: String, cover: URL? = nil, subtitle: String = "") {
@@ -325,6 +355,7 @@ struct SpotifyPlaylistDetailView: View {
             creatorName: "Spotify",
             isAlbum: false
         )
+        self.likeStorageKey = "pl:\(playlistId)"
         _model = StateObject(wrappedValue: SpotifyPlaylistDetailModel(metadata: meta, playlistId: playlistId))
     }
 
@@ -337,6 +368,7 @@ struct SpotifyPlaylistDetailView: View {
             creatorName: subtitle.isEmpty ? "Nghệ sĩ" : subtitle,
             isAlbum: true
         )
+        self.likeStorageKey = "al:\(albumId)"
         _model = StateObject(wrappedValue: SpotifyPlaylistDetailModel(metadata: meta, albumId: albumId))
     }
 
@@ -358,7 +390,30 @@ struct SpotifyPlaylistDetailView: View {
             likesCount: likesCount,
             isAlbum: isAlbum
         )
+        self.likeStorageKey = "custom:\(title):\(creator)"
         _model = StateObject(wrappedValue: SpotifyPlaylistDetailModel(metadata: meta, loader: loader))
+    }
+
+    // Generic initializer with cursor/continuation loader
+    init(
+        title: String,
+        cover: URL? = nil,
+        subtitle: String = "",
+        creator: String = "Spotify",
+        likesCount: Int? = nil,
+        isAlbum: Bool = false,
+        continuationLoader: @escaping (String?) async throws -> Page
+    ) {
+        let meta = SpotifyPlaylistMetadata(
+            title: title,
+            description: subtitle,
+            coverURL: cover,
+            creatorName: creator,
+            likesCount: likesCount,
+            isAlbum: isAlbum
+        )
+        self.likeStorageKey = "cont:\(title):\(creator)"
+        _model = StateObject(wrappedValue: SpotifyPlaylistDetailModel(metadata: meta, continuationLoader: continuationLoader))
     }
 
     var body: some View {
@@ -367,7 +422,10 @@ struct SpotifyPlaylistDetailView: View {
             SpotifyTheme.darkBackground.ignoresSafeArea()
 
             // Dynamic stretchy gradient pinned to top
-            stretchyGradientBackground
+            SpotifyStretchyHeaderGradient(
+                scrollTracker: scrollTracker,
+                dominantColor: model.dominantColor
+            )
 
             // Scrollable Content
             ScrollView(showsIndicators: false) {
@@ -408,7 +466,9 @@ struct SpotifyPlaylistDetailView: View {
             }
             .coordinateSpace(name: "SpotifyScroll")
             .onPreferenceChange(SpotifyScrollOffsetKey.self) { val in
-                scrollOffsetY = val
+                if abs(scrollTracker.offsetY - val) > 0.5 {
+                    scrollTracker.offsetY = val
+                }
             }
 
             // Sticky Navigation Bar with back button, fading title, and mini green play button
@@ -417,67 +477,44 @@ struct SpotifyPlaylistDetailView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .task {
+            let likedIds = Set(UserDefaults.standard.stringArray(forKey: "vidra_liked_playlists") ?? [])
+            isLikedPlaylist = likedIds.contains(likeStorageKey)
             if !model.loaded {
                 await model.load(reset: true)
+            }
+            if !model.tracks.isEmpty && model.tracks.allSatisfy({ DownloadManager.shared.isDownloaded($0.id) }) {
+                isDownloadingAll = true
             }
         }
         .refreshable {
             await model.load(reset: true)
+        }
+        .onReceive(PlayerManager.shared.$current) { cur in
+            if currentTrackId != cur?.id {
+                currentTrackId = cur?.id
+            }
+        }
+        .onReceive(PlayerManager.shared.$isPlaying) { playing in
+            if isPlayerPlaying != playing {
+                isPlayerPlaying = playing
+            }
         }
     }
 
     // MARK: - Stretchy Ambient Gradient
 
     private var stretchyGradientBackground: some View {
-        let stretch = max(0, scrollOffsetY)
-        let gradientHeight: CGFloat = 430 + stretch
-
-        return LinearGradient(
-            stops: [
-                .init(color: model.dominantColor.opacity(0.88), location: 0.0),
-                .init(color: model.dominantColor.opacity(0.55), location: 0.45),
-                .init(color: SpotifyTheme.darkBackground.opacity(0.95), location: 0.85),
-                .init(color: SpotifyTheme.darkBackground, location: 1.0)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .frame(height: gradientHeight)
-        .offset(y: -stretch)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
+        SpotifyStretchyHeaderGradient(scrollTracker: scrollTracker, dominantColor: model.dominantColor)
     }
 
     // MARK: - Artwork Header (Parallax + Stretch)
 
     private var artworkHeader: some View {
-        let stretch = max(0, scrollOffsetY)
-        let scale = 1.0 + (stretch / 380.0)
-        let translateY = min(0, scrollOffsetY) * 0.28
-        let opacity = max(0.0, 1.0 - (-min(0, scrollOffsetY) / 220.0))
-
-        return Color(.secondarySystemFill)
-            .frame(width: 200, height: 200)
-            .overlay {
-                CachedAsyncImage(url: model.metadata.coverURL, targetSize: CGSize(width: 300, height: 300)) { image in
-                    image
-                        .resizable()
-                        .scaledToFill()
-                } placeholder: {
-                    ZStack {
-                        Color(white: 0.2)
-                        Image(systemName: model.metadata.isAlbum ? "opticaldisc" : "music.note.list")
-                            .font(.system(size: 54, weight: .light))
-                            .foregroundStyle(SpotifyTheme.secondaryText)
-                    }
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .shadow(color: Color.black.opacity(0.65), radius: 22, x: 0, y: 12)
-            .scaleEffect(scale, anchor: .bottom)
-            .offset(y: translateY)
-            .opacity(opacity)
-            .frame(maxWidth: .infinity, alignment: .center)
+        SpotifyParallaxArtworkHeader(
+            scrollTracker: scrollTracker,
+            coverURL: model.metadata.coverURL,
+            isAlbum: model.metadata.isAlbum
+        )
     }
 
     // MARK: - Metadata Section
@@ -759,11 +796,11 @@ struct SpotifyPlaylistDetailView: View {
                 .padding(.top, 40)
             }
 
-            ForEach(Array(model.tracks.enumerated()), id: \.element.id) { index, track in
+            ForEach(Array(model.tracks.enumerated()), id: \.offset) { index, track in
                 SpotifyTrackRow(
                     index: index + 1,
                     track: track,
-                    isPlaying: player.current?.id == track.id,
+                    isPlaying: currentTrackId == track.id,
                     isAlbumMode: model.metadata.isAlbum,
                     onTap: {
                         playTrack(at: index)
@@ -986,79 +1023,21 @@ struct SpotifyPlaylistDetailView: View {
     // MARK: - Sticky Top Navigation Bar
 
     private var stickyNavigationBar: some View {
-        let scrollY = -min(0, scrollOffsetY)
-        let navOpacity = min(max((scrollY - 140) / 70.0, 0), 1.0)
-        let showMiniPlay = scrollY > 280
-
-        return ZStack {
-            // Blurred background that fades in on scroll
-            Rectangle()
-                .fill(SpotifyTheme.darkBackground.opacity(navOpacity * 0.98))
-                .overlay {
-                    Rectangle()
-                        .fill(model.dominantColor.opacity(navOpacity * 0.25))
-                }
-                .ignoresSafeArea(edges: .top)
-                .frame(height: 52)
-                .opacity(navOpacity)
-
-            HStack(spacing: 12) {
-                // Back Button
-                Button {
-                    dismiss()
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Color.black.opacity(0.45))
-                            .frame(width: 34, height: 34)
-
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                }
-                .buttonStyle(.plain)
-
-                // Sticky Title
-                Text(model.metadata.title)
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .opacity(navOpacity)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                // Mini Green 40pt Play Button (signature Spotify iOS behavior)
-                if showMiniPlay {
-                    Button {
-                        togglePlayAll()
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(SpotifyTheme.green)
-                                .frame(width: 40, height: 40)
-                                .shadow(color: SpotifyTheme.green.opacity(0.3), radius: 6, y: 2)
-
-                            Image(systemName: isCurrentlyPlayingThisPlaylist ? "pause.fill" : "play.fill")
-                                .font(.system(size: 17, weight: .bold))
-                                .foregroundStyle(.black)
-                                .offset(x: isCurrentlyPlayingThisPlaylist ? 0 : 1.5)
-                        }
-                    }
-                    .buttonStyle(SpotifyScaleButtonStyle())
-                    .transition(.scale.combined(with: .opacity))
-                }
-            }
-            .padding(.horizontal, 16)
-            .frame(height: 52)
-        }
-        .animation(.easeInOut(duration: 0.2), value: showMiniPlay)
+        SpotifyStickyNavigationBarOverlay(
+            scrollTracker: scrollTracker,
+            title: model.metadata.title,
+            dominantColor: model.dominantColor,
+            isPlayingThisPlaylist: isCurrentlyPlayingThisPlaylist,
+            onBack: { dismiss() },
+            onTogglePlay: { togglePlayAll() }
+        )
     }
 
     // MARK: - Actions & Helpers
 
     private var isCurrentlyPlayingThisPlaylist: Bool {
-        guard let currentId = player.current?.id else { return false }
-        return model.tracks.contains { $0.id == currentId } && player.isPlaying
+        guard let currentId = currentTrackId else { return false }
+        return model.tracks.contains { $0.id == currentId } && isPlayerPlaying
     }
 
     private func togglePlayAll() {
@@ -1066,10 +1045,10 @@ struct SpotifyPlaylistDetailView: View {
         gen.impactOccurred()
 
         if isCurrentlyPlayingThisPlaylist {
-            player.player.pause()
-        } else if let currentId = player.current?.id,
-                  let match = model.tracks.first(where: { $0.id == currentId }) {
-            player.play(match)
+            player.pause()
+        } else if let currentId = currentTrackId,
+                  model.tracks.contains(where: { $0.id == currentId }) {
+            player.resume()
         } else {
             playAll(shuffle: isShuffle)
         }
@@ -1099,9 +1078,16 @@ struct SpotifyPlaylistDetailView: View {
     private func togglePlaylistLike() {
         let gen = UIImpactFeedbackGenerator(style: .light)
         gen.impactOccurred()
+        var liked = Set(UserDefaults.standard.stringArray(forKey: "vidra_liked_playlists") ?? [])
         withAnimation(.spring(response: 0.25, dampingFraction: 0.6)) {
             isLikedPlaylist.toggle()
         }
+        if isLikedPlaylist {
+            liked.insert(likeStorageKey)
+        } else {
+            liked.remove(likeStorageKey)
+        }
+        UserDefaults.standard.set(Array(liked), forKey: "vidra_liked_playlists")
     }
 
     private func downloadAllTracks() {
@@ -1110,10 +1096,144 @@ struct SpotifyPlaylistDetailView: View {
         withAnimation {
             isDownloadingAll.toggle()
         }
-        guard isDownloadingAll else { return }
-        for track in model.tracks {
-            DownloadManager.shared.start(track, audioOnly: true)
+        if isDownloadingAll {
+            for track in model.tracks where !DownloadManager.shared.isDownloaded(track.id) && DownloadManager.shared.active[track.id] == nil {
+                DownloadManager.shared.start(track, audioOnly: true)
+            }
+        } else {
+            for track in model.tracks {
+                DownloadManager.shared.cancel(track.id)
+            }
         }
+    }
+}
+
+private struct SpotifyStretchyHeaderGradient: View {
+    @ObservedObject var scrollTracker: SpotifyScrollTracker
+    let dominantColor: Color
+
+    var body: some View {
+        let stretch = max(0, scrollTracker.offsetY)
+        let gradientHeight: CGFloat = 430 + stretch
+
+        return LinearGradient(
+            colors: [
+                dominantColor.opacity(0.95),
+                dominantColor.opacity(0.45),
+                SpotifyTheme.darkBackground
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .frame(height: gradientHeight)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+}
+
+private struct SpotifyParallaxArtworkHeader: View {
+    @ObservedObject var scrollTracker: SpotifyScrollTracker
+    let coverURL: URL?
+    let isAlbum: Bool
+
+    var body: some View {
+        let stretch = max(0, scrollTracker.offsetY)
+        let scale = 1.0 + (stretch / 380.0)
+        let translateY = min(0, scrollTracker.offsetY) * 0.28
+        let opacity = max(0.0, 1.0 - (-min(0, scrollTracker.offsetY) / 220.0))
+
+        return Color(.secondarySystemFill)
+            .frame(width: 200, height: 200)
+            .overlay {
+                CachedAsyncImage(url: coverURL, targetSize: CGSize(width: 300, height: 300)) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    ZStack {
+                        Color(white: 0.2)
+                        Image(systemName: isAlbum ? "opticaldisc" : "music.note.list")
+                            .font(.system(size: 54, weight: .light))
+                            .foregroundStyle(SpotifyTheme.secondaryText)
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .shadow(color: Color.black.opacity(0.65), radius: 22, x: 0, y: 12)
+            .scaleEffect(scale, anchor: .bottom)
+            .offset(y: translateY)
+            .opacity(opacity)
+            .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+private struct SpotifyStickyNavigationBarOverlay: View {
+    @ObservedObject var scrollTracker: SpotifyScrollTracker
+    let title: String
+    let dominantColor: Color
+    let isPlayingThisPlaylist: Bool
+    let onBack: () -> Void
+    let onTogglePlay: () -> Void
+
+    var body: some View {
+        let scrollY = -min(0, scrollTracker.offsetY)
+        let navOpacity = min(max((scrollY - 140) / 70.0, 0), 1.0)
+        let showMiniPlay = scrollY > 280
+
+        return HStack(spacing: 12) {
+            Button(action: onBack) {
+                ZStack {
+                    Circle()
+                        .fill(Color.black.opacity(0.45))
+                        .frame(width: 34, height: 34)
+
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Text(title)
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .opacity(navOpacity)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if showMiniPlay {
+                Button(action: onTogglePlay) {
+                    ZStack {
+                        Circle()
+                            .fill(SpotifyTheme.green)
+                            .frame(width: 40, height: 40)
+                            .shadow(color: SpotifyTheme.green.opacity(0.3), radius: 6, y: 2)
+
+                        Image(systemName: isPlayingThisPlaylist ? "pause.fill" : "play.fill")
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundStyle(.black)
+                            .offset(x: isPlayingThisPlaylist ? 0 : 1.5)
+                    }
+                }
+                .buttonStyle(SpotifyScaleButtonStyle())
+                .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 52)
+        .frame(maxWidth: .infinity)
+        .background {
+            Rectangle()
+                .fill(SpotifyTheme.darkBackground.opacity(navOpacity * 0.98))
+                .overlay {
+                    Rectangle()
+                        .fill(dominantColor.opacity(navOpacity * 0.25))
+                }
+                .opacity(navOpacity)
+                .ignoresSafeArea(edges: .top)
+        }
+        .animation(.easeInOut(duration: 0.2), value: showMiniPlay)
     }
 }
 
@@ -1126,9 +1246,10 @@ struct SpotifyTrackRow: View {
     var isAlbumMode: Bool = false
     let onTap: () -> Void
 
-    @ObservedObject private var player = PlayerManager.shared
     @ObservedObject private var library = Library.shared
+    @State private var isPlayerPlaying: Bool = PlayerManager.shared.isPlaying
     @State private var showRemap = false
+    private let player = PlayerManager.shared
 
     private var isExplicit: Bool {
         let t = track.title.lowercased()
@@ -1189,7 +1310,7 @@ struct SpotifyTrackRow: View {
                     }
 
                     Button {
-                        player.queue.append(track)
+                        player.appendToQueue(track)
                     } label: {
                         Label("Thêm vào hàng đợi", systemImage: "text.badge.plus")
                     }
@@ -1234,6 +1355,11 @@ struct SpotifyTrackRow: View {
         .sheet(isPresented: $showRemap) {
             SpotifyRemapSheet(video: track)
         }
+        .onReceive(PlayerManager.shared.$isPlaying) { playing in
+            if isPlayerPlaying != playing {
+                isPlayerPlaying = playing
+            }
+        }
     }
 
     @ViewBuilder
@@ -1258,7 +1384,7 @@ struct SpotifyTrackRow: View {
                 ZStack {
                     RoundedRectangle(cornerRadius: 4)
                         .fill(Color.black.opacity(0.6))
-                    Image(systemName: player.isPlaying ? "speaker.wave.2.fill" : "speaker.fill")
+                    Image(systemName: isPlayerPlaying ? "speaker.wave.2.fill" : "speaker.fill")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(SpotifyTheme.green)
                 }

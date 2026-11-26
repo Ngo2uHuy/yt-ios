@@ -8,17 +8,20 @@ final class Library: ObservableObject {
     nonisolated static let fileURL = FileManager.default
         .urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("library.json")
+    private nonisolated static let ioQueue = DispatchQueue(label: "vidra.library.io", qos: .utility)
 
-    @Published var subscriptions: [Channel] = [] { didSet { scheduleSave() } }
-    @Published var history: [HistoryItem] = [] { didSet { scheduleSave() } }
-    @Published var watchLater: [Video] = [] { didSet { scheduleSave() } }
-    @Published var playlists: [LocalPlaylist] = [] { didSet { scheduleSave() } }
+    @Published var subscriptions: [Channel] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
+    @Published var history: [HistoryItem] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
+    @Published var watchLater: [Video] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
+    @Published var playlists: [LocalPlaylist] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
     /// Music tracks from any source (YT Music / Spotify).
-    @Published var likedTracks: [Video] = [] { didSet { scheduleSave() } }
+    @Published var likedTracks: [Video] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
     /// Followed music artists (Spotify artists "spa:…", etc.).
-    @Published var followedArtists: [Channel] = [] { didSet { scheduleSave() } }
-    // Not @Published: it changes every few seconds during playback.
+    @Published var followedArtists: [Channel] = [] { didSet { if !suppressAutoSave { scheduleSave() } } }
+
+    // Not @Published: changes frequently during playback.
     private var positions: [String: Double] = [:]
+    private var suppressAutoSave = false
     private var saveTask: Task<Void, Never>?
     private var throttledSaveTask: Task<Void, Never>?
     private var lastThrottledSaveTime: Date = .distantPast
@@ -38,7 +41,7 @@ final class Library: ObservableObject {
             self.history = history
             self.watchLater = watchLater
             self.playlists = playlists
-            self.positions = positions
+            self.positions = positions.filter { $0.value.isFinite && $0.value >= 0 }
             self.likedTracks = likedTracks
             self.followedArtists = followedArtists
         }
@@ -50,21 +53,24 @@ final class Library: ObservableObject {
             history = try c.decodeIfPresent([HistoryItem].self, forKey: .history) ?? []
             watchLater = try c.decodeIfPresent([Video].self, forKey: .watchLater) ?? []
             playlists = try c.decodeIfPresent([LocalPlaylist].self, forKey: .playlists) ?? []
-            positions = try c.decodeIfPresent([String: Double].self, forKey: .positions) ?? [:]
+            let rawPos = try c.decodeIfPresent([String: Double].self, forKey: .positions) ?? [:]
+            positions = rawPos.filter { $0.value.isFinite && $0.value >= 0 }
             likedTracks = try c.decodeIfPresent([Video].self, forKey: .likedTracks) ?? []
             followedArtists = try c.decodeIfPresent([Channel].self, forKey: .followedArtists) ?? []
         }
     }
 
     private init() {
-        guard let data = try? Data(contentsOf: Self.fileURL) else { return }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: Self.fileURL.path),
+              let data = try? Data(contentsOf: Self.fileURL) else { return }
         guard let s = try? JSONDecoder().decode(Snapshot.self, from: data) else {
-            // Keep the unreadable file instead of overwriting it on the next save.
             let backup = Self.fileURL.deletingLastPathComponent()
                 .appendingPathComponent("library.corrupt-\(Int(Date().timeIntervalSince1970)).json")
-            try? FileManager.default.moveItem(at: Self.fileURL, to: backup)
+            try? fm.moveItem(at: Self.fileURL, to: backup)
             return
         }
+        suppressAutoSave = true
         subscriptions = s.subscriptions
         history = s.history
         watchLater = s.watchLater
@@ -72,12 +78,14 @@ final class Library: ObservableObject {
         positions = s.positions
         likedTracks = s.likedTracks
         followedArtists = s.followedArtists
+        suppressAutoSave = false
     }
 
     // MARK: Persistence
 
     func restoreBackup(from data: Data) -> Bool {
         guard let s = try? JSONDecoder().decode(Snapshot.self, from: data) else { return false }
+        suppressAutoSave = true
         subscriptions = s.subscriptions
         history = s.history
         watchLater = s.watchLater
@@ -85,6 +93,7 @@ final class Library: ObservableObject {
         positions = s.positions
         likedTracks = s.likedTracks
         followedArtists = s.followedArtists
+        suppressAutoSave = false
         write()
         return true
     }
@@ -97,8 +106,11 @@ final class Library: ObservableObject {
         let s = Snapshot(subscriptions: subscriptions, history: history, watchLater: watchLater,
                          playlists: playlists, positions: positions,
                          likedTracks: likedTracks, followedArtists: followedArtists)
-        if let data = try? JSONEncoder().encode(s) {
-            try? data.write(to: Self.fileURL, options: .atomic)
+        let url = Self.fileURL
+        Self.ioQueue.sync {
+            if let data = try? JSONEncoder().encode(s) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
@@ -116,7 +128,7 @@ final class Library: ObservableObject {
                          playlists: playlists, positions: positions,
                          likedTracks: likedTracks, followedArtists: followedArtists)
         let fileURL = Self.fileURL
-        Task.detached(priority: .utility) {
+        Self.ioQueue.async {
             guard let data = try? JSONEncoder().encode(s) else { return }
             try? data.write(to: fileURL, options: .atomic)
         }
@@ -143,17 +155,21 @@ final class Library: ObservableObject {
 
     /// Google Takeout `subscriptions.csv`: Channel Id,Channel Url,Channel Title
     func importTakeout(_ csv: String) -> Int {
-        var added = 0
-        for line in csv.split(whereSeparator: \.isNewline) {
+        let cleanCSV = csv.hasPrefix("\u{FEFF}") ? String(csv.dropFirst()) : csv
+        var existing = Set(subscriptions.map(\.id))
+        var appended: [Channel] = []
+        for line in cleanCSV.split(whereSeparator: \.isNewline) {
             let parts = line.split(separator: ",", maxSplits: 2, omittingEmptySubsequences: false).map {
                 $0.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
             }
-            guard parts.count == 3, parts[0].hasPrefix("UC"), !isSubscribed(parts[0]) else { continue }
-            subscriptions.append(Channel(id: parts[0], title: parts[2]))
-            added += 1
+            guard parts.count == 3, parts[0].hasPrefix("UC"), existing.insert(parts[0]).inserted else { continue }
+            appended.append(Channel(id: parts[0], title: parts[2]))
         }
-        sortSubscriptions()
-        return added
+        guard !appended.isEmpty else { return 0 }
+        var combined = subscriptions + appended
+        combined.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        subscriptions = combined
+        return appended.count
     }
 
     private func sortSubscriptions() {
@@ -178,13 +194,28 @@ final class Library: ObservableObject {
     func position(_ id: String) -> Double { positions[id] ?? 0 }
 
     func setPosition(_ id: String, _ seconds: Double?, persist: Bool = false) {
-        positions[id] = seconds
+        if let seconds {
+            guard seconds.isFinite, seconds >= 0 else { return }
+            positions[id] = seconds
+        } else {
+            positions[id] = nil
+        }
         if positions.count > 3000 {
-            let keep = Set(history.map(\.id))
-            positions = positions.filter { keep.contains($0.key) }
+            if Pref.saveHistory && !history.isEmpty {
+                let keep = Set(history.map(\.id))
+                positions = positions.filter { keep.contains($0.key) || $0.key == id }
+            } else {
+                // Keep most recent batch rather than wiping all saved positions.
+                let trimmed = Array(positions.keys.prefix(1500))
+                var nextPos: [String: Double] = [:]
+                for k in trimmed { nextPos[k] = positions[k] }
+                if let s = seconds { nextPos[id] = s }
+                positions = nextPos
+            }
         }
         if persist {
-            scheduleSave()
+            saveTask?.cancel()
+            write()
         } else {
             scheduleThrottledSave()
         }
@@ -245,7 +276,8 @@ final class Library: ObservableObject {
 
     @discardableResult
     func createPlaylist(_ name: String) -> UUID {
-        let p = LocalPlaylist(name: name.trimmingCharacters(in: .whitespaces))
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = LocalPlaylist(name: trimmed.isEmpty ? "Danh sách phát mới" : trimmed)
         playlists.append(p)
         return p.id
     }
@@ -279,19 +311,36 @@ final class Library: ObservableObject {
 
     func remove(at offsets: IndexSet, from source: LocalSource) {
         switch source {
-        case .liked: likedTracks.remove(atOffsets: offsets)
-        case .watchLater: watchLater.remove(atOffsets: offsets)
+        case .liked:
+            let valid = offsets.filter { likedTracks.indices.contains($0) }
+            likedTracks.remove(atOffsets: IndexSet(valid))
+        case .watchLater:
+            let valid = offsets.filter { watchLater.indices.contains($0) }
+            watchLater.remove(atOffsets: IndexSet(valid))
         case .playlist(let id):
-            if let i = playlists.firstIndex(where: { $0.id == id }) { playlists[i].videos.remove(atOffsets: offsets) }
+            if let i = playlists.firstIndex(where: { $0.id == id }) {
+                let valid = offsets.filter { playlists[i].videos.indices.contains($0) }
+                playlists[i].videos.remove(atOffsets: IndexSet(valid))
+            }
         }
     }
 
     func move(from offsets: IndexSet, to dest: Int, in source: LocalSource) {
         switch source {
-        case .liked: likedTracks.move(fromOffsets: offsets, toOffset: dest)
-        case .watchLater: watchLater.move(fromOffsets: offsets, toOffset: dest)
+        case .liked:
+            let valid = offsets.filter { likedTracks.indices.contains($0) }
+            let clamped = min(max(0, dest), likedTracks.count)
+            if !valid.isEmpty { likedTracks.move(fromOffsets: IndexSet(valid), toOffset: clamped) }
+        case .watchLater:
+            let valid = offsets.filter { watchLater.indices.contains($0) }
+            let clamped = min(max(0, dest), watchLater.count)
+            if !valid.isEmpty { watchLater.move(fromOffsets: IndexSet(valid), toOffset: clamped) }
         case .playlist(let id):
-            if let i = playlists.firstIndex(where: { $0.id == id }) { playlists[i].videos.move(fromOffsets: offsets, toOffset: dest) }
+            if let i = playlists.firstIndex(where: { $0.id == id }) {
+                let valid = offsets.filter { playlists[i].videos.indices.contains($0) }
+                let clamped = min(max(0, dest), playlists[i].videos.count)
+                if !valid.isEmpty { playlists[i].videos.move(fromOffsets: IndexSet(valid), toOffset: clamped) }
+            }
         }
     }
 }

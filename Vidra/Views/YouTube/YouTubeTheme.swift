@@ -375,58 +375,66 @@ struct YouTubeCategoryChips: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                // Explore / Compass Leading Chip (like YouTube iOS)
-                if showExploreButton {
-                    Button {
-                        onExploreTap?()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "safari")
-                                .font(.system(size: 14, weight: .semibold))
-                            Text("Khám phá")
-                                .font(.system(size: 13, weight: .medium))
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(YTColor.chipBackground, in: Capsule())
-                        .foregroundStyle(YTColor.textPrimary)
-                    }
-                    .buttonStyle(.plain)
-
-                    // Vertical separator between Explore and Categories
-                    Rectangle()
-                        .fill(YTColor.separator)
-                        .frame(width: 1, height: 20)
-                        .padding(.trailing, 2)
-                }
-
-                // Category Chips
-                ForEach(categories, id: \.self) { category in
-                    let isSelected = selectedCategory == category
-
-                    Button {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
-                            selectedCategory = category
-                        }
-                        onSelect?(category)
-                    } label: {
-                        Text(category)
-                            .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
-                            .padding(.horizontal, 14)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    // Explore / Compass Leading Chip (like YouTube iOS)
+                    if showExploreButton {
+                        Button {
+                            onExploreTap?()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "safari")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("Khám phá")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .padding(.horizontal, 12)
                             .padding(.vertical, 7)
-                            .background(
-                                isSelected ? YTColor.chipActiveBackground : YTColor.chipBackground,
-                                in: Capsule()
-                            )
-                            .foregroundStyle(isSelected ? YTColor.chipActiveText : YTColor.textPrimary)
+                            .background(YTColor.chipBackground, in: Capsule())
+                            .foregroundStyle(YTColor.textPrimary)
+                        }
+                        .buttonStyle(.plain)
+
+                        // Vertical separator between Explore and Categories
+                        Rectangle()
+                            .fill(YTColor.separator)
+                            .frame(width: 1, height: 20)
+                            .padding(.trailing, 2)
                     }
-                    .buttonStyle(.plain)
+
+                    // Category Chips
+                    ForEach(categories, id: \.self) { category in
+                        let isSelected = selectedCategory == category
+
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+                                selectedCategory = category
+                            }
+                            onSelect?(category)
+                        } label: {
+                            Text(category)
+                                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .background(
+                                    isSelected ? YTColor.chipActiveBackground : YTColor.chipBackground,
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(isSelected ? YTColor.chipActiveText : YTColor.textPrimary)
+                        }
+                        .buttonStyle(.plain)
+                        .id(category)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .onChange(of: selectedCategory) { cat in
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(cat, anchor: .center)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
         }
         .background(YTColor.background)
     }
@@ -710,9 +718,10 @@ struct YouTubeFeedCard: View {
                     GeometryReader { geo in
                         Rectangle()
                             .fill(YTColor.brandRed)
-                            .frame(width: geo.size.width * min(progress, 1), height: 3)
-                            .frame(maxHeight: .infinity, alignment: .bottom)
+                            .frame(width: geo.size.width * min(max(progress, 0), 1), height: 3)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                     }
+                    .allowsHitTesting(false)
                 }
 
                 // Duration badge

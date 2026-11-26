@@ -15,22 +15,39 @@ struct Chapter: Identifiable {
     )
 
     /// Chapters come from timestamp lines in the description (same rule YouTube uses:
-    /// first at 0:00, at least three, ascending).
+    /// first at 0:00, at least three ascending entries).
     static func parse(_ description: String) -> [Chapter] {
         guard let re = regex else { return [] }
         let ns = description as NSString
         var out: [Chapter] = []
+        var started = false
         for m in re.matches(in: description, range: NSRange(location: 0, length: ns.length)) {
             guard let t = Fmt.seconds(ns.substring(with: m.range(at: 1))) else { continue }
-            out.append(Chapter(start: t, title: ns.substring(with: m.range(at: 2))))
+            let rawTitle = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawTitle.isEmpty else { continue }
+            if !started {
+                if t == 0 {
+                    started = true
+                    out = [Chapter(start: t, title: rawTitle)]
+                }
+            } else if let prev = out.last {
+                if t > prev.start {
+                    out.append(Chapter(start: t, title: rawTitle))
+                } else if out.count >= 3 {
+                    // Ignore out-of-order footer timestamps once a valid chapter block was parsed.
+                    break
+                } else {
+                    started = false
+                    out.removeAll()
+                }
+            }
         }
-        let ascending = zip(out, out.dropFirst()).allSatisfy { $0.start < $1.start }
-        guard out.count >= 3, out.first?.start == 0, ascending else { return [] }
-        return out
+        return out.count >= 3 ? out : []
     }
 
     static func at(_ time: Double, in chapters: [Chapter]) -> Chapter? {
-        chapters.last { $0.start <= time }
+        guard time.isFinite else { return nil }
+        return chapters.last { $0.start <= time }
     }
 }
 
@@ -53,25 +70,34 @@ struct Storyboard {
         let level = parts.count - 2 // highest-resolution level
         let f = parts[parts.count - 1].split(separator: "#", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 8, let w = Int(f[0]), let h = Int(f[1]), let n = Int(f[2]),
-              let c = Int(f[3]), let r = Int(f[4]), c > 0, r > 0 else { return nil }
+              let c = Int(f[3]), let r = Int(f[4]), w > 0, h > 0, n > 0, c > 0, r > 0 else { return nil }
         var url = parts[0]
             .replacingOccurrences(of: "$L", with: String(level))
             .replacingOccurrences(of: "$N", with: f[6])
-        url += (url.contains("?") ? "&" : "?") + "sigh=" + f[7]
+        if !f[7].isEmpty {
+            let encodedSigh = f[7].addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? f[7]
+            url += (url.contains("?") ? "&" : "?") + "sigh=" + encodedSigh
+        }
         template = url
         width = w
         height = h
         count = n
         cols = c
         rows = r
-        interval = (Double(f[5]) ?? 0) / 1000
+        interval = max(0, (Double(f[5]) ?? 0) / 1000)
     }
 
     func frame(at time: Double, duration: Double) -> (url: URL, col: Int, row: Int)? {
-        let per = interval > 0 ? interval : (count > 0 ? duration / Double(count) : 0)
-        guard per > 0 else { return nil }
-        let index = min(Int(time / per), max(count - 1, 0))
+        guard time.isFinite else { return nil }
+        let safeDur = (duration.isFinite && duration > 0) ? duration : 0
+        let per = interval > 0 ? interval : (count > 0 ? safeDur / Double(count) : 0)
+        guard per.isFinite, per > 0 else { return nil }
+        let safeTime = max(0, time)
+        let rawIndex = safeTime / per
+        guard rawIndex.isFinite else { return nil }
+        let index = max(0, min(Int(rawIndex), max(count - 1, 0)))
         let perPage = cols * rows
+        guard perPage > 0 else { return nil }
         let within = index % perPage
         guard let url = URL(string: template.replacingOccurrences(of: "$M", with: String(index / perPage))) else { return nil }
         return (url, within % cols, within / cols)
@@ -83,19 +109,31 @@ struct StoryboardThumb: View {
     let time: Double
     let duration: Double
 
+    @State private var loadedURL: URL?
+    @State private var loadedImage: UIImage?
+
     var body: some View {
-        if let f = board.frame(at: time, duration: duration) {
-            let w = CGFloat(board.width), h = CGFloat(board.height)
-            // Sprite sheet at native size, shifted so the wanted cell sits in the clip window.
-            AsyncImage(url: f.url) { img in
-                img.offset(x: -w * CGFloat(f.col), y: -h * CGFloat(f.row))
-            } placeholder: {
+        let f = board.frame(at: time, duration: duration)
+        let w = CGFloat(board.width), h = CGFloat(board.height)
+        if let f {
+            ZStack(alignment: .topLeading) {
                 Color.black
+                if loadedURL == f.url, let img = loadedImage {
+                    Image(uiImage: img)
+                        .offset(x: -w * CGFloat(f.col), y: -h * CGFloat(f.row))
+                }
             }
             .frame(width: w, height: h, alignment: .topLeading)
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white, lineWidth: 1.5))
+            .task(id: f.url) {
+                let sheetSize = CGSize(width: w * CGFloat(board.cols), height: h * CGFloat(board.rows))
+                if let img = await ImageCache.shared.load(url: f.url, targetSize: sheetSize, scale: 1.0) {
+                    loadedURL = f.url
+                    loadedImage = img
+                }
+            }
         }
     }
 }
@@ -112,7 +150,9 @@ struct SystemVolumeView: UIViewRepresentable {
         return v
     }
 
-    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {
+        if SystemVolume.view !== uiView { SystemVolume.view = uiView }
+    }
 }
 
 @MainActor
@@ -122,8 +162,16 @@ enum SystemVolume {
     static var value: Float { AVAudioSession.sharedInstance().outputVolume }
 
     static func set(_ value: Float) {
-        guard let slider = view?.subviews.compactMap({ $0 as? UISlider }).first else { return }
+        guard let v = view, let slider = findSlider(in: v) else { return }
         slider.value = max(0, min(1, value))
+    }
+
+    private static func findSlider(in root: UIView) -> UISlider? {
+        for sub in root.subviews {
+            if let slider = sub as? UISlider { return slider }
+            if let found = findSlider(in: sub) { return found }
+        }
+        return nil
     }
 }
 

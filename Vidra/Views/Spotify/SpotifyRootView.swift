@@ -36,6 +36,7 @@ enum SpotifyTab: Int, CaseIterable, Identifiable {
 struct SpotifyRootView: View {
     @State private var selectedTab: SpotifyTab = .home
     @State private var showNowPlaying = false
+    @State private var showConnectSheet = false
     private let pm = PlayerManager.shared
 
     init() {
@@ -51,7 +52,11 @@ struct SpotifyRootView: View {
                 NavigationStack {
                     SpotifyHomeFeedView()
                 }
-                .withSpotifyMiniPlayer(onTap: { showNowPlaying = true })
+                .withSpotifyMiniPlayer(
+                    isVisible: selectedTab == .home,
+                    onTap: { showNowPlaying = true },
+                    onDeviceTap: { showConnectSheet = true }
+                )
                 .tabItem {
                     Label(SpotifyTab.home.title, systemImage: SpotifyTab.home.icon)
                 }
@@ -61,7 +66,11 @@ struct SpotifyRootView: View {
                 NavigationStack {
                     SpotifySearchBrowseView()
                 }
-                .withSpotifyMiniPlayer(onTap: { showNowPlaying = true })
+                .withSpotifyMiniPlayer(
+                    isVisible: selectedTab == .search,
+                    onTap: { showNowPlaying = true },
+                    onDeviceTap: { showConnectSheet = true }
+                )
                 .tabItem {
                     Label(SpotifyTab.search.title, systemImage: SpotifyTab.search.icon)
                 }
@@ -71,7 +80,11 @@ struct SpotifyRootView: View {
                 NavigationStack {
                     SpotifyLibraryView()
                 }
-                .withSpotifyMiniPlayer(onTap: { showNowPlaying = true })
+                .withSpotifyMiniPlayer(
+                    isVisible: selectedTab == .library,
+                    onTap: { showNowPlaying = true },
+                    onDeviceTap: { showConnectSheet = true }
+                )
                 .tabItem {
                     Label(SpotifyTab.library.title, systemImage: SpotifyTab.library.icon)
                 }
@@ -83,6 +96,9 @@ struct SpotifyRootView: View {
         // Sheet mở trình phát toàn màn hình khi bấm vào MiniPlayer
         .sheet(isPresented: $showNowPlaying) {
             SpotifyNowPlayingFullView()
+        }
+        .sheet(isPresented: $showConnectSheet) {
+            SpotifyConnectSheet().presentationDetents([.medium, .large])
         }
         // Tự động mở Now Playing khi phát bài mới từ bất kỳ danh sách nào
         .onReceive(pm.$showWatch) { show in
@@ -125,163 +141,197 @@ struct SpotifyRootView: View {
 
 /// Floating pill-style MiniPlayer bar positioned immediately above the tab bar.
 struct SpotifyMiniPlayerBar: View {
-    @ObservedObject private var pm = PlayerManager.shared
     @ObservedObject private var library = Library.shared
+    @ObservedObject private var connectManager = SpotifyConnectManager.shared
+    @State private var current: Video? = PlayerManager.shared.current
+    @State private var isPlaying: Bool = PlayerManager.shared.isPlaying
     @State private var ambientTint: Color = SpotifyColor.surface
     var onTap: (() -> Void)?
+    var onDeviceTap: (() -> Void)?
+    private let pm = PlayerManager.shared
 
-    init(onTap: (() -> Void)? = nil) {
+    init(onTap: (() -> Void)? = nil, onDeviceTap: (() -> Void)? = nil) {
         self.onTap = onTap
+        self.onDeviceTap = onDeviceTap
     }
 
     var body: some View {
-        if let video = pm.current {
-            let isLiked = library.isLiked(video.id)
+        Group {
+            if let video = current {
+                let isLiked = library.isLiked(video.id)
+                let active = connectManager.activeDevice
+                let isExternal = active != nil && !active!.isLocal
 
-            VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    // 1. Ảnh bìa vuông 44x44
-                    CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 88, height: 88)) { image in
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } placeholder: {
-                        ZStack {
-                            SpotifyColor.surfaceHighlight
-                            Image(systemName: "music.note")
-                                .font(.system(size: 15))
+                VStack(spacing: 0) {
+                    HStack(spacing: 12) {
+                        // 1. Ảnh bìa vuông 44x44
+                        CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 88, height: 88)) { image in
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } placeholder: {
+                            ZStack {
+                                SpotifyColor.surfaceHighlight
+                                Image(systemName: "music.note")
+                                    .font(.system(size: 15))
+                                    .foregroundColor(SpotifyColor.textSecondary)
+                            }
+                        }
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .shadow(color: Color.black.opacity(0.35), radius: 4, x: 0, y: 2)
+
+                        // 2. Tên bài hát & Nghệ sĩ
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(video.title.isEmpty ? "Đang tải…" : video.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+                                .lineLimit(1)
+
+                            Text(video.channelTitle.isEmpty ? "Nghệ sĩ" : video.channelTitle)
+                                .font(.system(size: 11, weight: .regular))
                                 .foregroundColor(SpotifyColor.textSecondary)
+                                .lineLimit(1)
                         }
-                    }
-                    .frame(width: 44, height: 44)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .shadow(color: Color.black.opacity(0.35), radius: 4, x: 0, y: 2)
 
-                    // 2. Tên bài hát & Nghệ sĩ
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(video.title.isEmpty ? "Đang tải…" : video.title)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(SpotifyColor.textPrimary)
-                            .lineLimit(1)
+                        Spacer(minLength: 4)
 
-                        Text(video.channelTitle.isEmpty ? "Nghệ sĩ" : video.channelTitle)
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundColor(SpotifyColor.textSecondary)
-                            .lineLimit(1)
-                    }
-
-                    Spacer(minLength: 4)
-
-                    // 3. Biểu tượng Spotify Connect thiết bị phát
-                    Image(systemName: "speaker.wave.2.fill")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(SpotifyColor.brandGreen)
-                        .padding(.trailing, 2)
-
-                    // 4. Nút trái tim (Heart Toggle) với hiệu ứng nảy
-                    Button {
-                        #if canImport(UIKit)
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        #endif
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.5)) {
-                            library.toggleLike(video)
+                        // 3. Biểu tượng Spotify Connect thiết bị phát (tương tác)
+                        Button {
+                            #if canImport(UIKit)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
+                            onDeviceTap?()
+                        } label: {
+                            Image(systemName: active?.iconName ?? "hifi.speaker.and.homepod")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(isExternal ? SpotifyColor.brandGreen : SpotifyColor.textSecondary)
+                                .frame(width: 30, height: 40)
+                                .contentShape(Rectangle())
                         }
-                    } label: {
-                        Image(systemName: isLiked ? "heart.fill" : "heart")
-                            .font(.system(size: 19))
-                            .foregroundColor(isLiked ? SpotifyColor.brandGreen : SpotifyColor.textPrimary)
-                            .scaleEffect(isLiked ? 1.08 : 1.0)
-                            .frame(width: 36, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(SpringPressButtonStyle())
+                        .buttonStyle(.plain)
 
-                    // 5. Nút play/pause
-                    Button {
-                        #if canImport(UIKit)
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        #endif
-                        pm.togglePlay()
-                    } label: {
-                        Image(systemName: pm.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundColor(SpotifyColor.textPrimary)
-                            .frame(width: 36, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(SpringPressButtonStyle())
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
+                        // 4. Nút trái tim (Heart Toggle) với hiệu ứng nảy
+                        Button {
+                            #if canImport(UIKit)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.5)) {
+                                library.toggleLike(video)
+                            }
+                        } label: {
+                            Image(systemName: isLiked ? "heart.fill" : "heart")
+                                .font(.system(size: 19))
+                                .foregroundColor(isLiked ? SpotifyColor.brandGreen : SpotifyColor.textPrimary)
+                                .scaleEffect(isLiked ? 1.08 : 1.0)
+                                .frame(width: 36, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SpringPressButtonStyle())
 
-                // 6. Thanh tiến trình xanh lá 2pt ở viền đáy
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Rectangle()
-                            .fill(Color.white.opacity(0.12))
-                            .frame(height: 2)
-
-                        let progress = pm.duration > 0 ? min(max(pm.currentTime / pm.duration, 0.0), 1.0) : 0.0
-                        Rectangle()
-                            .fill(SpotifyColor.brandGreen)
-                            .frame(width: geo.size.width * CGFloat(progress), height: 2)
+                        // 5. Nút play/pause
+                        Button {
+                            #if canImport(UIKit)
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            #endif
+                            pm.togglePlay()
+                        } label: {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundColor(SpotifyColor.textPrimary)
+                                .frame(width: 36, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SpringPressButtonStyle())
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+
+                    // 6. Thanh tiến trình xanh lá 2pt ở viền đáy (tách observer tránh render lại cả thanh)
+                    SpotifyMiniProgressBar()
                 }
-                .frame(height: 2)
-            }
-            .background(
-                ZStack {
-                    Color(red: 24 / 255.0, green: 24 / 255.0, blue: 24 / 255.0).opacity(0.95)
-                    Rectangle().fill(.ultraThinMaterial)
-                    LinearGradient(
-                        colors: [ambientTint.opacity(0.6), Color.clear],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                }
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(
+                .background(
+                    ZStack {
+                        Color(red: 24 / 255.0, green: 24 / 255.0, blue: 24 / 255.0).opacity(0.95)
+                        Rectangle().fill(.ultraThinMaterial)
                         LinearGradient(
-                            colors: [Color.white.opacity(0.16), Color.white.opacity(0.04)],
+                            colors: [ambientTint.opacity(0.6), Color.clear],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 0.5
-                    )
-            )
-            .shadow(color: Color.black.opacity(0.45), radius: 10, x: 0, y: 5)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                onTap?()
-            }
-            .task(id: video.thumbnail) {
-                if let url = video.thumbnail, let c = await ArtworkColorCache.shared.color(for: url) {
-                    withAnimation(.easeInOut(duration: 0.5)) {
-                        ambientTint = c
+                        )
                     }
-                } else {
-                    ambientTint = SpotifyColor.surface
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.16), Color.white.opacity(0.04)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 0.5
+                        )
+                )
+                .shadow(color: Color.black.opacity(0.45), radius: 10, x: 0, y: 5)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    onTap?()
                 }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 20).onEnded { value in
-                    let dx = value.translation.width
-                    let dy = value.translation.height
-                    if abs(dx) > abs(dy) {
-                        if dx < -50 {
-                            pm.next()
-                        } else if dx > 50 {
-                            pm.previous()
+                .task(id: video.thumbnail) {
+                    if let url = video.thumbnail, let c = await ArtworkColorCache.shared.color(for: url) {
+                        withAnimation(.easeInOut(duration: 0.5)) {
+                            ambientTint = c
                         }
-                    } else if dy < -30 {
-                        onTap?()
+                    } else {
+                        ambientTint = SpotifyColor.surface
                     }
                 }
-            )
+                .gesture(
+                    DragGesture(minimumDistance: 20).onEnded { value in
+                        let dx = value.translation.width
+                        let dy = value.translation.height
+                        if abs(dx) > abs(dy) {
+                            if dx < -50 {
+                                pm.next()
+                            } else if dx > 50 {
+                                pm.previous()
+                            }
+                        } else if dy < -30 {
+                            onTap?()
+                        }
+                    }
+                )
+            }
         }
+        .onReceive(pm.$current) { cur in
+            if current?.id != cur?.id || current?.title != cur?.title || current?.thumbnail != cur?.thumbnail {
+                current = cur
+            }
+        }
+        .onReceive(pm.$isPlaying) { playing in
+            if isPlaying != playing { isPlaying = playing }
+        }
+    }
+}
+
+private struct SpotifyMiniProgressBar: View {
+    @ObservedObject private var pm = PlayerManager.shared
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(height: 2)
+
+                let progress = pm.duration > 0 ? min(max(pm.currentTime / pm.duration, 0.0), 1.0) : 0.0
+                Rectangle()
+                    .fill(SpotifyColor.brandGreen)
+                    .frame(width: geo.size.width * CGFloat(progress), height: 2)
+            }
+        }
+        .frame(height: 2)
     }
 }
 
@@ -289,24 +339,40 @@ struct SpotifyMiniPlayerBar: View {
 
 extension View {
     /// Insets the floating Spotify mini player directly above the bottom tab bar.
-    func withSpotifyMiniPlayer(onTap: @escaping () -> Void) -> some View {
+    func withSpotifyMiniPlayer(
+        isVisible: Bool = true,
+        onTap: @escaping () -> Void,
+        onDeviceTap: (() -> Void)? = nil
+    ) -> some View {
         safeAreaInset(edge: .bottom, spacing: 0) {
-            SpotifyFloatingMiniPlayerContainer(onTap: onTap)
+            if isVisible {
+                SpotifyFloatingMiniPlayerContainer(onTap: onTap, onDeviceTap: onDeviceTap)
+            }
         }
     }
 }
 
 /// Floating container for the mini player with edge padding and animated transition.
 private struct SpotifyFloatingMiniPlayerContainer: View {
-    @ObservedObject private var pm = PlayerManager.shared
+    @State private var hasCurrent: Bool = (PlayerManager.shared.current != nil)
     var onTap: () -> Void
+    var onDeviceTap: (() -> Void)?
 
     var body: some View {
-        if pm.current != nil {
-            SpotifyMiniPlayerBar(onTap: onTap)
-                .padding(.horizontal, 8)
-                .padding(.bottom, 2)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+        Group {
+            if hasCurrent {
+                SpotifyMiniPlayerBar(onTap: onTap, onDeviceTap: onDeviceTap)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 2)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.22), value: hasCurrent)
+        .onReceive(PlayerManager.shared.$current) { cur in
+            let nextHas = (cur != nil)
+            if hasCurrent != nextHas {
+                hasCurrent = nextHas
+            }
         }
     }
 }

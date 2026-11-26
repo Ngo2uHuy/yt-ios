@@ -17,6 +17,7 @@ struct Thumbnail: View {
                     } placeholder: {
                         Color.clear
                     }
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
             }
             .clipped()
@@ -33,7 +34,7 @@ struct Thumbnail: View {
             .overlay(alignment: .bottomLeading) {
                 if let progress, progress > 0 {
                     GeometryReader { g in
-                        Rectangle().fill(Color.red).frame(width: g.size.width * min(progress, 1), height: 3)
+                        Rectangle().fill(Color.red).frame(width: g.size.width * min(max(progress, 0), 1), height: 3)
                             .frame(maxHeight: .infinity, alignment: .bottom)
                     }
                 }
@@ -45,6 +46,8 @@ struct Thumbnail: View {
 struct VideoRow: View {
     let video: Video
     var compact = true
+    @ObservedObject private var lib = Library.shared
+    @State private var showRemap = false
 
     private var meta: String {
         [video.views, video.published].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " • ")
@@ -52,66 +55,81 @@ struct VideoRow: View {
 
     private var progress: Double? {
         guard let total = Fmt.seconds(video.duration), total > 0 else { return nil }
-        let p = Library.shared.position(video.id)
+        let p = lib.position(video.id)
         return p > 0 ? p / total : nil
     }
 
+    private var artworkURL: URL? {
+        DownloadManager.shared.localArtwork(for: video.id) ?? video.thumbnail
+    }
+
     var body: some View {
-        if let source = video.source {
-            HStack(spacing: 12) {
-                Color(.secondarySystemFill)
-                    .frame(width: 56, height: 56)
-                    .overlay {
-                        CachedAsyncImage(url: video.thumbnail, targetSize: CGSize(width: 80, height: 80)) {
-                            $0.resizable().scaledToFill()
-                        } placeholder: {
-                            Image(systemName: "music.note").foregroundStyle(.secondary)
+        Group {
+            if let source = video.source {
+                HStack(spacing: 12) {
+                    Color(.secondarySystemFill)
+                        .frame(width: 56, height: 56)
+                        .overlay {
+                            CachedAsyncImage(url: artworkURL, targetSize: CGSize(width: 80, height: 80)) {
+                                $0.resizable().scaledToFill()
+                            } placeholder: {
+                                Image(systemName: "music.note").foregroundStyle(.secondary)
+                            }
                         }
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(video.title).font(.subheadline.weight(.medium)).lineLimit(1)
-                    Text([video.channelTitle, video.duration ?? "", video.published ?? ""].filter { !$0.isEmpty }
-                        .joined(separator: " • "))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: source.iconName).font(.caption).foregroundStyle(source.tint)
-            }
-        } else if compact {
-            HStack(alignment: .top, spacing: 10) {
-                Thumbnail(url: video.thumbnail, duration: video.duration, progress: progress).frame(width: 168)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(video.title).font(.subheadline.weight(.medium)).lineLimit(2)
-                    if !video.channelTitle.isEmpty {
-                        Text(video.channelTitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    if !meta.isEmpty {
-                        Text(meta).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: 10) {
-                Thumbnail(url: video.thumbnail, duration: video.duration, progress: progress)
-                HStack(alignment: .top, spacing: 12) {
-                    let known = Library.shared.subscriptions.first { $0.id == video.channelId }
-                    Avatar(url: known?.avatar, name: video.channelTitle, size: 36)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(video.title).font(.subheadline.weight(.semibold)).lineLimit(2)
-                        Text([video.channelTitle, meta].filter { !$0.isEmpty }.joined(separator: " • "))
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(video.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                        Text([video.channelTitle, video.duration ?? "", video.published ?? ""].filter { !$0.isEmpty }
+                            .joined(separator: " • "))
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer(minLength: 0)
-                    Image(systemName: "ellipsis")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 2)
+                    Image(systemName: source.iconName).font(.caption).foregroundStyle(source.tint)
                 }
-                .padding(.horizontal, 6)
+            } else if compact {
+                HStack(alignment: .top, spacing: 10) {
+                    Thumbnail(url: artworkURL, duration: video.duration, progress: progress).frame(width: 168)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(video.title).font(.subheadline.weight(.medium)).lineLimit(2)
+                        if !video.channelTitle.isEmpty {
+                            Text(video.channelTitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        if !meta.isEmpty {
+                            Text(meta).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Thumbnail(url: artworkURL, duration: video.duration, progress: progress)
+                    HStack(alignment: .top, spacing: 12) {
+                        let known = lib.subscriptions.first { $0.id == video.channelId }
+                        Avatar(url: known?.avatar, name: video.channelTitle, size: 36)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(video.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                            Text([video.channelTitle, meta].filter { !$0.isEmpty }.joined(separator: " • "))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                        Spacer(minLength: 0)
+                        Menu {
+                            VideoMenuItems(video: video, onRemap: { showRemap = true })
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 6)
+                }
+                .padding(.bottom, 6)
             }
-            .padding(.bottom, 6)
+        }
+        .sheet(isPresented: $showRemap) {
+            SpotifyRemapSheet(video: video)
         }
     }
 }
@@ -135,11 +153,12 @@ extension MediaSource {
 struct VideoButton: View {
     let video: Video
     var compact = true
-    var queue: [Video]?
+    var queue: [Video]? = nil
+    var showWatchSheet: Bool = true
 
     var body: some View {
         Button {
-            PlayerManager.shared.play(video, queue: queue)
+            PlayerManager.shared.play(video, queue: queue ?? [], showWatchSheet: showWatchSheet)
         } label: {
             VideoRow(video: video, compact: compact).contentShape(Rectangle())
         }
@@ -148,41 +167,50 @@ struct VideoButton: View {
     }
 }
 
+struct VideoMenuItems: View {
+    let video: Video
+    var onRemap: () -> Void
+    @ObservedObject private var lib = Library.shared
+
+    var body: some View {
+        if video.source == .spotify {
+            Button { onRemap() } label: {
+                Label("Đổi nguồn âm thanh", systemImage: "arrow.triangle.2.circlepath")
+            }
+        }
+        Button { PlayerManager.shared.playNext(video) } label: {
+            Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
+        }
+        Button { PlayerManager.shared.appendToQueue(video) } label: {
+            Label("Thêm vào hàng đợi", systemImage: "text.badge.plus")
+        }
+        Button { lib.toggleWatchLater(video) } label: {
+            Label(lib.isInWatchLater(video.id) ? "Bỏ khỏi Xem sau" : "Xem sau", systemImage: "clock")
+        }
+        if !lib.playlists.isEmpty {
+            Menu {
+                ForEach(lib.playlists) { p in Button(p.name) { lib.add(video, to: p.id) } }
+            } label: {
+                Label("Thêm vào danh sách phát", systemImage: "music.note.list")
+            }
+        }
+        Menu {
+            Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
+            Button("Chỉ âm thanh") { DownloadManager.shared.start(video, audioOnly: true) }
+        } label: {
+            Label("Tải xuống", systemImage: "arrow.down.circle")
+        }
+        ShareLink(item: video.shareURL) { Label("Chia sẻ", systemImage: "square.and.arrow.up") }
+    }
+}
+
 struct VideoMenu: ViewModifier {
     let video: Video
-    @ObservedObject private var lib = Library.shared
     @State private var showRemap = false
 
     func body(content: Content) -> some View {
         content.contextMenu {
-            if video.source == .spotify {
-                Button { showRemap = true } label: {
-                    Label("Đổi nguồn âm thanh", systemImage: "arrow.triangle.2.circlepath")
-                }
-            }
-            Button { PlayerManager.shared.playNext(video) } label: {
-                Label("Phát tiếp theo", systemImage: "text.line.first.and.arrowtriangle.forward")
-            }
-            Button { PlayerManager.shared.queue.append(video) } label: {
-                Label("Thêm vào hàng đợi", systemImage: "text.badge.plus")
-            }
-            Button { lib.toggleWatchLater(video) } label: {
-                Label(lib.isInWatchLater(video.id) ? "Bỏ khỏi Xem sau" : "Xem sau", systemImage: "clock")
-            }
-            if !lib.playlists.isEmpty {
-                Menu {
-                    ForEach(lib.playlists) { p in Button(p.name) { lib.add(video, to: p.id) } }
-                } label: {
-                    Label("Thêm vào danh sách phát", systemImage: "music.note.list")
-                }
-            }
-            Menu {
-                Button("Video") { DownloadManager.shared.start(video, audioOnly: false) }
-                Button("Chỉ âm thanh") { DownloadManager.shared.start(video, audioOnly: true) }
-            } label: {
-                Label("Tải xuống", systemImage: "arrow.down.circle")
-            }
-            ShareLink(item: video.shareURL) { Label("Chia sẻ", systemImage: "square.and.arrow.up") }
+            VideoMenuItems(video: video, onRemap: { showRemap = true })
         }
         .sheet(isPresented: $showRemap) {
             SpotifyRemapSheet(video: video)
@@ -313,6 +341,7 @@ struct SpotifyRemapSheet: View {
     @State private var results: [Video] = []
     @State private var loading = false
     @State private var error: String?
+    @State private var searchTask: Task<Void, Never>?
 
     init(video: Video) {
         self.video = video
@@ -387,22 +416,26 @@ struct SpotifyRemapSheet: View {
                 }
             }
             .task { search() }
+            .onDisappear { searchTask?.cancel() }
         }
     }
 
     private func search() {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
+        searchTask?.cancel()
         loading = true
         error = nil
-        Task {
+        searchTask = Task {
             do {
                 let page = try await InnerTube.shared.musicSearch(q, continuation: nil)
+                guard !Task.isCancelled else { return }
                 results = page.videos
             } catch {
+                guard !Task.isCancelled else { return }
                 self.error = error.localizedDescription
             }
-            loading = false
+            if !Task.isCancelled { loading = false }
         }
     }
 
@@ -412,7 +445,7 @@ struct SpotifyRemapSheet: View {
             if PlayerManager.shared.current?.id == video.id {
                 PlayerManager.shared.retry()
             } else {
-                PlayerManager.shared.play(video)
+                PlayerManager.shared.play(video, queue: [])
             }
             dismiss()
         }
@@ -424,7 +457,9 @@ struct PagedList: View {
     let loader: (String?) async throws -> Page
     var header: AnyView?
     var compact = true
+    var queueFromRemaining = false
     var onFirstPage: ((Page) -> Void)?
+    var onVideosChanged: (([Video]) -> Void)?
 
     @State private var videos: [Video] = []
     @State private var channels: [Channel] = []
@@ -433,20 +468,27 @@ struct PagedList: View {
     @State private var loading = false
     @State private var error: String?
     @State private var loaded = false
+    @State private var activeTask: Task<Void, Never>?
 
     var body: some View {
         List {
             if let header { header.listRowSeparator(.hidden) }
             ForEach(channels) { c in
                 NavigationLink { ChannelView(channel: c) } label: { ChannelRow(channel: c) }
+                    .onAppear { if c.id == channels.last?.id { loadMore() } }
             }
             ForEach(playlists) { p in
                 NavigationLink { RemotePlaylistView(id: p.id) } label: { ChannelPlaylistRow(playlist: p) }
+                    .onAppear { if p.id == playlists.last?.id { loadMore() } }
             }
-            ForEach(videos) { v in
-                VideoButton(video: v, compact: compact)
-                    .listRowSeparator(.hidden)
-                    .onAppear { if v.id == videos.last?.id { loadMore() } }
+            ForEach(Array(videos.enumerated()), id: \.element.id) { idx, v in
+                VideoButton(
+                    video: v,
+                    compact: compact,
+                    queue: queueFromRemaining ? Array(videos.dropFirst(idx + 1)) : []
+                )
+                .listRowSeparator(.hidden)
+                .onAppear { if v.id == videos.last?.id { loadMore() } }
             }
             if loading {
                 ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden)
@@ -454,7 +496,9 @@ struct PagedList: View {
             if let error {
                 VStack(spacing: 8) {
                     Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Button("Thử lại") { Task { await load(reset: videos.isEmpty && playlists.isEmpty) } }
+                    Button("Thử lại") {
+                        Task { await load(reset: videos.isEmpty && channels.isEmpty && playlists.isEmpty) }
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .listRowSeparator(.hidden)
@@ -468,12 +512,18 @@ struct PagedList: View {
             guard !loaded else { return }
             await load(reset: true)
         }
-        .refreshable { await load(reset: true) }
+        .refreshable {
+            activeTask?.cancel()
+            loading = false
+            await load(reset: true)
+        }
+        .onDisappear { activeTask?.cancel() }
     }
 
     private func loadMore() {
         guard token != nil, !loading, error == nil else { return }
-        Task { await load(reset: false) }
+        activeTask?.cancel()
+        activeTask = Task { await load(reset: false) }
     }
 
     private func load(reset: Bool) async {
@@ -482,26 +532,36 @@ struct PagedList: View {
         error = nil
         do {
             let page = try await loader(reset ? nil : token)
+            guard !Task.isCancelled else {
+                loading = false
+                return
+            }
             if reset {
-                videos = page.videos
-                channels = page.channels
-                playlists = page.playlists
+                var sv = Set<String>()
+                videos = page.videos.filter { sv.insert($0.id).inserted }
+                var sc = Set<String>()
+                channels = page.channels.filter { sc.insert($0.id).inserted }
+                var sp = Set<String>()
+                playlists = page.playlists.filter { sp.insert($0.id).inserted }
                 onFirstPage?(page)
             } else {
-                let seen = Set(videos.map(\.id))
-                videos += page.videos.filter { !seen.contains($0.id) }
-                let seenP = Set(playlists.map(\.id))
-                playlists += page.playlists.filter { !seenP.contains($0.id) }
+                var seenV = Set(videos.map(\.id))
+                videos += page.videos.filter { seenV.insert($0.id).inserted }
+                var seenC = Set(channels.map(\.id))
+                channels += page.channels.filter { seenC.insert($0.id).inserted }
+                var seenP = Set(playlists.map(\.id))
+                playlists += page.playlists.filter { seenP.insert($0.id).inserted }
             }
+            onVideosChanged?(videos)
             token = page.continuation
+            loaded = true
         } catch {
             let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
             loading = false
-            // Leave `loaded` false so the next appearance retries.
             if cancelled { return }
             self.error = error.localizedDescription
+            return
         }
         loading = false
-        loaded = true
     }
 }

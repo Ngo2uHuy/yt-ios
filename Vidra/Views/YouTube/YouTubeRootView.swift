@@ -6,7 +6,9 @@ import UIKit
 // MARK: - YouTube Root View
 
 struct YouTubeRootView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @State private var selectedTab: YouTubeTab = .home
+    @State private var visitedTabs: Set<YouTubeTab> = [.home]
     @State private var showWatch: Bool = false
     @State private var showCreateSheet: Bool = false
     @State private var hasCurrentTrack: Bool = (PlayerManager.shared.current != nil)
@@ -14,19 +16,35 @@ struct YouTubeRootView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            // Main content based on selected tab
-            Group {
-                switch selectedTab {
-                case .home:
+            // Preserve feed tab states once visited; unmount Shorts when leaving its tab
+            ZStack {
+                if visitedTabs.contains(.home) {
                     YouTubeHomeView()
-                case .shorts:
-                    YouTubeShortsView(isTab: true)
-                case .create:
-                    EmptyView()
-                case .subscriptions:
+                        .opacity(selectedTab == .home ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .home)
+                        .accessibilityHidden(selectedTab != .home)
+                        .zIndex(selectedTab == .home ? 1 : 0)
+                }
+
+                if visitedTabs.contains(.subscriptions) {
                     YouTubeSubscriptionsView()
-                case .you:
+                        .opacity(selectedTab == .subscriptions ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .subscriptions)
+                        .accessibilityHidden(selectedTab != .subscriptions)
+                        .zIndex(selectedTab == .subscriptions ? 1 : 0)
+                }
+
+                if visitedTabs.contains(.you) {
                     YouTubeYouView()
+                        .opacity(selectedTab == .you ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .you)
+                        .accessibilityHidden(selectedTab != .you)
+                        .zIndex(selectedTab == .you ? 1 : 0)
+                }
+
+                if selectedTab == .shorts {
+                    YouTubeShortsView(isTab: true)
+                        .zIndex(2)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -45,10 +63,16 @@ struct YouTubeRootView: View {
                             showCreateSheet = true
                         }
                     )
+                    .environment(\.colorScheme, selectedTab == .shorts ? .dark : colorScheme)
                 }
             }
         }
         .ignoresSafeArea(.keyboard)
+        .onChange(of: selectedTab) { tab in
+            if tab != .create {
+                visitedTabs.insert(tab)
+            }
+        }
         .sheet(isPresented: $showCreateSheet) {
             YouTubeCreateSheet()
                 .presentationDetents([.fraction(0.44), .medium])
@@ -159,7 +183,7 @@ struct YouTubeMiniPlayerBar: View {
                 GeometryReader { g in
                     ZStack(alignment: .leading) {
                         Rectangle()
-                            .fill(Color.white.opacity(0.08))
+                            .fill(Color.primary.opacity(0.12))
                             .frame(height: 2)
 
                         let prog = pm.duration > 0 ? min(max(pm.currentTime / pm.duration, 0), 1) : 0
@@ -172,15 +196,15 @@ struct YouTubeMiniPlayerBar: View {
             }
             .background(
                 ZStack {
-                    Color(red: 24 / 255.0, green: 24 / 255.0, blue: 24 / 255.0).opacity(0.96)
+                    YTColor.surfaceSecondary.opacity(0.94)
                     Rectangle()
-                        .fill(.ultraThinMaterial)
+                        .fill(.regularMaterial)
                 }
             )
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+                    .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
             )
             .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 4)
             .padding(.horizontal, 8)

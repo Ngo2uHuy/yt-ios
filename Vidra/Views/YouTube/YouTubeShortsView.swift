@@ -35,6 +35,10 @@ struct YouTubeShortsView: View {
 
     // iOS 16 fallback swipe state
     @State private var dragOffset: CGFloat = 0
+    @State private var fetchTask: Task<Void, Never>?
+    @State private var hudHideTask: Task<Void, Never>?
+    @State private var toastHideTask: Task<Void, Never>?
+    @State private var heartHideTask: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { geometry in
@@ -54,6 +58,7 @@ struct YouTubeShortsView: View {
 
                 // Interactive HUD Overlays
                 centerActionHUDs
+                    .allowsHitTesting(false)
 
                 // Toast Notification
                 if showToast, let toastMessage {
@@ -64,8 +69,14 @@ struct YouTubeShortsView: View {
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showComments) {
+            let activeId = activeCommentsVideo?.id ?? pm.current?.id
+            let tokenForActive = (pm.current?.id == activeId) ? pm.commentsToken : nil
             NavigationStack {
-                CommentsView(token: pm.commentsToken)
+                CommentsView(
+                    token: tokenForActive,
+                    channelTitle: activeCommentsVideo?.channelTitle,
+                    channelAvatar: nil
+                )
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
@@ -74,8 +85,13 @@ struct YouTubeShortsView: View {
             await initializeShorts()
         }
         .onDisappear {
+            fetchTask?.cancel()
+            hudHideTask?.cancel()
+            toastHideTask?.cancel()
+            heartHideTask?.cancel()
+            pm.pause()
             pm.loop = false
-            pm.player.isMuted = false
+            pm.setMuted(false)
             pm.clearAllPreloads()
         }
     }
@@ -133,10 +149,14 @@ struct YouTubeShortsView: View {
         }
 
         isLoadingMore = true
-        Task {
+        fetchTask?.cancel()
+        fetchTask = Task {
+            defer { isLoadingMore = false }
             do {
                 let page = try await InnerTube.shared.search("#shorts", params: nil, continuation: token)
-                let newVideos = page.videos.filter { v in !shorts.contains(where: { $0.id == v.id }) }
+                guard !Task.isCancelled else { return }
+                let existing = Set(shorts.map(\.id))
+                let newVideos = page.videos.filter { !existing.contains($0.id) }
                 if !newVideos.isEmpty {
                     shorts.append(contentsOf: newVideos)
                 }
@@ -144,7 +164,6 @@ struct YouTubeShortsView: View {
             } catch {
                 // Continuation error handled gracefully
             }
-            isLoadingMore = false
         }
     }
 
@@ -155,12 +174,12 @@ struct YouTubeShortsView: View {
         let video = shorts[index]
 
         pm.loop = true
-        pm.player.isMuted = isMuted
+        pm.setMuted(isMuted)
 
         if pm.current?.id != video.id {
-            pm.play(video, showWatchSheet: false)
+            pm.play(video, queue: [], showWatchSheet: false, preserveMute: true)
         } else if !pm.isPlaying {
-            pm.player.play()
+            pm.resume()
         }
 
         updatePreloadsAndRecycleMemory(for: index)
@@ -203,7 +222,10 @@ struct YouTubeShortsView: View {
         withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
             showPlayPauseIcon = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+        hudHideTask?.cancel()
+        hudHideTask = Task {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) {
                 showPlayPauseIcon = false
             }
@@ -212,7 +234,7 @@ struct YouTubeShortsView: View {
 
     private func toggleMute() {
         isMuted.toggle()
-        pm.player.isMuted = isMuted
+        pm.setMuted(isMuted)
         showToast(message: isMuted ? "Đã tắt tiếng" : "Đã bật tiếng")
     }
 
@@ -221,7 +243,10 @@ struct YouTubeShortsView: View {
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+        toastHideTask?.cancel()
+        toastHideTask = Task {
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) {
                 showToast = false
             }
@@ -242,6 +267,7 @@ struct YouTubeShortsView: View {
                             isActive: index == currentIndex,
                             isWithinRetentionWindow: isWithinWindow,
                             isMuted: isMuted,
+                            isTab: isTab,
                             onTogglePlay: togglePlayPause,
                             onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
                             onToggleMute: toggleMute,
@@ -270,42 +296,56 @@ struct YouTubeShortsView: View {
                 }
             ))
         } else {
-            // iOS 16 fallback: vertical paging gesture
+            // iOS 16 fallback: vertical paging gesture over active neighbor window
             verticalDragPager(geometry: geometry)
         }
     }
 
     private func verticalDragPager(geometry: GeometryProxy) -> some View {
-        LazyVStack(spacing: 0) {
-            ForEach(Array(shorts.enumerated()), id: \.element.id) { index, video in
-                let isWithinWindow = abs(index - currentIndex) <= 2
-                ShortsCardView(
-                    video: video,
-                    isActive: index == currentIndex,
-                    isWithinRetentionWindow: isWithinWindow,
-                    isMuted: isMuted,
-                    onTogglePlay: togglePlayPause,
-                    onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
-                    onToggleMute: toggleMute,
-                    onOpenComments: {
-                        activeCommentsVideo = video
-                        showComments = true
-                    },
-                    onRemixTapped: {
-                        showToast(message: "Tính năng Phối lại Shorts")
-                    }
-                )
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .id(video.id)
+        let lower = max(0, currentIndex - 1)
+        let upper = min(shorts.count - 1, currentIndex + 1)
+
+        return ZStack {
+            if !shorts.isEmpty {
+                ForEach(lower...upper, id: \.self) { index in
+                    let video = shorts[index]
+                    ShortsCardView(
+                        video: video,
+                        isActive: index == currentIndex,
+                        isWithinRetentionWindow: true,
+                        isMuted: isMuted,
+                        isTab: isTab,
+                        onTogglePlay: togglePlayPause,
+                        onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
+                        onToggleMute: toggleMute,
+                        onOpenComments: {
+                            activeCommentsVideo = video
+                            showComments = true
+                        },
+                        onRemixTapped: {
+                            showToast(message: "Tính năng Phối lại Shorts")
+                        }
+                    )
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .offset(y: CGFloat(index - currentIndex) * geometry.size.height + dragOffset)
+                    .id(video.id)
+                }
             }
         }
-        .offset(y: -CGFloat(currentIndex) * geometry.size.height + dragOffset)
+        .frame(width: geometry.size.width, height: geometry.size.height)
+        .clipped()
         .gesture(
-            DragGesture()
+            DragGesture(minimumDistance: 16)
                 .onChanged { value in
-                    dragOffset = value.translation.height
+                    if abs(value.translation.height) > abs(value.translation.width) {
+                        dragOffset = value.translation.height
+                    }
                 }
                 .onEnded { value in
+                    guard abs(value.translation.height) > abs(value.translation.width) else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { dragOffset = 0 }
+                        return
+                    }
                     let threshold = geometry.size.height * 0.16
                     let predicted = value.predictedEndTranslation.height
                     var newIndex = currentIndex
@@ -333,7 +373,10 @@ struct YouTubeShortsView: View {
         withAnimation(.spring(response: 0.25, dampingFraction: 0.5)) {
             showHeartAnimation = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+        heartHideTask?.cancel()
+        heartHideTask = Task {
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) {
                 showHeartAnimation = false
             }
@@ -434,6 +477,9 @@ struct YouTubeShortsView: View {
         }
     }
 
+    @ViewBuilder
+    private var centerActionHUDsHitSafe: some View { EmptyView() }
+
     // MARK: - Toast Banner
 
     private func toastOverlay(_ text: String) -> some View {
@@ -501,6 +547,7 @@ struct ShortsCardView: View {
     let isActive: Bool
     var isWithinRetentionWindow: Bool = true
     let isMuted: Bool
+    var isTab: Bool = false
 
     var onTogglePlay: () -> Void
     var onDoubleTap: (CGPoint) -> Void
@@ -538,15 +585,21 @@ struct ShortsCardView: View {
                     .frame(width: 64)
             }
             .padding(.horizontal, 14)
-            .padding(.bottom, 36)
+            .padding(.bottom, isTab ? 88 : 36)
 
             // Bottom Thin Playback Progress Indicator
             bottomProgressIndicator
+                .padding(.bottom, isTab ? 68 : 0)
         }
         .clipped()
-        .task(id: video.id) {
+        .task(id: isWithinRetentionWindow ? video.id : "") {
+            isLiked = lib.isLiked(video.id)
             guard isWithinRetentionWindow else { return }
             await loadVideoStats()
+        }
+        .onChange(of: lib.liked.count) { _ in
+            isLiked = lib.isLiked(video.id)
+            if isLiked { isDisliked = false }
         }
     }
 
@@ -570,7 +623,7 @@ struct ShortsCardView: View {
 
             // Realtime Video Surface
             if isActive {
-                VideoSurface(player: pm.player, gravity: .resizeAspectFill)
+                VideoSurface(player: pm.player, gravity: .resizeAspectFill, enablePiP: false)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if pm.isLoading {
@@ -617,6 +670,7 @@ struct ShortsCardView: View {
                     isLiked = true
                     isDisliked = false
                     likeCount += 1
+                    if !lib.isLiked(video.id) { lib.toggleLike(video) }
                 }
                 onDoubleTap(location)
             }
@@ -640,8 +694,10 @@ struct ShortsCardView: View {
                 if isLiked {
                     isDisliked = false
                     likeCount += 1
+                    if !lib.isLiked(video.id) { lib.toggleLike(video) }
                 } else {
                     likeCount = max(0, likeCount - 1)
+                    if lib.isLiked(video.id) { lib.toggleLike(video) }
                 }
             }
 
@@ -657,6 +713,7 @@ struct ShortsCardView: View {
                     if isLiked {
                         isLiked = false
                         likeCount = max(0, likeCount - 1)
+                        if lib.isLiked(video.id) { lib.toggleLike(video) }
                     }
                 }
             }
@@ -759,27 +816,29 @@ struct ShortsCardView: View {
                 .shadow(color: .black.opacity(0.6), radius: 3, x: 0, y: 1)
 
             // Subscribe Pill Button
-            Button {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                let channel = Channel(
-                    id: channelId.isEmpty ? UUID().uuidString : channelId,
-                    title: video.channelTitle,
-                    avatar: knownChannel?.avatar
-                )
-                lib.toggleSubscription(channel)
-            } label: {
-                Text(isSubscribed ? "Đã đăng ký" : "Đăng ký")
-                    .font(.system(size: 12, weight: .bold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(
-                        isSubscribed ? Color.white.opacity(0.2) : Color.white,
-                        in: Capsule()
+            if !channelId.isEmpty {
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    let channel = Channel(
+                        id: channelId,
+                        title: video.channelTitle,
+                        avatar: knownChannel?.avatar
                     )
-                    .foregroundStyle(isSubscribed ? Color.white : Color.black)
-                    .shadow(color: .black.opacity(0.3), radius: 3)
+                    lib.toggleSubscription(channel)
+                } label: {
+                    Text(isSubscribed ? "Đã đăng ký" : "Đăng ký")
+                        .font(.system(size: 12, weight: .bold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(
+                            isSubscribed ? Color.white.opacity(0.2) : Color.white,
+                            in: Capsule()
+                        )
+                        .foregroundStyle(isSubscribed ? Color.white : Color.black)
+                        .shadow(color: .black.opacity(0.3), radius: 3)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
     }
 
@@ -863,16 +922,10 @@ struct ShortsCardView: View {
 
     private func loadVideoStats() async {
         // Fetch votes (Likes/Dislikes)
-        if let votes = await Extras.votes(video.id) {
-            likeCount = votes.likes
-        } else {
-            // Initial pseudo-heuristic based on views if available
-            likeCount = parseEstimatedLikes(video.views)
-        }
-
-        // Check if current video in PM has comments
-        if isActive, let token = pm.commentsToken {
-            commentCountString = "Bình luận"
+        if let votes = await Extras.votes(video.id), !Task.isCancelled {
+            likeCount = votes.likes + (isLiked ? 1 : 0)
+        } else if !Task.isCancelled {
+            likeCount = parseEstimatedLikes(video.views) + (isLiked ? 1 : 0)
         }
     }
 
@@ -894,12 +947,19 @@ struct ShortsCardView: View {
     }
 
     private func parseEstimatedLikes(_ views: String?) -> Int {
-        guard let views else { return Int.random(in: 1200...45000) }
-        let clean = views.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-        if let v = Int(clean), v > 0 {
-            return max(10, v / 12)
+        guard let views else { return 0 }
+        let lower = views.lowercased()
+        let numText = lower.components(separatedBy: CharacterSet(charactersIn: "0123456789.,").inverted).joined()
+            .replacingOccurrences(of: ",", with: ".")
+        if let v = Double(numText), v > 0 {
+            if lower.contains("m") || lower.contains("tr") {
+                return max(10, Int(v * 1_000_000 / 15))
+            } else if lower.contains("k") || lower.contains("n") {
+                return max(10, Int(v * 1_000 / 15))
+            }
+            return max(10, Int(v / 15))
         }
-        return Int.random(in: 1500...28000)
+        return 0
     }
 }
 
@@ -998,19 +1058,25 @@ struct MusicWaveBars: View {
         .onChange(of: isPlaying) { playing in
             if playing {
                 animateBars()
+            } else {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    bar1Height = 4
+                    bar2Height = 4
+                    bar3Height = 4
+                }
             }
         }
     }
 
     private func animateBars() {
         withAnimation(.easeInOut(duration: 0.45).repeatForever(autoreverses: true)) {
-            bar1Height = CGFloat.random(in: 6...12)
+            bar1Height = 11
         }
         withAnimation(.easeInOut(duration: 0.35).repeatForever(autoreverses: true).delay(0.1)) {
-            bar2Height = CGFloat.random(in: 4...11)
+            bar2Height = 9
         }
         withAnimation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true).delay(0.2)) {
-            bar3Height = CGFloat.random(in: 7...12)
+            bar3Height = 12
         }
     }
 }

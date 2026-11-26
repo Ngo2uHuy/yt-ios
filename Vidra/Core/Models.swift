@@ -15,17 +15,29 @@ struct Video: Identifiable, Codable, Hashable, Sendable {
 
     var thumbnail: URL? {
         if let artwork { return artwork }
-        if source == nil || source == .ytMusic {
-            return URL(string: "https://i.ytimg.com/vi/\(id)/hq720.jpg") ?? URL(string: "https://i.ytimg.com/vi/\(id)/mqdefault.jpg")
+        if (source == nil || source == .ytMusic), !id.isEmpty,
+           let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+            return URL(string: "https://i.ytimg.com/vi/\(encoded)/hq720.jpg")
+                ?? URL(string: "https://i.ytimg.com/vi/\(encoded)/mqdefault.jpg")
         }
         return nil
     }
 
     var shareURL: URL {
         switch source {
-        case .spotify?: return link ?? URL(string: "https://open.spotify.com")!
-        case .ytMusic?: return URL(string: "https://music.youtube.com/watch?v=\(id)")!
-        case nil: return URL(string: "https://youtu.be/\(id)")!
+        case .spotify?:
+            return link ?? URL(string: "https://open.spotify.com")!
+        case .ytMusic?:
+            var c = URLComponents(string: "https://music.youtube.com/watch")!
+            if !id.isEmpty { c.queryItems = [URLQueryItem(name: "v", value: id)] }
+            return c.url ?? URL(string: "https://music.youtube.com")!
+        case nil:
+            guard !id.isEmpty,
+                  let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                  let url = URL(string: "https://youtu.be/\(encoded)") else {
+                return URL(string: "https://www.youtube.com")!
+            }
+            return url
         }
     }
 }
@@ -50,7 +62,7 @@ struct ChannelPlaylist: Identifiable, Codable, Hashable, Sendable {
     var videoCount: String?
 }
 
-struct Page {
+struct Page: Sendable {
     var videos: [Video] = []
     var channels: [Channel] = []
     var playlists: [ChannelPlaylist] = []
@@ -121,14 +133,14 @@ struct CaptionTrack: Identifiable, Codable, Hashable, Sendable {
     var url: URL
 }
 
-struct CaptionCue: Identifiable, Sendable {
-    var id: Double { start }
+struct CaptionCue: Identifiable, Hashable, Sendable {
+    var id: String { "\(start)_\(end)_\(text)" }
     let start: Double
     let end: Double
     let text: String
 }
 
-struct VideoInfo {
+struct VideoInfo: Sendable {
     var description: String
     var viewCount: Int?
     var isLive: Bool
@@ -136,7 +148,7 @@ struct VideoInfo {
     var captions: [CaptionTrack] = []
 }
 
-struct DirectFormat {
+struct DirectFormat: Sendable {
     let url: URL
     let size: Int64?
     let width: Int?
@@ -147,6 +159,29 @@ struct DirectFormat {
     let isDefaultAudio: Bool
     let initRange: (start: Int, end: Int)?
     let indexRange: (start: Int, end: Int)?
+    let itag: Int?
+    let approxDurationMs: Double?
+    let expiresAt: Date?
+    let client: YTClient?
+    let isDrc: Bool
+
+    var effectiveUserAgent: String {
+        client?.userAgent ?? YTClient.ios.userAgent
+    }
+
+    var shortEdge: Int {
+        if let w = width, let h = height, w > 0, h > 0 { return min(w, h) }
+        return height ?? 0
+    }
+
+    var cacheIdentifier: String {
+        var h: UInt64 = 14695981039346656037
+        for b in url.absoluteString.utf8 {
+            h ^= UInt64(b)
+            h &*= 1099511628211
+        }
+        return "\(itag.map(String.init) ?? "x")_\(client?.name ?? "x")_\(width ?? 0)x\(height ?? 0)_\(fps ?? 0)_\(h)"
+    }
 
     init(
         url: URL,
@@ -158,7 +193,12 @@ struct DirectFormat {
         mime: String,
         isDefaultAudio: Bool,
         initRange: (start: Int, end: Int)? = nil,
-        indexRange: (start: Int, end: Int)? = nil
+        indexRange: (start: Int, end: Int)? = nil,
+        itag: Int? = nil,
+        approxDurationMs: Double? = nil,
+        expiresAt: Date? = nil,
+        client: YTClient? = nil,
+        isDrc: Bool = false
     ) {
         self.url = url
         self.size = size
@@ -170,10 +210,15 @@ struct DirectFormat {
         self.isDefaultAudio = isDefaultAudio
         self.initRange = initRange
         self.indexRange = indexRange
+        self.itag = itag
+        self.approxDurationMs = approxDurationMs
+        self.expiresAt = expiresAt
+        self.client = client
+        self.isDrc = isDrc
     }
 }
 
-struct DirectSet {
+struct DirectSet: Sendable {
     var video: DirectFormat?
     var audio: DirectFormat?
     var muxed: DirectFormat?
@@ -192,17 +237,18 @@ struct DirectSet {
     }
 }
 
-enum PlaybackSource {
-    case hls(URL)
-    case composite(video: URL, audio: URL)
-    case progressive(URL)
+enum PlaybackSource: Sendable {
+    case hls(URL, userAgent: String? = nil)
+    case composite(video: URL, audio: URL, videoUserAgent: String? = nil, audioUserAgent: String? = nil)
+    case progressive(URL, userAgent: String? = nil)
     case file(URL)
 }
 
-struct ResolvedVideo {
+struct ResolvedVideo: Sendable {
     var video: Video
     var info: VideoInfo
     var sources: [PlaybackSource]
+    var expiresAt: Date? = nil
 }
 
 struct FeedEntry: Sendable {
@@ -230,14 +276,19 @@ enum YTLink {
 
     static func parse(_ text: String) -> YTLink? {
         let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let c = URLComponents(string: s), let host = c.host?.lowercased(), host.contains("youtu") else { return nil }
+        guard let c = URLComponents(string: s), let host = c.host?.lowercased() else { return nil }
+        let isYT = host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com")
+            || host == "youtube-nocookie.com" || host.hasSuffix(".youtube-nocookie.com")
+        guard isYT else { return nil }
         let query = c.queryItems ?? []
         let path = c.path.split(separator: "/").map(String.init)
-        if host.contains("youtu.be"), let id = path.first { return .video(id) }
-        if let v = query.first(where: { $0.name == "v" })?.value { return .video(v) }
-        if path.count >= 2, ["shorts", "live", "embed", "v"].contains(path[0]) { return .video(path[1]) }
-        if let list = query.first(where: { $0.name == "list" })?.value { return .playlist(list) }
-        if path.count >= 2, path[0] == "channel" { return .channel(path[1]) }
+        if host == "youtu.be", let id = path.first, !id.isEmpty { return .video(id) }
+        if let v = query.first(where: { $0.name == "v" })?.value, !v.isEmpty { return .video(v) }
+        if path.count >= 2, ["shorts", "live", "embed", "v"].contains(path[0]), !path[1].isEmpty {
+            return .video(path[1])
+        }
+        if let list = query.first(where: { $0.name == "list" })?.value, !list.isEmpty { return .playlist(list) }
+        if path.count >= 2, path[0] == "channel", !path[1].isEmpty { return .channel(path[1]) }
         return nil
     }
 }
@@ -258,9 +309,9 @@ enum Pref {
         UserDefaults.standard.object(forKey: key) as? Bool ?? fallback
     }
 
-    /// 0 = automatic (highest available). Supports up to 4K (2160p) with automatic fallback to 1080p if undecodable.
+    /// 0 = automatic (highest available). Defaults to 1080p H.264 for universal hardware compatibility.
     static var maxHeight: Int {
-        UserDefaults.standard.object(forKey: maxHeightKey) as? Int ?? 2160
+        UserDefaults.standard.object(forKey: maxHeightKey) as? Int ?? 1080
     }
     static var autoplay: Bool { bool(autoplayKey, true) }
     static var endlessRadio: Bool { bool(endlessRadioKey, true) }
@@ -269,7 +320,10 @@ enum Pref {
     static var saveHistory: Bool { bool(saveHistoryKey, true) }
     static var hideShorts: Bool { bool(hideShortsKey, true) }
     static var musicAudioOnly: Bool { bool(musicAudioOnlyKey, true) }
-    static var defaultRate: Double { UserDefaults.standard.object(forKey: defaultRateKey) as? Double ?? 1 }
+    static var defaultRate: Double {
+        let r = UserDefaults.standard.object(forKey: defaultRateKey) as? Double ?? 1
+        return r.isFinite && r > 0 ? r : 1
+    }
 }
 
 enum Fmt {
@@ -281,7 +335,7 @@ enum Fmt {
     private static let relativeLock = NSLock()
 
     static func time(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        guard seconds.isFinite, seconds >= 0, seconds < Double(Int.max / 2) else { return "0:00" }
         let t = Int(seconds)
         let h = t / 3600, m = (t % 3600) / 60, s = t % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
@@ -290,8 +344,8 @@ enum Fmt {
     /// "1:02:03" -> 3723
     static func seconds(_ text: String?) -> Double? {
         guard let text else { return nil }
-        let raw = text.split(separator: ":")
-        let parts = raw.compactMap { Double($0) }
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ":")
+        let parts = raw.compactMap { Double($0) }.filter { $0.isFinite && $0 >= 0 }
         guard (2...3).contains(parts.count), parts.count == raw.count else { return nil }
         return parts.reduce(0) { $0 * 60 + $1 }
     }

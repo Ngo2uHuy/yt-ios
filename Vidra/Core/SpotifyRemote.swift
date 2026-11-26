@@ -21,7 +21,6 @@ final class SpotifyRemote: NSObject, ObservableObject {
     @Published private(set) var isPaused: Bool = true
     @Published private(set) var lastError: String?
 
-    /// User preference to use direct Spotify App Remote when playing Spotify tracks (default: true).
     @Published var isEnabled: Bool {
         didSet { UserDefaults.standard.set(isEnabled, forKey: "spotifyAppRemoteEnabled") }
     }
@@ -49,21 +48,28 @@ final class SpotifyRemote: NSObject, ObservableObject {
         #endif
     }
 
-    /// Checks if the official Spotify app is installed on the user's iOS device.
     var isSpotifyInstalled: Bool {
         guard let url = URL(string: "spotify:") else { return false }
         return UIApplication.shared.canOpenURL(url)
     }
 
-    /// Can Spotify App Remote be used for direct audio streaming right now?
     var isAvailable: Bool {
         isEnabled && isSpotifyInstalled
     }
 
     #if canImport(SpotifyiOS)
     private func setupAppRemote() {
+        if let old = appRemote {
+            old.delegate = nil
+            if old.isConnected { old.disconnect() }
+            isConnected = false
+        }
         let clientId = SpotifyAuth.shared.clientId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clientId.isEmpty else { return }
+        guard !clientId.isEmpty else {
+            appRemote = nil
+            configuration = nil
+            return
+        }
         let config = SPTConfiguration(clientID: clientId, redirectURL: redirectURI)
         config.playURI = ""
         configuration = config
@@ -83,10 +89,41 @@ final class SpotifyRemote: NSObject, ObservableObject {
         }
         return appRemote != nil
     }
+
+    private func playURI(_ uri: String, remote: SPTAppRemote, video: Video) async -> Bool {
+        await withCheckedContinuation { cont in
+            var resumed = false
+            remote.playerAPI?.play(uri) { [weak self] _, error in
+                Task { @MainActor in
+                    guard !resumed else { return }
+                    resumed = true
+                    if let error {
+                        self?.lastError = error.localizedDescription
+                        cont.resume(returning: false)
+                    } else {
+                        self?.applyTrackStart(uri: uri, video: video)
+                        cont.resume(returning: true)
+                    }
+                }
+            }
+        }
+    }
     #endif
 
+    private func applyTrackStart(uri: String, video: Video) {
+        pendingURI = nil
+        currentTrackURI = uri
+        trackTitle = video.title
+        artistTitle = video.channelTitle
+        duration = Fmt.seconds(video.duration) ?? 0
+        position = 0
+        basePosition = 0
+        lastStateTimestamp = Date()
+        isPaused = false
+        startProgressTimer()
+    }
+
     /// Requests Spotify App Remote to play a track URI directly.
-    /// Returns true if playback was initiated via Spotify, false if fallback is required.
     func play(trackId: String, video: Video) async -> Bool {
         guard isAvailable else { return false }
         let rawId = trackId.hasPrefix("sp:") ? String(trackId.dropFirst(3)) : trackId
@@ -96,74 +133,57 @@ final class SpotifyRemote: NSObject, ObservableObject {
         #if canImport(SpotifyiOS)
         guard ensureConfigured(), let remote = appRemote else { return false }
 
-        // If already connected, play directly
         if remote.isConnected {
-            return await withCheckedContinuation { cont in
-                remote.playerAPI?.play(uri) { [weak self] _, error in
-                    if let error {
-                        self?.lastError = error.localizedDescription
-                        cont.resume(returning: false)
-                    } else {
-                        self?.currentTrackURI = uri
-                        self?.trackTitle = video.title
-                        self?.artistTitle = video.channelTitle
-                        self?.duration = Fmt.seconds(video.duration) ?? 0
-                        self?.isPaused = false
-                        self?.basePosition = 0
-                        self?.lastStateTimestamp = Date()
-                        self?.startProgressTimer()
-                        cont.resume(returning: true)
-                    }
-                }
-            }
+            return await playURI(uri, remote: remote, video: video)
         }
 
-        // Try connecting with existing OAuth access token first
         isConnecting = true
         if let token = try? await SpotifyAuth.shared.validToken() {
+            if Task.isCancelled {
+                isConnecting = false
+                pendingURI = nil
+                return false
+            }
             remote.connectionParameters.accessToken = token
             remote.connect()
 
-            // Wait up to 1.5s for handshake
             for _ in 0..<15 {
+                if Task.isCancelled {
+                    isConnecting = false
+                    pendingURI = nil
+                    return false
+                }
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 if remote.isConnected { break }
             }
 
             if remote.isConnected {
                 isConnecting = false
-                return await withCheckedContinuation { cont in
-                    remote.playerAPI?.play(uri) { [weak self] _, error in
-                        if let error {
-                            self?.lastError = error.localizedDescription
-                            cont.resume(returning: false)
-                        } else {
-                            self?.currentTrackURI = uri
-                            self?.trackTitle = video.title
-                            self?.artistTitle = video.channelTitle
-                            self?.duration = Fmt.seconds(video.duration) ?? 0
-                            self?.isPaused = false
-                            cont.resume(returning: true)
-                        }
-                    }
-                }
+                return await playURI(uri, remote: remote, video: video)
             }
         }
 
-        // If direct connect failed, wake up Spotify app via authorizeAndPlayURI
+        guard !Task.isCancelled else {
+            isConnecting = false
+            pendingURI = nil
+            return false
+        }
+
         return await withCheckedContinuation { cont in
+            var resumed = false
             remote.authorizeAndPlayURI(uri) { [weak self] success in
-                self?.isConnecting = false
-                if success {
-                    self?.currentTrackURI = uri
-                    self?.trackTitle = video.title
-                    self?.artistTitle = video.channelTitle
-                    self?.duration = Fmt.seconds(video.duration) ?? 0
-                    self?.isPaused = false
-                    cont.resume(returning: true)
-                } else {
-                    self?.lastError = "Không thể mở ứng dụng Spotify"
-                    cont.resume(returning: false)
+                Task { @MainActor in
+                    guard !resumed else { return }
+                    resumed = true
+                    self?.isConnecting = false
+                    if success {
+                        self?.applyTrackStart(uri: uri, video: video)
+                        cont.resume(returning: true)
+                    } else {
+                        self?.pendingURI = nil
+                        self?.lastError = "Không thể mở ứng dụng Spotify"
+                        cont.resume(returning: false)
+                    }
                 }
             }
         }
@@ -173,10 +193,18 @@ final class SpotifyRemote: NSObject, ObservableObject {
     }
 
     func pause() {
+        pendingURI = nil
         stopProgressTimer()
+        isPaused = true
         #if canImport(SpotifyiOS)
         appRemote?.playerAPI?.pause { [weak self] _, error in
-            if error == nil { self?.isPaused = true }
+            Task { @MainActor in
+                if let error {
+                    self?.lastError = error.localizedDescription
+                } else {
+                    self?.isPaused = true
+                }
+            }
         }
         #endif
     }
@@ -184,10 +212,20 @@ final class SpotifyRemote: NSObject, ObservableObject {
     func resume() {
         basePosition = position
         lastStateTimestamp = Date()
+        isPaused = false
         startProgressTimer()
         #if canImport(SpotifyiOS)
         appRemote?.playerAPI?.resume { [weak self] _, error in
-            if error == nil { self?.isPaused = false }
+            Task { @MainActor in
+                if let error {
+                    self?.isPaused = true
+                    self?.stopProgressTimer()
+                    self?.lastError = error.localizedDescription
+                } else {
+                    self?.lastStateTimestamp = Date()
+                    self?.isPaused = false
+                }
+            }
         }
         #endif
     }
@@ -197,11 +235,12 @@ final class SpotifyRemote: NSObject, ObservableObject {
     }
 
     func seek(to seconds: Double) {
-        basePosition = seconds
+        let clamped = max(0, duration > 0 ? min(seconds, duration) : seconds)
+        basePosition = clamped
         lastStateTimestamp = Date()
-        position = seconds
+        position = clamped
         #if canImport(SpotifyiOS)
-        let ms = Int(seconds * 1000)
+        let ms = Int(clamped * 1000)
         appRemote?.playerAPI?.seek(toPosition: ms, callback: nil)
         #endif
     }
@@ -229,8 +268,8 @@ final class SpotifyRemote: NSObject, ObservableObject {
         basePosition = position
         progressTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                guard let self, !self.isPaused else { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, let self, !self.isPaused else { break }
                 let elapsed = Date().timeIntervalSince(self.lastStateTimestamp)
                 let currentPos = self.basePosition + elapsed
                 let capped = self.duration > 0 ? min(currentPos, self.duration) : currentPos
@@ -247,10 +286,9 @@ final class SpotifyRemote: NSObject, ObservableObject {
         }
     }
 
-    /// Handles incoming deep links (vidra://spotify-callback) when returning from Spotify.
     func handleURL(_ url: URL) {
         #if canImport(SpotifyiOS)
-        guard let remote = appRemote else { return }
+        guard ensureConfigured(), let remote = appRemote else { return }
         let params = remote.authorizationParameters(from: url)
         if let token = params?[SPTAppRemoteAccessTokenKey] {
             remote.connectionParameters.accessToken = token
@@ -284,6 +322,7 @@ extension SpotifyRemote: SPTAppRemoteDelegate {
 
     nonisolated func appRemote(_ appRemote: SPTAppRemote, didFailConnectionAttemptWithError error: Error?) {
         Task { @MainActor in
+            self.pendingURI = nil
             self.isConnected = false
             self.isConnecting = false
             self.lastError = error?.localizedDescription
@@ -292,10 +331,20 @@ extension SpotifyRemote: SPTAppRemoteDelegate {
 
     nonisolated func appRemote(_ appRemote: SPTAppRemote, didDisconnectWithError error: Error?) {
         Task { @MainActor in
+            self.pendingURI = nil
             self.stopProgressTimer()
             self.isConnected = false
             self.isConnecting = false
+            self.isPaused = true
             self.lastError = error?.localizedDescription
+            PlayerManager.shared.syncFromSpotifyRemote(
+                isPaused: true,
+                position: self.position,
+                duration: self.duration,
+                title: self.trackTitle,
+                artist: self.artistTitle,
+                uri: self.currentTrackURI
+            )
         }
     }
 }
@@ -319,7 +368,6 @@ extension SpotifyRemote: SPTAppRemotePlayerStateDelegate {
                 self.stopProgressTimer()
             }
 
-            // Synchronize with Vidra's PlayerManager
             PlayerManager.shared.syncFromSpotifyRemote(
                 isPaused: playerState.isPaused,
                 position: self.position,

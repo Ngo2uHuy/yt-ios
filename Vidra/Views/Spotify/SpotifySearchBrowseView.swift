@@ -203,6 +203,7 @@ final class SpotifySearchBrowseViewModel: ObservableObject {
     @Published var artists: [SpotifyCard] = []
     @Published var albums: [SpotifyCard] = []
     @Published var playlists: [SpotifyCard] = []
+    @Published var isFallbackSearch: Bool = false
 
     // Top Result calculation
     @Published var topTrack: Video? = nil
@@ -270,6 +271,7 @@ final class SpotifySearchBrowseViewModel: ObservableObject {
                     self.artists = res.artists
                     self.albums = res.albums
                     self.playlists = res.playlists
+                    self.isFallbackSearch = false
 
                     // Pick Top Result: If query matches artist closely, prefer artist
                     let cleanQ = query.lowercased()
@@ -294,12 +296,20 @@ final class SpotifySearchBrowseViewModel: ObservableObject {
 
         // Fallback / standard music search via InnerTube
         do {
-            let page = try await InnerTube.shared.musicSearch(query, continuation: nil)
+            async let musicTask = InnerTube.shared.musicSearch(query, continuation: nil)
+            async let generalTask = try? InnerTube.shared.search(query, params: nil, continuation: nil)
+            let page = try await musicTask
+            let general = await generalTask
             guard !Task.isCancelled else { return }
 
+            self.isFallbackSearch = true
             self.tracks = page.videos
-            self.artists = page.channels.map { ch in
-                SpotifyCard(
+
+            let rawChannels = page.channels.isEmpty ? (general?.channels ?? []) : page.channels
+            var seenArtists = Set<String>()
+            self.artists = rawChannels.compactMap { ch in
+                guard seenArtists.insert(ch.id).inserted else { return nil }
+                return SpotifyCard(
                     id: ch.id,
                     kind: .artist,
                     title: ch.title,
@@ -307,8 +317,12 @@ final class SpotifySearchBrowseViewModel: ObservableObject {
                     image: ch.avatar
                 )
             }
-            self.playlists = page.playlists.map { p in
-                SpotifyCard(
+
+            let rawPlaylists = page.playlists.isEmpty ? (general?.playlists ?? []) : page.playlists
+            var seenPlaylists = Set<String>()
+            self.playlists = rawPlaylists.compactMap { p in
+                guard seenPlaylists.insert(p.id).inserted else { return nil }
+                return SpotifyCard(
                     id: p.id,
                     kind: .playlist,
                     title: p.title,
@@ -392,17 +406,22 @@ final class SpotifyCategoryDetailModel: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var error: String? = nil
 
-    func load(category: SpotifyCategory) async {
-        guard tracks.isEmpty else { return }
+    func load(category: SpotifyCategory, force: Bool = false) async {
+        guard force || tracks.isEmpty else { return }
+        guard !isLoading else { return }
         isLoading = true
         error = nil
+        defer { isLoading = false }
         do {
             let page = try await InnerTube.shared.musicSearch(category.searchKeyword, continuation: nil)
+            guard !Task.isCancelled else { return }
             self.tracks = page.videos
         } catch {
-            self.error = error.localizedDescription
+            guard !(error is CancellationError), !Task.isCancelled else { return }
+            if tracks.isEmpty {
+                self.error = error.localizedDescription
+            }
         }
-        isLoading = false
     }
 }
 
@@ -527,12 +546,13 @@ struct SpotifyCategoryDetailView: View {
             .padding(.bottom, 40)
         }
         .background(Color(red: 0.07, green: 0.07, blue: 0.07).ignoresSafeArea())
+        .navigationTitle(category.title)
         .navigationBarTitleDisplayMode(.inline)
         .task {
             await model.load(category: category)
         }
         .refreshable {
-            await model.load(category: category)
+            await model.load(category: category, force: true)
         }
     }
 }
@@ -613,17 +633,17 @@ struct SpotifySongRow: View {
                 }
 
                 Button {
-                    PlayerManager.shared.queue.append(video)
+                    PlayerManager.shared.appendToQueue(video)
                 } label: {
                     Label("Thêm vào hàng đợi", systemImage: "text.badge.plus")
                 }
 
                 Button {
-                    Library.shared.toggleWatchLater(video)
+                    Library.shared.toggleLike(video)
                 } label: {
                     Label(
-                        Library.shared.isInWatchLater(video.id) ? "Bỏ khỏi Thư viện" : "Lưu vào Thư viện",
-                        systemImage: Library.shared.isInWatchLater(video.id) ? "heart.fill" : "heart"
+                        Library.shared.isLiked(video.id) ? "Bỏ khỏi Bài hát đã thích" : "Lưu vào Bài hát đã thích",
+                        systemImage: Library.shared.isLiked(video.id) ? "heart.fill" : "heart"
                     )
                 }
 
@@ -710,26 +730,24 @@ struct SpotifySearchBrowseView: View {
     @FocusState private var isSearchFocused: Bool
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                // Top Search Bar Section (Fixed prominent Spotify header)
-                searchHeaderBar
+        VStack(spacing: 0) {
+            // Top Search Bar Section (Fixed prominent Spotify header)
+            searchHeaderBar
 
-                // Content Area: Either Search Results or Browse All Grid
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        if model.isSearching {
-                            searchResultsSection
-                        } else {
-                            browseCategoriesSection
-                        }
+            // Content Area: Either Search Results or Browse All Grid
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if model.isSearching {
+                        searchResultsSection
+                    } else {
+                        browseCategoriesSection
                     }
-                    .padding(.bottom, 32)
                 }
+                .padding(.bottom, 32)
             }
-            .background(Color(red: 0.07, green: 0.07, blue: 0.07).ignoresSafeArea())
-            .navigationBarHidden(true)
         }
+        .background(Color(red: 0.07, green: 0.07, blue: 0.07).ignoresSafeArea())
+        .navigationBarHidden(true)
     }
 
     // MARK: - Top Search Bar
@@ -930,20 +948,51 @@ struct SpotifySearchBrowseView: View {
                     }
 
                 case .songs:
-                    songsSection(limit: nil)
+                    if model.tracks.isEmpty {
+                        emptySectionMessage("Không tìm thấy bài hát phù hợp.")
+                    } else {
+                        songsSection(limit: nil)
+                    }
 
                 case .artists:
-                    artistsSection(limit: nil)
+                    if model.artists.isEmpty {
+                        emptySectionMessage("Không tìm thấy nghệ sĩ phù hợp.")
+                    } else {
+                        artistsSection(limit: nil)
+                    }
 
                 case .albums:
-                    albumsSection
+                    if model.albums.isEmpty {
+                        emptySectionMessage("Không tìm thấy album phù hợp.")
+                    } else {
+                        albumsSection
+                    }
 
                 case .playlists:
-                    playlistsSection
+                    if model.playlists.isEmpty {
+                        emptySectionMessage("Không tìm thấy playlist phù hợp.")
+                    } else {
+                        playlistsSection
+                    }
                 }
             }
             .padding(.top, 6)
         }
+    }
+
+    private func emptySectionMessage(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 32))
+                .foregroundStyle(Color(white: 0.45))
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 48)
+        .padding(.horizontal, 24)
     }
 
     // MARK: - Top Result Card (Thẻ Kết quả hàng đầu)
@@ -994,7 +1043,7 @@ struct SpotifySearchBrowseView: View {
 
                         // Floating Spotify Green Play Button
                         Button {
-                            PlayerManager.shared.play(track, queue: model.tracks)
+                            PlayerManager.shared.play(track, queue: spotifyRestQueue(model.tracks, after: track))
                         } label: {
                             ZStack {
                                 Circle()
@@ -1016,7 +1065,7 @@ struct SpotifySearchBrowseView: View {
                 .contentShape(RoundedRectangle(cornerRadius: 8))
                 .padding(.horizontal, 16)
                 .onTapGesture {
-                    PlayerManager.shared.play(track, queue: model.tracks)
+                    PlayerManager.shared.play(track, queue: spotifyRestQueue(model.tracks, after: track))
                 }
             }
         } else if let artist = model.topArtist {
@@ -1191,7 +1240,24 @@ struct SpotifySearchBrowseView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(model.playlists) { card in
-                        SpotifyCardLink(card: card, width: 140)
+                        if model.isFallbackSearch || card.id.hasPrefix("PL") || card.id.hasPrefix("OLAK") || card.id.hasPrefix("RD") {
+                            NavigationLink {
+                                SpotifyPlaylistDetailView(
+                                    title: card.title,
+                                    cover: card.image,
+                                    subtitle: card.subtitle,
+                                    creator: "YouTube Music",
+                                    continuationLoader: { token in
+                                        try await InnerTube.shared.playlist(card.id, continuation: token)
+                                    }
+                                )
+                            } label: {
+                                SpotifyCardView(card: card, width: 140)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            SpotifyCardLink(card: card, width: 140)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1205,10 +1271,20 @@ struct SpotifySearchBrowseView: View {
     private func artistDestination(_ card: SpotifyCard) -> some View {
         if card.id.hasPrefix("spa:") {
             SpotifyArtistView(artistId: String(card.id.dropFirst(4)), name: card.title)
-        } else if SpotifyAuth.shared.isLoggedIn && !card.id.hasPrefix("UC") {
+        } else if !model.isFallbackSearch && SpotifyAuth.shared.isLoggedIn && !card.id.hasPrefix("UC") {
             SpotifyArtistView(artistId: card.id, name: card.title)
-        } else {
+        } else if card.id.hasPrefix("UC") {
             ChannelView(channel: Channel(id: card.id, title: card.title, avatar: card.image))
+        } else {
+            SpotifyPlaylistDetailView(
+                title: card.title,
+                cover: card.image,
+                subtitle: card.subtitle,
+                creator: card.title,
+                continuationLoader: { token in
+                    try await InnerTube.shared.search(card.title, params: nil, continuation: token)
+                }
+            )
         }
     }
 }
