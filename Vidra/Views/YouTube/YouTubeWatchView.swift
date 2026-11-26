@@ -233,8 +233,7 @@ struct YouTubeWatchDetails: View {
                 topCommentCount = nil
                 await loadVideoMeta(v)
             }
-            .onChange(of: lib.liked.count) { _ in
-                let liked = lib.isLiked(v.id)
+            .onChange(of: lib.isLiked(v.id)) { liked in
                 if userLiked != liked {
                     userLiked = liked
                     if liked { userDisliked = false }

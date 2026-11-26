@@ -597,9 +597,11 @@ struct ShortsCardView: View {
             guard isWithinRetentionWindow else { return }
             await loadVideoStats()
         }
-        .onChange(of: lib.liked.count) { _ in
-            isLiked = lib.isLiked(video.id)
-            if isLiked { isDisliked = false }
+        .onChange(of: lib.isLiked(video.id)) { liked in
+            if isLiked != liked {
+                isLiked = liked
+                if liked { isDisliked = false }
+            }
         }
     }
 
