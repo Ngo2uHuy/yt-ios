@@ -1244,6 +1244,7 @@ struct SpotifyNowPlayingFullView: View {
         return lines.lastIndex { $0.time <= t } ?? -1
     }
 
+    @MainActor
     private func loadAlbumArtworkColor() async {
         let defaultTint = Color(red: 0.18, green: 0.28, blue: 0.22)
         guard let v = pm.current, let url = v.thumbnail,
@@ -1259,6 +1260,7 @@ struct SpotifyNowPlayingFullView: View {
         }
     }
 
+    @MainActor
     private func loadTrackLyrics() async {
         lyrics = nil
         guard let v = pm.current else {

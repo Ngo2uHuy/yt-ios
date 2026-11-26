@@ -60,7 +60,7 @@ struct ContentView: View {
                 SpotifyRootView()
             }
         }
-        .overlay {
+        .background {
             DownloadErrorAlertObserver()
         }
     }

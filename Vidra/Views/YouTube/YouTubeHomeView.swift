@@ -326,18 +326,21 @@ struct YouTubeHomeView: View {
 
     // MARK: - Actions & Data Fetching
 
+    @MainActor
     private func scrollToTopAndRefresh() {
         scrollToTopToken += 1
-        Task {
+        Task { @MainActor in
             await refreshFeed()
         }
     }
 
+    @MainActor
     private func switchCategory(_ category: String) async {
         selectedCategory = category
         await loadInitialFeed()
     }
 
+    @MainActor
     private func loadInitialFeed() async {
         loadTask?.cancel()
         nextPageTask?.cancel()
@@ -347,7 +350,7 @@ struct YouTubeHomeView: View {
         errorMessage = nil
 
         let targetCategory = selectedCategory
-        let task = Task {
+        let task = Task { @MainActor in
             isLoading = true
             defer {
                 if !Task.isCancelled {
@@ -373,9 +376,14 @@ struct YouTubeHomeView: View {
             }
         }
         loadTask = task
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
+    @MainActor
     private func refreshFeed() async {
         let targetCategory = selectedCategory
         do {
@@ -398,13 +406,14 @@ struct YouTubeHomeView: View {
         }
     }
 
+    @MainActor
     private func loadNextPage() {
         guard !isLoadingMore, !isLoading, let token = continuationToken else { return }
         let targetCategory = selectedCategory
         isLoadingMore = true
 
         nextPageTask?.cancel()
-        nextPageTask = Task {
+        nextPageTask = Task { @MainActor in
             defer { isLoadingMore = false }
             do {
                 let query = queryForCategory(targetCategory)
@@ -461,13 +470,14 @@ struct YouTubeHomeView: View {
         })
     }
 
+    @MainActor
     private func showToast(_ message: String, undo: (() -> Void)? = nil) {
         toastTimer?.cancel()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             toastMessage = message
             undoAction = undo
         }
-        toastTimer = Task {
+        toastTimer = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) {

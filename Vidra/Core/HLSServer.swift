@@ -45,9 +45,26 @@ final class HLSServer: @unchecked Sendable {
         }
     }
 
+    private final class PortWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<UInt16, Never>?
+
+        init(_ continuation: CheckedContinuation<UInt16, Never>) {
+            self.continuation = continuation
+        }
+
+        func resolve(_ port: UInt16) {
+            lock.lock()
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume(returning: port)
+        }
+    }
+
     private var listener: NWListener?
     private var _port: UInt16 = 0
-    private var portWaiters: [CheckedContinuation<UInt16, Never>] = []
+    private var portWaiters: [PortWaiter] = []
     private var nextTagSeq: UInt64 = 0
     private var nextProxySeq: UInt64 = 0
     private var restartScheduled = false
@@ -134,7 +151,7 @@ final class HLSServer: @unchecked Sendable {
                         let waiters = self.portWaiters
                         self.portWaiters.removeAll()
                         self.lock.unlock()
-                        for w in waiters { w.resume(returning: assignedPort) }
+                        for w in waiters { w.resolve(assignedPort) }
                     }
                 case .failed(let err):
                     print("HLSServer listener failed: \(err)")
@@ -187,42 +204,30 @@ final class HLSServer: @unchecked Sendable {
         let immediate = port
         if immediate > 0 { return immediate }
 
-        return await withTaskGroup(of: UInt16.self) { group in
-            group.addTask {
-                await withCheckedContinuation { cont in
-                    self.lock.lock()
-                    if self._port > 0 {
-                        let p = self._port
-                        self.lock.unlock()
-                        cont.resume(returning: p)
-                    } else {
-                        self.portWaiters.append(cont)
-                        self.lock.unlock()
-                    }
+        return await withCheckedContinuation { cont in
+            let waiter = PortWaiter(cont)
+            lock.lock()
+            if _port > 0 {
+                let p = _port
+                lock.unlock()
+                waiter.resolve(p)
+                return
+            }
+            portWaiters.append(waiter)
+            lock.unlock()
+
+            acceptQueue.asyncAfter(deadline: .now() + 2.0) { [weak self, weak waiter] in
+                guard let waiter else { return }
+                guard let self else {
+                    waiter.resolve(0)
+                    return
                 }
-            }
-            group.addTask {
-                for _ in 0..<40 {
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                    let p = self.port
-                    if p > 0 { return p }
-                }
-                return self.port
-            }
-            let first = await group.next() ?? self.port
-            group.cancelAll()
-            // Drain any pending waiters if timeout won
-            self.lock.lock()
-            let current = self._port
-            if current > 0 || !self.portWaiters.isEmpty {
-                let leftovers = self.portWaiters
-                self.portWaiters.removeAll()
+                self.lock.lock()
+                self.portWaiters.removeAll { $0 === waiter }
+                let current = self._port
                 self.lock.unlock()
-                for w in leftovers { w.resume(returning: current) }
-            } else {
-                self.lock.unlock()
+                waiter.resolve(current)
             }
-            return first > 0 ? first : self.port
         }
     }
 

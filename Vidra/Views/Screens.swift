@@ -102,6 +102,7 @@ struct HomeView: View {
         }
     }
 
+    @MainActor
     private func loadFeed() async {
         loading = true
         let key = subsKey

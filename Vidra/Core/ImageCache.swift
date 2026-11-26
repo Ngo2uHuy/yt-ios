@@ -14,7 +14,7 @@ final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
 
     private let cache = NSCache<NSString, UIImage>()
-    private var inFlight: [NSString: Task<UIImage?, Never>] = [:]
+    private var inFlight: [NSString: (id: UUID, task: Task<UIImage?, Never>)] = [:]
     private var trackedKeysByURL: [String: Set<NSString>] = [:]
     private let lock = NSLock()
     private var lastPressurePurge: Date = .distantPast
@@ -158,12 +158,13 @@ final class ImageCache: @unchecked Sendable {
 
     func clear() {
         lock.lock()
-        for (_, task) in inFlight {
-            task.cancel()
-        }
+        let tasks = inFlight.values.map(\.task)
         inFlight.removeAll()
         trackedKeysByURL.removeAll()
         lock.unlock()
+        for task in tasks {
+            task.cancel()
+        }
         cache.removeAllObjects()
     }
 
@@ -182,18 +183,19 @@ final class ImageCache: @unchecked Sendable {
         }
 
         lock.lock()
-        if let existing = inFlight[key] {
+        if let existing = inFlight[key]?.task {
             lock.unlock()
             return await existing.value
         }
 
-        let safeSize = maxSafePointSize
-        var taskRef: Task<UIImage?, Never>?
+        // Read `_maxSafePointSize` directly while `lock` is held to avoid re-entering non-recursive NSLock.
+        let safeSize = _maxSafePointSize
+        let requestId = UUID()
         let task = Task<UIImage?, Never> { [weak self] in
             defer {
                 if let self {
                     self.lock.lock()
-                    if self.inFlight[key] == taskRef {
+                    if self.inFlight[key]?.id == requestId {
                         self.inFlight.removeValue(forKey: key)
                     }
                     self.lock.unlock()
@@ -224,8 +226,7 @@ final class ImageCache: @unchecked Sendable {
             self.insert(image, for: url, targetSize: targetSize, scale: actualScale)
             return image
         }
-        taskRef = task
-        inFlight[key] = task
+        inFlight[key] = (requestId, task)
         lock.unlock()
 
         return await task.value

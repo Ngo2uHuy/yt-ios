@@ -98,6 +98,7 @@ struct YouTubeShortsView: View {
 
     // MARK: - Initialization & Data Loading
 
+    @MainActor
     private func initializeShorts() async {
         pm.loop = true
         isMuted = pm.player.isMuted
@@ -113,6 +114,7 @@ struct YouTubeShortsView: View {
         await fetchInitialShorts()
     }
 
+    @MainActor
     private func fetchInitialShorts() async {
         isLoadingInitial = true
         errorMessage = nil
@@ -143,6 +145,7 @@ struct YouTubeShortsView: View {
         }
     }
 
+    @MainActor
     private func fetchMoreShortsIfNeeded(forIndex index: Int) {
         guard let token = continuationToken, !isLoadingMore, index >= shorts.count - 3 else {
             return
@@ -150,7 +153,7 @@ struct YouTubeShortsView: View {
 
         isLoadingMore = true
         fetchTask?.cancel()
-        fetchTask = Task {
+        fetchTask = Task { @MainActor in
             defer { isLoadingMore = false }
             do {
                 let page = try await InnerTube.shared.search("#shorts", params: nil, continuation: token)
@@ -217,13 +220,14 @@ struct YouTubeShortsView: View {
         }
     }
 
+    @MainActor
     private func togglePlayPause() {
         pm.togglePlay()
         withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
             showPlayPauseIcon = true
         }
         hudHideTask?.cancel()
-        hudHideTask = Task {
+        hudHideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) {
@@ -238,13 +242,14 @@ struct YouTubeShortsView: View {
         showToast(message: isMuted ? "Đã tắt tiếng" : "Đã bật tiếng")
     }
 
+    @MainActor
     private func showToast(message: String) {
         toastMessage = message
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = true
         }
         toastHideTask?.cancel()
-        toastHideTask = Task {
+        toastHideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) {
@@ -268,7 +273,7 @@ struct YouTubeShortsView: View {
                             isWithinRetentionWindow: isWithinWindow,
                             isMuted: isMuted,
                             isTab: isTab,
-                            onTogglePlay: togglePlayPause,
+                            onTogglePlay: { togglePlayPause() },
                             onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
                             onToggleMute: toggleMute,
                             onOpenComments: {
@@ -315,7 +320,7 @@ struct YouTubeShortsView: View {
                         isWithinRetentionWindow: true,
                         isMuted: isMuted,
                         isTab: isTab,
-                        onTogglePlay: togglePlayPause,
+                        onTogglePlay: { togglePlayPause() },
                         onDoubleTap: { location in handleDoubleTap(at: location, for: video) },
                         onToggleMute: toggleMute,
                         onOpenComments: {
@@ -367,6 +372,7 @@ struct YouTubeShortsView: View {
         )
     }
 
+    @MainActor
     private func handleDoubleTap(at location: CGPoint, for video: Video) {
         lastHeartPosition = location
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -374,7 +380,7 @@ struct YouTubeShortsView: View {
             showHeartAnimation = true
         }
         heartHideTask?.cancel()
-        heartHideTask = Task {
+        heartHideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 750_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) {
@@ -526,7 +532,7 @@ struct YouTubeShortsView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
             Button {
-                Task { await fetchInitialShorts() }
+                Task { @MainActor in await fetchInitialShorts() }
             } label: {
                 Text("Thử lại")
                     .font(.subheadline.weight(.semibold))
@@ -922,6 +928,7 @@ struct ShortsCardView: View {
 
     // MARK: - Helpers & Data Fetching
 
+    @MainActor
     private func loadVideoStats() async {
         // Fetch votes (Likes/Dislikes)
         if let votes = await Extras.votes(video.id), !Task.isCancelled {

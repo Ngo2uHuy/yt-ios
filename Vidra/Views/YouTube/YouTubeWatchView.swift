@@ -92,6 +92,7 @@ struct YouTubeWatchView: View {
     }
 
     /// Trích xuất màu sắc chủ đạo từ thumbnail video để làm ánh sáng Ambient Mode
+    @MainActor
     private func updateAmbientColor(for url: URL?) async {
         guard let url else {
             withAnimation(.easeInOut(duration: 0.8)) {
@@ -241,7 +242,7 @@ struct YouTubeWatchDetails: View {
             }
             .onChange(of: pm.commentsToken) { token in
                 if let token, topComment == nil {
-                    Task {
+                    Task { @MainActor in
                         if let res = try? await InnerTube.shared.comments(token),
                            pm.current?.id == v.id,
                            pm.commentsToken == token,
@@ -918,6 +919,7 @@ struct YouTubeWatchDetails: View {
         return page?.channel
     }
 
+    @MainActor
     private func loadVideoMeta(_ v: Video) async {
         let token = pm.commentsToken
         let chId = v.channelId
@@ -941,10 +943,11 @@ struct YouTubeWatchDetails: View {
         }
     }
 
+    @MainActor
     private func showToast(_ msg: String) {
         toastTask?.cancel()
         withAnimation { toastMessage = msg }
-        toastTask = Task {
+        toastTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_400_000_000)
             guard !Task.isCancelled else { return }
             withAnimation { toastMessage = nil }
@@ -1416,10 +1419,11 @@ struct CommentsView: View {
         }
     }
 
+    @MainActor
     private func loadReplies(for commentId: String, token: String) {
         guard !loadingReplies.contains(commentId) else { return }
         loadingReplies.insert(commentId)
-        Task {
+        Task { @MainActor in
             defer { loadingReplies.remove(commentId) }
             if let res = try? await InnerTube.shared.comments(token), !Task.isCancelled {
                 if let idx = comments.firstIndex(where: { $0.id == commentId }) {
@@ -1430,11 +1434,12 @@ struct CommentsView: View {
         }
     }
 
+    @MainActor
     private func loadMoreReplies(for commentId: String) {
         guard !loadingMoreReplies.contains(commentId),
               let next = replyNextTokens[commentId] else { return }
         loadingMoreReplies.insert(commentId)
-        Task {
+        Task { @MainActor in
             defer { loadingMoreReplies.remove(commentId) }
             if let res = try? await InnerTube.shared.comments(next), !Task.isCancelled {
                 if let idx = comments.firstIndex(where: { $0.id == commentId }) {
@@ -1447,6 +1452,7 @@ struct CommentsView: View {
         }
     }
 
+    @MainActor
     private func loadComments(reset: Bool) async {
         guard !isLoading else { return }
         let targetToken = reset ? token : nextToken

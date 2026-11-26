@@ -1040,6 +1040,7 @@ struct YouTubeSubscriptionsView: View {
         }
     }
 
+    @MainActor
     private func loadFeed() async {
         guard !lib.subscriptions.isEmpty else {
             feed = []

@@ -420,13 +420,14 @@ struct SpotifyRemapSheet: View {
         }
     }
 
+    @MainActor
     private func search() {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         searchTask?.cancel()
         loading = true
         error = nil
-        searchTask = Task {
+        searchTask = Task { @MainActor in
             do {
                 let page = try await InnerTube.shared.musicSearch(q, continuation: nil)
                 guard !Task.isCancelled else { return }
@@ -439,8 +440,9 @@ struct SpotifyRemapSheet: View {
         }
     }
 
+    @MainActor
     private func select(_ candidate: Video) {
-        Task {
+        Task { @MainActor in
             await TrackMatcher.shared.setCustomMatch(for: video.id, youtubeId: candidate.id)
             if PlayerManager.shared.current?.id == video.id {
                 PlayerManager.shared.retry()
@@ -520,12 +522,14 @@ struct PagedList: View {
         .onDisappear { activeTask?.cancel() }
     }
 
+    @MainActor
     private func loadMore() {
         guard token != nil, !loading, error == nil else { return }
         activeTask?.cancel()
-        activeTask = Task { await load(reset: false) }
+        activeTask = Task { @MainActor in await load(reset: false) }
     }
 
+    @MainActor
     private func load(reset: Bool) async {
         guard !loading else { return }
         loading = true
